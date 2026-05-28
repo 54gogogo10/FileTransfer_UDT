@@ -434,6 +434,9 @@ namespace TrFileTransfer
                 else if (transferType == 0x02)
                 {
                     bool fileComplete = await HandleChunkedFile(clientSocket, ct);
+                    // Application-level ACK for this chunk
+                    var ack2 = new byte[1] { 0x01 };
+                    await Task.Run(() => UdtNative.udt_send(clientSocket, ack2, 1, 0), ct);
                     // Chunk connection done — always clean up progress card for this endpoint.
                     // OnTransferComplete fires separately when file is fully assembled.
                     var ccHandler = OnClientTransferComplete;
@@ -448,6 +451,10 @@ namespace TrFileTransfer
                     var ccHandler = OnClientTransferComplete;
                     if (ccHandler != null) ccHandler(clientEp);
                 }
+
+                // Application-level ACK: tell client we received data successfully
+                var ack = new byte[1] { 0x01 };
+                await Task.Run(() => UdtNative.udt_send(clientSocket, ack, 1, 0), ct);
             }
             catch (OperationCanceledException) { }
             catch (IOException ex)
@@ -856,6 +863,11 @@ namespace TrFileTransfer
                 UdtDll.EnsureExtracted();
                 UdtNative.UdtStartup();
                 await transferAction(_cts.Token).ConfigureAwait(false);
+                // Wait for server ACK before closing — confirms data was received
+                var ackBuf = new byte[1];
+                int ackTimeout = 30000;
+                UdtNative.udt_setsockopt(_socket, 0, UdtNative.UDT_RCVTIMEO, ref ackTimeout, 4);
+                await Task.Run(() => UdtNative.udt_recv(_socket, ackBuf, 1, 0), _cts.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -873,11 +885,6 @@ namespace TrFileTransfer
                 _isRunning = false;
                 if (_socket >= 0)
                 {
-                    // Drain: wait for server to close connection, confirming all data
-                    // was received. Match server's 30s timeout for large chunks.
-                    int drainTimeout = 30000;
-                    UdtNative.udt_setsockopt(_socket, 0, UdtNative.UDT_RCVTIMEO, ref drainTimeout, 4);
-                    try { var d = new byte[1]; UdtNative.udt_recv(_socket, d, 1, 0); } catch { }
                     try { UdtNative.udt_close(_socket); } catch { }
                     _socket = -1;
                 }
