@@ -155,7 +155,7 @@ namespace TrFileTransfer
             _chkFolder.CheckedChanged += ChkFolder_CheckedChanged;
             _chkMonitor = new CheckBox { Location = new Point(70, 95), Width = 100, TextAlign = ContentAlignment.MiddleLeft };
             _chkMonitor.CheckedChanged += ChkMonitor_CheckedChanged;
-            _lblConcurrency = new Label { Location = new Point(260, 93), Width = 80, TextAlign = ContentAlignment.MiddleRight };
+            _lblConcurrency = new Label { Location = new Point(245, 93), Width = 95, TextAlign = ContentAlignment.MiddleRight };
             _numConcurrency = new NumericUpDown
             {
                 Location = new Point(345, 93), Width = 50,
