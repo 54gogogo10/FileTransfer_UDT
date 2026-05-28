@@ -36,7 +36,7 @@ namespace TrFileTransfer
         public static string ServerStopped { get { return IsChinese ? "服务器已停止。" : "Server stopped."; } }
         public static string TransferComplete { get { return IsChinese ? "传输完成!" : "Transfer complete!"; } }
         public static string Cancelling { get { return IsChinese ? "正在取消..." : "Cancelling..."; } }
-        public static string ConcurrencyLabel { get { return IsChinese ? "并发(1-64):" : "Concur(1-64):"; } }
+        public static string ConcurrencyLabel { get { return IsChinese ? "并发(1-16):" : "Concur(1-16):"; } }
         public static string AboutBtn { get { return IsChinese ? "关于" : "About"; } }
         public static string AboutTitle { get { return IsChinese ? "关于" : "About"; } }
         public static string AboutText { get { return IsChinese ? "TrFileTransfer v1.0\r\n局域网文件传输工具\r\nSHA-256 完整性校验" : "TrFileTransfer v1.0\r\nLAN file transfer tool\r\nSHA-256 integrity verification"; } }
