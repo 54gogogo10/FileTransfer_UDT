@@ -873,11 +873,10 @@ namespace TrFileTransfer
                 _isRunning = false;
                 if (_socket >= 0)
                 {
-                    // Wait for server to receive all data before closing.
-                    // Drain recv with short timeout: returns quickly if server already
-                    // closed; blocks briefly if data still in-flight.
-                    int shortTimeout = 2000;
-                    UdtNative.udt_setsockopt(_socket, 0, UdtNative.UDT_RCVTIMEO, ref shortTimeout, 4);
+                    // Drain: wait for server to close connection, confirming all data
+                    // was received. Match server's 30s timeout for large chunks.
+                    int drainTimeout = 30000;
+                    UdtNative.udt_setsockopt(_socket, 0, UdtNative.UDT_RCVTIMEO, ref drainTimeout, 4);
                     try { var d = new byte[1]; UdtNative.udt_recv(_socket, d, 1, 0); } catch { }
                     try { UdtNative.udt_close(_socket); } catch { }
                     _socket = -1;
