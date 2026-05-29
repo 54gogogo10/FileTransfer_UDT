@@ -363,10 +363,10 @@ namespace TrFileTransfer.Tests
             }
         }
 
-        private static void TcpLargeSingle()  { ConcurrentTransferTest("tr_tcpls", true, 1, 500, 120); }
-        private static void TcpLargeConcur()  { ConcurrentTransferTest("tr_tcplc", true, 16, 500, 300); }
+        private static void TcpLargeSingle()  { ConcurrentTransferTest("tr_tcpls", true, 1, 5000, 600); }
+        private static void TcpLargeConcur()  { ConcurrentTransferTest("tr_tcplc", true, 16, 5000, 900); }
 
-        private static void UdtLargeSingle()  { ConcurrentTransferTest("tr_udtls", false, 1, 500, 300); }
-        private static void UdtLargeConcur()  { ConcurrentTransferTest("tr_udtlc", false, 16, 500, 900); }
+        private static void UdtLargeSingle()  { ConcurrentTransferTest("tr_udtls", false, 1, 5000, 1200); }
+        private static void UdtLargeConcur()  { ConcurrentTransferTest("tr_udtlc", false, 16, 5000, 1800); }
     }
 }
