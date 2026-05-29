@@ -36,8 +36,8 @@ namespace TrFileTransfer.Tests
         private static void TcpSingleFile()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(Path.GetTempPath(), "tr_it_send_" + Guid.NewGuid().ToString("N"));
-            string recvDir = Path.Combine(Path.GetTempPath(), "tr_it_recv_" + Guid.NewGuid().ToString("N"));
+            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_it_send_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_it_recv_" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -102,8 +102,8 @@ namespace TrFileTransfer.Tests
         private static void TcpFolder()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(Path.GetTempPath(), "tr_it_fsend_" + Guid.NewGuid().ToString("N"));
-            string recvDir = Path.Combine(Path.GetTempPath(), "tr_it_frecv_" + Guid.NewGuid().ToString("N"));
+            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_it_fsend_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_it_frecv_" + Guid.NewGuid().ToString("N"));
             string folderPath = Path.Combine(sendDir, "myFolder");
             Directory.CreateDirectory(folderPath);
 
@@ -172,8 +172,8 @@ namespace TrFileTransfer.Tests
         private static void UdtSingleFile()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(Path.GetTempPath(), "tr_it_udt_s_" + Guid.NewGuid().ToString("N"));
-            string recvDir = Path.Combine(Path.GetTempPath(), "tr_it_udt_r_" + Guid.NewGuid().ToString("N"));
+            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_it_udt_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_it_udt_r_" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -240,8 +240,8 @@ namespace TrFileTransfer.Tests
             long fileSizeMB, int timeoutSec)
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(Path.GetTempPath(), prefix + "_s_" + Guid.NewGuid().ToString("N"));
-            string recvDir = Path.Combine(Path.GetTempPath(), prefix + "_r_" + Guid.NewGuid().ToString("N"));
+            string sendDir = Path.Combine(@"D:\cc\tmp", prefix + "_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(@"D:\cc\tmp", prefix + "_r_" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 

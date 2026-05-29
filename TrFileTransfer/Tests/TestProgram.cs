@@ -153,7 +153,7 @@ namespace TrFileTransfer.Tests
 
         private static void RunGetUniqueSavePath(TestRunner runner)
         {
-            var dir = Path.Combine(Path.GetTempPath(), "tr_test_" + Guid.NewGuid().ToString("N"));
+            var dir = Path.Combine(@"D:\cc\tmp", "tr_test_" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(dir);
             try
             {
