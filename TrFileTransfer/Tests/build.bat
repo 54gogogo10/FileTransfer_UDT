@@ -29,6 +29,7 @@ echo.
     ..\TransferServer.cs ^
     ..\TransferUdt.cs ^
     ..\TransferClient.cs ^
+    ..\ResumeState.cs ^
     TestProgram.cs ^
     IntegrationTests.cs
 
