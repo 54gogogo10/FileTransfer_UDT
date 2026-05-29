@@ -76,6 +76,14 @@ namespace TrFileTransfer
             await RunTransfer(ct => SendChunkedInternal(offset, chunkSize, totalSize, ct));
         }
 
+        /// <summary>Sends a file with resume support (type 0x03), negotiating with server via 0x10 response.</summary>
+        public async Task<Guid> SendResumableAsync(Guid? existingSessionId = null)
+        {
+            var sessionId = existingSessionId ?? Guid.NewGuid();
+            await RunTransfer(ct => SendResumableInternal(sessionId, ct));
+            return sessionId;
+        }
+
         private async Task RunTransfer(Func<CancellationToken, Task> transferAction)
         {
             _cts = new CancellationTokenSource();
@@ -283,6 +291,102 @@ namespace TrFileTransfer
 
                 var completeHandler = OnTransferComplete;
                 if (completeHandler != null) completeHandler();
+            }
+        }
+
+        private async Task SendResumableInternal(Guid sessionId, CancellationToken ct)
+        {
+            ResumeState.EnsureDir();
+            var fileInfo = new FileInfo(_filePath);
+            long fileSize = fileInfo.Length;
+            string fileName = fileInfo.Name;
+            long sentBytes = 0;
+
+            // Load existing state if resuming
+            var existingState = ResumeState.Load(sessionId);
+            if (existingState != null)
+            {
+                sentBytes = existingState.SentBytes;
+                Log(string.Format("Resuming {0} from offset {1} ({2})", fileName,
+                    sentBytes, Utils.FormatSize(sentBytes)));
+            }
+            else
+            {
+                var newState = new ResumeState
+                {
+                    SessionId = sessionId,
+                    TotalSize = fileSize,
+                    FileName = fileName,
+                    FilePath = _filePath,
+                    ServerIp = _serverIp,
+                    Port = _port,
+                    IsUdt = false,
+                    Created = DateTime.UtcNow,
+                    SentBytes = 0
+                };
+                newState.Save();
+            }
+
+            using (var client = _localPort > 0
+                ? new TcpClient(new IPEndPoint(IPAddress.Any, _localPort))
+                : new TcpClient())
+            {
+                client.NoDelay = true;
+                client.SendBufferSize = _bufferSize;
+                client.ReceiveBufferSize = _bufferSize;
+
+                await client.ConnectAsync(_serverIp, _port).ConfigureAwait(false);
+                var stream = client.GetStream();
+
+                // Build 0x03 header: type(1) + sessionId(16) + totalSize(8) + resumeOffset(8) + nameLen(4) + name
+                byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(fileName);
+                var header = new byte[1 + 16 + 8 + 8 + 4 + nameBytes.Length];
+                header[0] = 0x03;
+                Buffer.BlockCopy(sessionId.ToByteArray(), 0, header, 1, 16);
+                Buffer.BlockCopy(BitConverter.GetBytes(fileSize), 0, header, 17, 8);
+                Buffer.BlockCopy(BitConverter.GetBytes(sentBytes), 0, header, 25, 8);
+                Buffer.BlockCopy(BitConverter.GetBytes(nameBytes.Length), 0, header, 33, 4);
+                Buffer.BlockCopy(nameBytes, 0, header, 37, nameBytes.Length);
+                await stream.WriteAsync(header, 0, header.Length, ct).ConfigureAwait(false);
+
+                // Read 0x10 server response (10 bytes: 0x10 + offset8 + status1)
+                var respBuf = new byte[10];
+                await ReadExactResumeAsync(stream, respBuf, 0, 10, ct).ConfigureAwait(false);
+
+                byte respStatus = respBuf[9];
+                long serverOffset = BitConverter.ToInt64(respBuf, 1);
+
+                if (respStatus == 2)
+                {
+                    Log(fileName + " already fully received by server.");
+                    ResumeState.Delete(sessionId);
+                    var completeHandler = OnTransferComplete;
+                    if (completeHandler != null) completeHandler();
+                    return;
+                }
+
+                // Server is authoritative: use its offset
+                long actualStart = Math.Max(sentBytes, serverOffset);
+                Log(string.Format("Resume negotiated: start={0} serverHad={1} clientHad={2}",
+                    actualStart, serverOffset, sentBytes));
+
+                // Send file data from actualStart
+                await SendFilePayload(stream, _filePath, fileSize, fileName, ct, (int)actualStart).ConfigureAwait(false);
+
+                // Success — delete resume state
+                ResumeState.Delete(sessionId);
+            }
+        }
+
+        private static async Task ReadExactResumeAsync(NetworkStream stream, byte[] buf, int offset, int count, CancellationToken ct)
+        {
+            int total = 0;
+            while (total < count)
+            {
+                int read = await stream.ReadAsync(buf, offset + total, count - total, ct).ConfigureAwait(false);
+                if (read == 0)
+                    throw new IOException("Connection closed during resume response");
+                total += read;
             }
         }
 
