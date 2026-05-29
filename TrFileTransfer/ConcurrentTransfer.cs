@@ -58,7 +58,6 @@ namespace TrFileTransfer
             Log(string.Format("Concurrent send: {0} in {1} chunks", fileName, chunks));
 
             var tasks = new List<Task>();
-            var cts = new CancellationTokenSource();
 
             for (int i = 0; i < chunks; i++)
             {
@@ -78,7 +77,6 @@ namespace TrFileTransfer
             }
             catch (Exception ex)
             {
-                cts.Cancel();
                 var errHandler = OnError;
                 if (errHandler != null) errHandler("Concurrent transfer failed: " + ex.Message);
             }
