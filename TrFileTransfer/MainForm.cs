@@ -50,6 +50,7 @@ namespace TrFileTransfer
         private Label _lblConcurrency;
         private Label _lblSrcPort;
         private NumericUpDown _numSrcPort;
+        private Button _btnResumeList;
 
         // Progress
         private GroupBox _gbProgressS;
@@ -173,6 +174,8 @@ namespace TrFileTransfer
                 Minimum = 1, Maximum = 16, Value = 4
             };
             _numConcurrency.ValueChanged += NumConcurrency_ValueChanged;
+            _btnResumeList = new Button { Location = new Point(520, 93), Width = 45, Height = 22 };
+            _btnResumeList.Click += BtnResumeList_Click;
             _gbClient.Controls.Add(_lblServerIp);
             _gbClient.Controls.Add(_txtServerIp);
             _gbClient.Controls.Add(_lblPortC);
@@ -188,6 +191,7 @@ namespace TrFileTransfer
             _gbClient.Controls.Add(_chkMonitor);
             _gbClient.Controls.Add(_lblConcurrency);
             _gbClient.Controls.Add(_numConcurrency);
+            _gbClient.Controls.Add(_btnResumeList);
             _gbClient.Controls.Add(_btnSend);
             _gbClient.Controls.Add(_btnCancel);
 
@@ -257,6 +261,7 @@ namespace TrFileTransfer
             _btnSend.Text = _chkMonitor.Checked ? L.StartMonitor : (_chkFolder.Checked ? L.SendFolder : L.SendFile);
             _btnCancel.Text = L.CancelBtn;
             _chkFolder.Text = L.FolderMode;
+            _btnResumeList.Text = L.ResumeBtn;
             _chkMonitor.Text = L.MonitorMode;
             _lblConcurrency.Text = L.ConcurrencyLabel;
             _lblSrcPort.Text = L.SrcPortLabel;
@@ -425,6 +430,44 @@ namespace TrFileTransfer
             else
             {
                 AddLog(L.DragDropInvalid(path));
+            }
+        }
+
+        private void BtnResumeList_Click(object sender, EventArgs e)
+        {
+            var states = ResumeState.ListAll();
+            var validStates = new System.Collections.Generic.List<ResumeState>();
+            if (states != null)
+            {
+                foreach (var s in states) { if (s != null) validStates.Add(s); }
+            }
+            if (validStates.Count == 0)
+            {
+                MessageBox.Show(L.ResumeListEmpty, L.ResumeListTitle,
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            using (var dlg = new ResumeDialog(validStates.ToArray()))
+            {
+                if (dlg.ShowDialog() == DialogResult.OK && dlg.SelectedState != null)
+                {
+                    var s = dlg.SelectedState;
+                    _txtServerIp.Text = s.ServerIp;
+                    _txtPortC.Text = s.Port.ToString();
+                    _txtFile.Text = s.FilePath;
+                    _chkFolder.Checked = false;
+                    _numConcurrency.Value = 1;
+                    if (s.IsUdt)
+                    {
+                        _rbClientTcp.Checked = false;
+                        _rbClientUdt.Checked = true;
+                    }
+                    else
+                    {
+                        _rbClientTcp.Checked = true;
+                        _rbClientUdt.Checked = false;
+                    }
+                }
             }
         }
 
@@ -607,6 +650,7 @@ namespace TrFileTransfer
             _chkMonitor.Enabled = false;
             _numConcurrency.Enabled = false;
             _numSrcPort.Enabled = false;
+            _btnResumeList.Enabled = false;
         }
 
         private void OnServerStarted()
@@ -813,6 +857,7 @@ namespace TrFileTransfer
             _chkMonitor.Enabled = true;
             _numConcurrency.Enabled = true;
             _numSrcPort.Enabled = true;
+            _btnResumeList.Enabled = true;
         }
 
         private static string FormatEta(TransferProgress p)
@@ -1138,6 +1183,98 @@ namespace TrFileTransfer
             if (_clientUdt != null)
                 _clientUdt.Cancel();
             base.OnFormClosing(e);
+        }
+    }
+
+    public class ResumeDialog : Form
+    {
+        public ResumeState SelectedState;
+        private ListBox _list;
+        private Button _btnContinue, _btnDelete, _btnClearAll, _btnClose;
+        private ResumeState[] _states;
+
+        public ResumeDialog(ResumeState[] states)
+        {
+            _states = states;
+            Text = L.ResumeListTitle;
+            Size = new Size(520, 320);
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            Font = new Font("Segoe UI", 9f);
+
+            _list = new ListBox
+            {
+                Location = new Point(12, 12), Width = 480, Height = 200,
+                IntegralHeight = false
+            };
+            for (int i = 0; i < states.Length; i++)
+            {
+                var s = states[i];
+                if (s == null) continue;
+                string progress = s.TotalSize > 0
+                    ? string.Format("{0:F1}%", 100.0 * s.SentBytes / s.TotalSize)
+                    : "?";
+                _list.Items.Add(string.Format("{0} -> {1}:{2} [{3}] {4}",
+                    s.FileName, s.ServerIp, s.Port, progress,
+                    s.Created.ToLocalTime().ToString("g")));
+            }
+            Controls.Add(_list);
+
+            _btnContinue = new Button { Text = L.ResumeBtn, Location = new Point(12, 220), Width = 100 };
+            _btnContinue.Click += BtnContinue_Click;
+            Controls.Add(_btnContinue);
+
+            _btnDelete = new Button { Text = L.ResumeDelete, Location = new Point(120, 220), Width = 100 };
+            _btnDelete.Click += BtnDelete_Click;
+            Controls.Add(_btnDelete);
+
+            _btnClearAll = new Button { Text = L.ResumeClearAll, Location = new Point(228, 220), Width = 100 };
+            _btnClearAll.Click += BtnClearAll_Click;
+            Controls.Add(_btnClearAll);
+
+            _btnClose = new Button { Text = L.CancelBtn, Location = new Point(370, 220), Width = 100 };
+            _btnClose.Click += (__, ___) => Close();
+            Controls.Add(_btnClose);
+        }
+
+        private void BtnContinue_Click(object sender, EventArgs e)
+        {
+            int idx = _list.SelectedIndex;
+            if (idx >= 0 && idx < _states.Length)
+            {
+                SelectedState = _states[idx];
+                DialogResult = DialogResult.OK;
+                Close();
+            }
+        }
+
+        private void BtnDelete_Click(object sender, EventArgs e)
+        {
+            int idx = _list.SelectedIndex;
+            if (idx >= 0 && idx < _states.Length && _states[idx] != null)
+            {
+                ResumeState.Delete(_states[idx].SessionId);
+                _list.Items.RemoveAt(idx);
+                // rebuild state array without the deleted item
+                var newStates = new System.Collections.Generic.List<ResumeState>();
+                for (int i = 0; i < _states.Length; i++)
+                {
+                    if (i != idx && _states[i] != null) newStates.Add(_states[i]);
+                }
+                _states = newStates.ToArray();
+            }
+        }
+
+        private void BtnClearAll_Click(object sender, EventArgs e)
+        {
+            for (int i = 0; i < _states.Length; i++)
+            {
+                if (_states[i] != null) ResumeState.Delete(_states[i].SessionId);
+            }
+            _list.Items.Clear();
+            _states = new ResumeState[0];
         }
     }
 }

@@ -276,6 +276,13 @@ namespace TrFileTransfer
                 ? string.Format("[拖放] 无法识别的拖放内容: {0}", path)
                 : string.Format("[Drop] Unrecognized drop content: {0}", path);
         }
+        public static string ResumeListTitle { get { return IsChinese ? "续传任务" : "Resume Tasks"; } }
+        public static string ResumePromptFile { get { return IsChinese ? "上次传输未完成，是否续传？" : "Previous transfer incomplete. Resume?"; } }
+        public static string ResumeBtn { get { return IsChinese ? "续传" : "Resume"; } }
+        public static string ReSendBtn { get { return IsChinese ? "重新发送" : "Re-send"; } }
+        public static string ResumeDelete { get { return IsChinese ? "删除" : "Delete"; } }
+        public static string ResumeClearAll { get { return IsChinese ? "全部清空" : "Clear All"; } }
+        public static string ResumeListEmpty { get { return IsChinese ? "没有未完成的传输任务。" : "No incomplete transfer tasks."; } }
         public static string MonitorStarted(object path)
         {
             return IsChinese
