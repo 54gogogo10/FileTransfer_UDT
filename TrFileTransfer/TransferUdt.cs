@@ -450,11 +450,10 @@ namespace TrFileTransfer
                 {
                     var ccHandler = OnClientTransferComplete;
                     if (ccHandler != null) ccHandler(clientEp);
+                    // Application-level ACK only on verified success (not chunked — already sent above)
+                    var ack = new byte[1] { 0x01 };
+                    await Task.Run(() => UdtNative.udt_send(clientSocket, ack, 1, 0), ct);
                 }
-
-                // Application-level ACK: tell client we received data successfully
-                var ack = new byte[1] { 0x01 };
-                await Task.Run(() => UdtNative.udt_send(clientSocket, ack, 1, 0), ct);
             }
             catch (OperationCanceledException) { }
             catch (IOException ex)

@@ -202,6 +202,7 @@ namespace TrFileTransfer
         private int FindLocalPort(int index)
         {
             int basePort = _srcPort > 0 ? _srcPort + index : _port + index + 1;
+            if (basePort > 65535) basePort = 49152 + (basePort % 1024); // wrap to ephemeral range
             return Utils.FindFreePort(basePort, _isUdt);
         }
 

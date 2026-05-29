@@ -75,6 +75,7 @@ namespace TrFileTransfer
 
         // Monitor mode
         private System.Threading.CancellationTokenSource _monitorCts;
+        private int _monitorSrcPort;
         private System.Collections.Generic.List<string> _monitorQueue = new System.Collections.Generic.List<string>();
         private readonly object _monitorLock = new object();
 
@@ -297,7 +298,7 @@ namespace TrFileTransfer
             _txtFile.Text = Config.Get("LastPath", "");
             _chkFolder.Checked = Config.GetBool("FolderMode", false);
             _chkMonitor.Checked = Config.GetBool("MonitorMode", false);
-            _numConcurrency.Value = Math.Max(1, Math.Min(64, Config.GetInt("Concurrency", 4)));
+            _numConcurrency.Value = Math.Max(1, Math.Min(16, Config.GetInt("Concurrency", 4)));
             _numSrcPort.Value = Math.Max(0, Math.Min(65535, Config.GetInt("SrcPort", 0)));
         }
 
@@ -381,7 +382,7 @@ namespace TrFileTransfer
         private void NumConcurrency_ValueChanged(object sender, EventArgs e)
         {
             if (_numConcurrency.Value < 1) _numConcurrency.Value = 1;
-            if (_numConcurrency.Value > 64) _numConcurrency.Value = 64;
+            if (_numConcurrency.Value > 16) _numConcurrency.Value = 16;
         }
 
         private void ChkMonitor_CheckedChanged(object sender, EventArgs e)
@@ -901,6 +902,7 @@ namespace TrFileTransfer
         private void StartMonitoring(string folderPath, string ip, int port)
         {
             _monitorCts = new System.Threading.CancellationTokenSource();
+            _monitorSrcPort = (int)_numSrcPort.Value;
 
             DisableClientInputs();
             _lblStatusC.Text = L.MonitorWaiting;
@@ -985,7 +987,9 @@ namespace TrFileTransfer
                 var card = (Panel)this.Invoke((Func<Panel>)(() => CreateTransferCard(_progressPanelC)));
                 if (_rbClientTcp.Checked)
                 {
-                    var client = new TransferClient(ip, port, filePath);
+                    var client = _monitorSrcPort > 0
+                        ? new TransferClient(ip, port, filePath, _monitorSrcPort)
+                        : new TransferClient(ip, port, filePath);
                     client.OnLog += msg => this.Invoke((Action)(() => AddLog(msg)));
                     client.OnProgress += p => this.Invoke((Action)(() => UpdateCardProgress(card, p)));
                     client.OnError += msg => this.Invoke((Action)(() => AddLog(L.MonitorFileSendFailed(fileName, msg))));
@@ -995,7 +999,9 @@ namespace TrFileTransfer
                 }
                 else
                 {
-                    var clientUdt = new TransferUdtClient(ip, port, filePath);
+                    var clientUdt = _monitorSrcPort > 0
+                        ? new TransferUdtClient(ip, port, filePath, _monitorSrcPort)
+                        : new TransferUdtClient(ip, port, filePath);
                     clientUdt.OnLog += msg => this.Invoke((Action)(() => AddLog(msg)));
                     clientUdt.OnProgress += p => this.Invoke((Action)(() => UpdateCardProgress(card, p)));
                     clientUdt.OnError += msg => this.Invoke((Action)(() => AddLog(L.MonitorFileSendFailed(fileName, msg))));
