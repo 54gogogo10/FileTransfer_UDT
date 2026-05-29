@@ -231,6 +231,8 @@ namespace TrFileTransfer
             = new System.Collections.Generic.List<int>();
         private readonly System.Collections.Concurrent.ConcurrentDictionary<string, ChunkTracker> _chunkTrackers
             = new System.Collections.Concurrent.ConcurrentDictionary<string, ChunkTracker>();
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, ResumeState> _udtResumeStates
+            = new System.Collections.Concurrent.ConcurrentDictionary<Guid, ResumeState>();
 
         /// <summary>Fired for every log message.</summary>
         public event Action<string> OnLog;
@@ -442,6 +444,10 @@ namespace TrFileTransfer
                     var ccHandler = OnClientTransferComplete;
                     if (ccHandler != null) ccHandler(clientEp);
                     completed = false; // don't fire again below
+                }
+                else if (transferType == 0x03)
+                {
+                    completed = await HandleResumableFileUdt(clientSocket, ct);
                 }
                 else
                     completed = await HandleFileTransfer(clientSocket, ct);
@@ -667,6 +673,112 @@ namespace TrFileTransfer
             return false;
         }
 
+        private async Task<bool> HandleResumableFileUdt(int clientSocket, CancellationToken ct)
+        {
+            // Read header: sessionId(16) + totalSize(8) + clientOffset(8) + nameLen(4) = 36
+            var headerBuf = new byte[36];
+            if (await UdtIo.UdtReadExactAsync(clientSocket, headerBuf, 0, 36, ct) == 0)
+                return false;
+
+            var sidBytes = new byte[16];
+            Buffer.BlockCopy(headerBuf, 0, sidBytes, 0, 16);
+            var sessionId = new Guid(sidBytes);
+            long totalSize = BitConverter.ToInt64(headerBuf, 16);
+            long clientOffset = BitConverter.ToInt64(headerBuf, 24);
+            int nameLen = BitConverter.ToInt32(headerBuf, 32);
+
+            if (totalSize <= 0 || clientOffset < 0 || clientOffset > totalSize || nameLen <= 0 || nameLen > 4096)
+            {
+                Log(L.S_InvalidHeader(totalSize, nameLen));
+                return false;
+            }
+
+            var nameBuf = new byte[nameLen];
+            await UdtIo.UdtReadExactAsync(clientSocket, nameBuf, 0, nameLen, ct);
+            string fileName = System.Text.Encoding.UTF8.GetString(nameBuf);
+            fileName = Path.GetFileName(fileName);
+
+            ResumeState state;
+            byte status;
+            long resumeFrom;
+
+            if (!_udtResumeStates.TryGetValue(sessionId, out state))
+            {
+                state = new ResumeState
+                {
+                    SessionId = sessionId, TotalSize = totalSize,
+                    FileName = fileName, ReceivedBytes = 0
+                };
+                state.SavePath = Utils.GetUniqueSavePath(_saveDirectory, fileName);
+                state.WriteStream = new FileStream(state.SavePath, FileMode.Create, FileAccess.Write,
+                    FileShare.None, 4096, FileOptions.RandomAccess);
+                state.WriteStream.SetLength(totalSize);
+                _udtResumeStates[sessionId] = state;
+                status = 0;
+                resumeFrom = 0;
+            }
+            else
+            {
+                if (state.TotalSize != totalSize) return false;
+                if (state.ReceivedBytes >= totalSize)
+                {
+                    // Already complete — send status=2
+                    var doneResp = new byte[10];
+                    doneResp[0] = 0x10;
+                    Buffer.BlockCopy(BitConverter.GetBytes(totalSize), 0, doneResp, 1, 8);
+                    doneResp[9] = 2;
+                    await Task.Run(() => UdtNative.udt_send(clientSocket, doneResp, 10, 0), ct);
+                    return true;
+                }
+                status = 1;
+                resumeFrom = state.ReceivedBytes;
+            }
+
+            long actualStart = Math.Max(clientOffset, resumeFrom);
+            var resp = new byte[10];
+            resp[0] = 0x10;
+            Buffer.BlockCopy(BitConverter.GetBytes(actualStart), 0, resp, 1, 8);
+            resp[9] = status;
+            await Task.Run(() => UdtNative.udt_send(clientSocket, resp, 10, 0), ct);
+
+            // Receive remaining data + SHA256
+            long remaining = totalSize - actualStart;
+            state.WriteStream.Seek(actualStart, SeekOrigin.Begin);
+            using (var sha256 = System.Security.Cryptography.SHA256.Create())
+            {
+                var buf = new byte[4194304]; // 4 MB
+                long bytesRead = 0;
+                while (bytesRead < remaining)
+                {
+                    int toRead = (int)Math.Min(remaining - bytesRead, (long)buf.Length);
+                    int read = await Task.Run(() => UdtNative.udt_recv(clientSocket, buf, toRead, 0), ct);
+                    if (read == UdtNative.ERROR) return false;
+                    if (read == 0) return false;
+                    sha256.TransformBlock(buf, 0, read, null, 0);
+                    state.WriteStream.Write(buf, 0, read);
+                    bytesRead += read;
+                    state.ReceivedBytes = actualStart + bytesRead;
+                }
+                sha256.TransformFinalBlock(buf, 0, 0);
+                var computedHash = sha256.Hash;
+                var receivedHash = new byte[32];
+                await UdtIo.UdtReadExactAsync(clientSocket, receivedHash, 0, 32, ct);
+
+                if (Utils.ConstantTimeEquals(computedHash, receivedHash))
+                {
+                    state.WriteStream.Dispose();
+                    state.WriteStream = null;
+                    ResumeState removed;
+                    _udtResumeStates.TryRemove(sessionId, out removed);
+                    Log(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
+                    var ch = OnTransferComplete;
+                    if (ch != null) ch();
+                    return true;
+                }
+            }
+            return false;
+        }
+
         private async Task<bool> ReceiveFilePayload(int clientSocket, string savePath, long fileSize,
             string displayName, CancellationToken ct)
         {
@@ -849,6 +961,13 @@ namespace TrFileTransfer
             await RunUdtTransfer(ct => SendChunkedInternal(offset, chunkSize, totalSize, ct));
         }
 
+        public async Task<Guid> SendResumableAsync(Guid? existingSessionId = null)
+        {
+            var sessionId = existingSessionId ?? Guid.NewGuid();
+            await RunUdtTransfer(ct => SendResumableUdtInternal(sessionId, ct));
+            return sessionId;
+        }
+
         private async Task RunUdtTransfer(Func<CancellationToken, Task> transferAction)
         {
             _cts = new CancellationTokenSource();
@@ -958,6 +1077,82 @@ namespace TrFileTransfer
             Log(L.C_TransferDone(fileName + " chunk", Utils.FormatSize(chunkSize),
                 sw.Elapsed.TotalSeconds,
                 Utils.FormatSize((long)(chunkSize / Math.Max(sw.Elapsed.TotalSeconds, 0.001)))));
+        }
+
+        private async Task SendResumableUdtInternal(Guid sessionId, CancellationToken ct)
+        {
+            ResumeState.EnsureDir();
+            var fileInfo = new FileInfo(_filePath);
+            long fileSize = fileInfo.Length;
+            string fileName = fileInfo.Name;
+            long sentBytes = 0;
+
+            var existingState = ResumeState.Load(sessionId);
+            if (existingState != null)
+            {
+                sentBytes = existingState.SentBytes;
+                Log(L.C_Resuming(fileName, sentBytes, Utils.FormatSize(sentBytes)));
+            }
+            else
+            {
+                var newState = new ResumeState
+                {
+                    SessionId = sessionId,
+                    TotalSize = fileSize,
+                    FileName = fileName,
+                    FilePath = _filePath,
+                    ServerIp = _serverIp,
+                    Port = _port,
+                    IsUdt = true,
+                    Created = DateTime.UtcNow,
+                    SentBytes = 0
+                };
+                newState.Save();
+            }
+
+            await UdtConnect(ct).ConfigureAwait(false);
+
+            // Build 0x03 header: type(1) + sessionId(16) + totalSize(8) + offset(8) + nameLen(4) + name
+            byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(fileName);
+            var header = new byte[1 + 16 + 8 + 8 + 4 + nameBytes.Length];
+            int pos = 0;
+            header[pos++] = 0x03;
+            Buffer.BlockCopy(sessionId.ToByteArray(), 0, header, pos, 16); pos += 16;
+            Buffer.BlockCopy(BitConverter.GetBytes(fileSize), 0, header, pos, 8); pos += 8;
+            Buffer.BlockCopy(BitConverter.GetBytes(sentBytes), 0, header, pos, 8); pos += 8;
+            Buffer.BlockCopy(BitConverter.GetBytes(nameBytes.Length), 0, header, pos, 4); pos += 4;
+            Buffer.BlockCopy(nameBytes, 0, header, pos, nameBytes.Length);
+
+            await UdtIo.UdtWriteExactAsync(_socket, header, 0, header.Length, ct).ConfigureAwait(false);
+
+            // Read 0x10 server response (10 bytes)
+            var respBuf = new byte[10];
+            await UdtIo.UdtReadExactAsync(_socket, respBuf, 0, 10, ct).ConfigureAwait(false);
+
+            if (respBuf[0] != 0x10)
+                throw new InvalidDataException(string.Format("Unexpected resume response type: {0}", respBuf[0]));
+
+            byte respStatus = respBuf[9];
+            long serverOffset = BitConverter.ToInt64(respBuf, 1);
+
+            if (respStatus == 2)
+            {
+                Log(L.C_AlreadyReceived(fileName));
+                ResumeState.Delete(sessionId);
+                var completeHandler = OnTransferComplete;
+                if (completeHandler != null) completeHandler();
+                return;
+            }
+
+            long actualStart = Math.Max(sentBytes, serverOffset);
+            long remainingSize = fileSize - actualStart;
+            Log(L.C_ResumeNegotiated(actualStart, serverOffset, sentBytes));
+
+            await SendFilePayload(_socket, _filePath, remainingSize, fileName, ct, actualStart).ConfigureAwait(false);
+
+            ResumeState.Delete(sessionId);
+            var ch = OnTransferComplete;
+            if (ch != null) ch();
         }
 
         private async Task SendFileInternal(CancellationToken ct)
