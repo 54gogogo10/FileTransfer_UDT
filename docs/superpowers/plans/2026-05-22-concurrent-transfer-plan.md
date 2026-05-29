@@ -1,6 +1,8 @@
 # Concurrent Multi-Connection Transfer Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **状态：已完成**（2026-05-29）。所有任务已实现并合并到 master 分支。CLAUDE.md 中的 @superpowers 元数据不准确：9 个源文件、UDT 替代 UDP、ConcurrentTransfer 已实现。无需重新实现。
+
+> **For agentic workers (historical):** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add multi-connection concurrent file transfer — single files split into N chunks sent in parallel, folders send N files in parallel. TCP+UDP, concurrency 1-64.
 

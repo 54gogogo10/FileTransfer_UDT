@@ -1,5 +1,7 @@
 # Concurrent Multi-Connection Transfer Design
 
+> **状态：已实现**（2026-05-29）。此文档为实现前的设计方案，供历史参考。实际实现细节可能与此处描述不同——以 CLAUDE.md 和当前代码为准。
+
 ## Summary
 
 Add multi-connection concurrent file transfer to TrFileTransfer client. Single large files are split into equal chunks sent over N parallel connections. Folder transfers send up to N files in parallel (one per connection). Both TCP and UDP supported. Concurrency configurable 1-64.

@@ -42,88 +42,80 @@
 
 所有多字节整数均为小端序。
 
+### 分块文件（类型 `0x02`）
+
+用于并发传输——将单个大文件拆分为多个等大分块，每个分块通过独立连接并行发送。服务端通过 `ChunkTracker` 按文件名聚合，写入预分配文件（`SetLength`）的对应偏移位置。
+
+```
+[1 byte:  0x02]                // 分块文件标记
+[8 bytes: Int64 totalFileSize] // 文件总大小（所有分块合计）
+[8 bytes: Int64 chunkOffset]   // 此分块在文件中的字节偏移
+[8 bytes: Int64 chunkSize]     // 此分块数据大小
+[4 bytes: Int32 nameLen]       // 文件名长度
+[N bytes: UTF-8 fileName]      // 文件名（所有分块使用相同文件名，作为聚合键）
+[M bytes: chunkData]           // chunkSize 字节的数据
+[32 bytes: SHA256]             // 此分块数据的 SHA-256
+```
+
+每个分块独立发送头部+数据+哈希。服务端收到首个分块时创建 `ChunkTracker`：
+- 调用 `Utils.GetUniqueSavePath` 解析保存路径（处理名称冲突）
+- 创建 `FileStream`，调用 `SetLength(totalSize)` 预分配
+- 后续分块 Seek 到对应偏移写入，`BytesReceived` 累加
+- `BytesReceived >= TotalSize` 时文件完成，触发 `OnTransferComplete`，释放 tracker
+
+末块可能小于其他块——服务端以头部 `chunkSize` 为准，不自行计算。
+
 ### 服务器行为
 
 - 文件名通过 `Path.GetFileName()` 清理；文件夹传输的相对路径通过 `SanitizeRelativePath` 处理（替换 `..` / `.`）。
 - 名称冲突时在扩展名前追加 `_1`、`_2` 等。
 - 任何文件 SHA-256 不匹配，整个文件夹传输中止。
+- 分块传输的 `ChunkTracker` 在首块到达时预分配文件，即使后续块乱序到达也能正确写入对应偏移位置。
 
 ---
 
-## UDP 协议
+## UDT 协议
 
-### 包格式（固定 14 字节头部）
+UDT（UDP-based Data Transfer）在 UDP 之上提供可靠、有序字节流（STREAM 模式）。拥塞控制、丢包恢复和重排序由 UDT4/libudt v4.11 库内部处理。
 
-```
-偏移  大小  字段
-----  ----  -----
-0     4     魔数 = 0x55445054（"UDPT"）
-4     1     类型（见下表）
-5     1     保留（始终为 0）
-6     4     序号，Int32 小端序
-10    4     正文长度，Int32 小端序
-14    N     正文（bodyLen 字节）
-```
+**应用层协议与 TCP 完全相同**——UDT 的 `TransferUdtServer` 和 `TransferUdtClient` 发送/接收与 TCP 章节所述相同格式的数据（1 字节类型 + 头部 + 载荷 + SHA-256），仅传输层不同。
 
-### 包类型
+### UDT 特性
 
-| 类型 | 值 | 正文 | 用途 |
-|------|-----|------|------|
-| HELLO     | 0 | transferType(1) + fileSize(8) + nameLen(2) + fileName(N) | 发起文件传输 |
-| DATA      | 1 | 文件块（≤ 4096 字节） | 文件载荷 |
-| ACK       | 2 | 空 | 累计确认（最高连续收到的 seq） |
-| FIN       | 3 | SHA-256 哈希（32 字节） | 文件结束 + 完整性 |
-| FIN\_ACK  | 4 | 空 | 服务器确认哈希匹配 |
-| FOLDER\_END | 5 | 空 | 文件夹传输完成 |
-| NAK       | 6 | 空 | seq = 缺失块号，客户端选择性重传该块 |
+| 特性 | 说明 |
+|------|------|
+| 模式 | STREAM（类 TCP 语义） |
+| 拥塞控制 | UDT 内置（类似于 TCP BIC） |
+| 超时 | `UDT_RCVTIMEO` / `UDT_SNDTIMEO` = 30 秒 |
+| 缓冲区 | 4 MB（发送 & 接收） |
+| DLL 大小 | `udt.dll` + `libmcfgthread-2.dll` ≈ 实体内嵌 |
 
-HELLO 正文 `transferType`：`0x00` = 单文件（服务器应用 `Path.GetFileName`），
-`0x01` = 文件夹文件（服务器保留相对路径，创建子目录）。
+### 连接建立
 
-### 流程 — 单文件
+UDT `udt_connect()` 为异步握手（返回时可能仍处于 BOUND 状态）。客户端通过 `WaitForConnectionReady()` 轮询（30 次 × 200ms），执行一次小 `udt_send()` 等待套接字进入 CONNECTED 状态后再发送实际数据。
 
-```
-客户端                          服务器
-  |                               |
-  |--- HELLO(seq=0) ------------>|
-  |                               |  发送 HELLO_ACK（常规 ACK，seq=0）
-  |<-- ACK(seq=0) ---------------|
-  |                               |
-  |--- DATA[0]  ---------------->|
-  |--- DATA[1]  ---------------->|
-  |       ...（滑动窗口）           |
-  |--- DATA[N]  ---------------->|
-  |<-- ACK(seq=K) ---------------|  （累计，批量每窗或 50ms 定时器）
-  |       ...                     |
-  |                               |
-  |--- FIN(sha256) ------------->|
-  |                               |  验证哈希；落盘后发送 FIN_ACK 或 FIN
-  |<-- FIN_ACK ------------------|
-```
+### 类型支持
 
-### 流程 — 文件夹传输
+UDT 传输支持所有 TCP 线协议类型：
+- `0x00` — 单文件
+- `0x01` — 文件夹
+- `0x02` — 分块文件（配合 `ConcurrentTransfer`）
 
-文件夹中每个文件以独立的 HELLO → DATA… → FIN → FIN\_ACK 周期发送，
-使用 `transferType=0x01`，相对路径（前缀为源文件夹名，如 `"MyFolder\subdir\file.txt"`）。
-最后一个文件发送后，客户端发送单个 FOLDER\_END 包；服务器回复 ACK(seq=0)
-并触发 `OnTransferComplete`。
+### 服务端
 
-### Go-Back-N ARQ 参数
+`TransferUdtServer` 使用 `udt_bind()` → `udt_listen(10)` → accept 循环（类似 TCP 服务器模式）。每个客户端连接通过 `udt_accept()` 获取独立套接字，fire-and-forget `HandleClient`。Stop 时关闭所有活跃客户端套接字以中断阻塞中的 I/O。
 
-| 参数 | 值 |
-|------|-----|
-| 窗口大小 | 512 块 |
-| 块大小 | 4096 字节（~3 IP 分片，避免 32KB 分片爆炸） |
-| 重传超时 | 初始 3 秒，动态收敛至 max(4×RTT, 500ms) |
-| 最大重传次数 | 15 |
-| FIN 重试次数 | 5 |
-| 套接字缓冲区 | 4 MB（发送 & 接收） |
+### 客户端
 
-客户端批量发送整窗（`Task.WhenAll`），服务端批量 ACK（每窗或 50ms）。 
-服务端检测到缺口（3 次乱序到达）时发送 NAK，客户端选择性重传缺失块（非 Go-Back-N）。
-超时重传仍使用 Go-Back-N。
+`TransferUdtClient` 使用 `udt_connect()` → `WaitForConnectionReady()` → 发送 TCP 线协议数据 → drain 接收 → `udt_close()`。
 
-客户端以 1 MB 缓冲读取文件切片为块；服务端以 2 MB 缓冲写入，满窗刷新到磁盘。
+### DLL 嵌入
+
+`udt.dll` 和 `libmcfgthread-2.dll` 通过 csc.exe `/resource` 嵌入 exe。首次运行时由 `UdtDll.EnsureExtracted()` 提取到 exe 目录（只读目录回退到 `%TEMP%` + `SetDllDirectory`）。杀软文件锁采用重试机制（最多 3 次，间隔 200ms）。P/Invoke 通过 `udt_c_wrapper.cpp` 导出的纯 C 函数（14 个 API）调用，使用 `CallingConvention.Cdecl`。
+
+### 生命周期
+
+`UdtStartup()` / `UdtCleanup()` 通过引用计数管理——仅当计数归零时才调用原生 `udt_cleanup()`，防止客户端传输完成时关闭活跃的服务器连接。
 
 ---
 

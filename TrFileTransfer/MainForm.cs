@@ -97,6 +97,9 @@ namespace TrFileTransfer
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             Font = new Font("Segoe UI", 9f);
+            AllowDrop = true;
+            DragEnter += MainForm_DragEnter;
+            DragDrop += MainForm_DragDrop;
 
             // Language selector
             _cmbLang = new ComboBox
@@ -152,22 +155,21 @@ namespace TrFileTransfer
             _btnSend.Click += BtnSend_Click;
             _btnCancel = new Button { Location = new Point(455, 56), Width = 110, Height = 30, Enabled = false };
             _btnCancel.Click += BtnCancel_Click;
-            // Source port — row below IP/port
-            _lblSrcPort = new Label { Location = new Point(15, 53), Width = 90, TextAlign = ContentAlignment.MiddleRight };
-            _numSrcPort = new NumericUpDown { Location = new Point(110, 50), Width = 70, Minimum = 0, Maximum = 65535, Value = 0 };
-            _btnSend.Click += BtnSend_Click;
+            // Source port — on monitor row
+            _lblSrcPort = new Label { Location = new Point(15, 93), Width = 100, TextAlign = ContentAlignment.MiddleRight };
+            _numSrcPort = new NumericUpDown { Location = new Point(118, 93), Width = 50, Minimum = 0, Maximum = 65535, Value = 0 };
             _lblFile = new Label { Location = new Point(15, 63), Width = 48, TextAlign = ContentAlignment.MiddleRight };
             _txtFile = new TextBox { Location = new Point(68, 60), Width = 290 };
             _btnBrowseFile = new Button { Location = new Point(365, 59), Width = 80 };
             _btnBrowseFile.Click += BtnBrowseFile_Click;
-            _chkFolder = new CheckBox { Location = new Point(180, 93), Width = 100, TextAlign = ContentAlignment.MiddleLeft };
+            _chkFolder = new CheckBox { Location = new Point(275, 93), Width = 100, TextAlign = ContentAlignment.MiddleLeft };
             _chkFolder.CheckedChanged += ChkFolder_CheckedChanged;
-            _chkMonitor = new CheckBox { Location = new Point(70, 95), Width = 100, TextAlign = ContentAlignment.MiddleLeft };
+            _chkMonitor = new CheckBox { Location = new Point(175, 94), Width = 95, TextAlign = ContentAlignment.MiddleLeft };
             _chkMonitor.CheckedChanged += ChkMonitor_CheckedChanged;
-            _lblConcurrency = new Label { Location = new Point(245, 93), Width = 95, TextAlign = ContentAlignment.MiddleRight };
+            _lblConcurrency = new Label { Location = new Point(378, 93), Width = 85, TextAlign = ContentAlignment.MiddleRight };
             _numConcurrency = new NumericUpDown
             {
-                Location = new Point(345, 93), Width = 50,
+                Location = new Point(466, 93), Width = 50,
                 Minimum = 1, Maximum = 16, Value = 4
             };
             _numConcurrency.ValueChanged += NumConcurrency_ValueChanged;
@@ -392,6 +394,38 @@ namespace TrFileTransfer
             _btnSend.Text = isMonitor ? L.StartMonitor : (_chkFolder.Checked ? L.SendFolder : L.SendFile);
             _chkFolder.Enabled = !isMonitor;
             _txtFile.Text = "";
+        }
+
+        private void MainForm_DragEnter(object sender, DragEventArgs e)
+        {
+            if (e.Data.GetDataPresent(DataFormats.FileDrop))
+                e.Effect = DragDropEffects.Copy;
+            else
+                e.Effect = DragDropEffects.None;
+        }
+
+        private void MainForm_DragDrop(object sender, DragEventArgs e)
+        {
+            var files = (string[])e.Data.GetData(DataFormats.FileDrop);
+            if (files == null || files.Length == 0) return;
+            if (files.Length > 1)
+                AddLog(L.DragDropOnlyFirst(files[0], files.Length));
+            string path = files[0];
+
+            if (Directory.Exists(path))
+            {
+                _chkFolder.Checked = true;
+                _txtFile.Text = path;
+            }
+            else if (File.Exists(path))
+            {
+                _chkFolder.Checked = false;
+                _txtFile.Text = path;
+            }
+            else
+            {
+                AddLog(L.DragDropInvalid(path));
+            }
         }
 
         private void BtnBrowseFile_Click(object sender, EventArgs e)

@@ -264,6 +264,18 @@ namespace TrFileTransfer
                 : string.Format("File not ready, moved to back of queue: {0}", fileName);
         }
         public static string MonitorDirNotExist { get { return IsChinese ? "监控目录不存在。" : "Monitor directory does not exist."; } }
+        public static string DragDropOnlyFirst(object fileName, int total)
+        {
+            return IsChinese
+                ? string.Format("[拖放] 仅加载了第1个文件: {0}，其余 {1} 个已忽略", fileName, total - 1)
+                : string.Format("[Drop] Loaded first file: {0}, {1} others ignored", fileName, total - 1);
+        }
+        public static string DragDropInvalid(object path)
+        {
+            return IsChinese
+                ? string.Format("[拖放] 无法识别的拖放内容: {0}", path)
+                : string.Format("[Drop] Unrecognized drop content: {0}", path);
+        }
         public static string MonitorStarted(object path)
         {
             return IsChinese
