@@ -357,7 +357,7 @@ namespace TrFileTransfer
         {
             // Read 0x03 header: sessionId(16) + totalSize(8) + resumeOffset(8) + nameLen(4) = 36
             var headerBuf = new byte[36];
-            await ReadExactAsync(stream, headerBuf, 0, 36, ct);
+            await ReadExactAsync(stream, headerBuf, 0, 36, ct).ConfigureAwait(false);
 
             var sidBytes = new byte[16];
             Buffer.BlockCopy(headerBuf, 0, sidBytes, 0, 16);
@@ -366,37 +366,54 @@ namespace TrFileTransfer
             long clientOffset = BitConverter.ToInt64(headerBuf, 24);
             int nameLen = BitConverter.ToInt32(headerBuf, 32);
 
-            if (totalSize <= 0 || nameLen <= 0 || nameLen > 4096)
+            if (totalSize <= 0 || clientOffset < 0 || clientOffset > totalSize || nameLen <= 0 || nameLen > 4096)
             {
                 Log(L.S_InvalidHeader(totalSize, nameLen));
                 return;
             }
 
             var nameBuf = new byte[nameLen];
-            await ReadExactAsync(stream, nameBuf, 0, nameLen, ct);
+            await ReadExactAsync(stream, nameBuf, 0, nameLen, ct).ConfigureAwait(false);
             string fileName = System.Text.Encoding.UTF8.GetString(nameBuf);
             fileName = Path.GetFileName(fileName);
             if (string.IsNullOrWhiteSpace(fileName))
                 fileName = L.S_ReceivedFile;
 
-            ResumeState state;
+            ResumeState state = null;
+            _resumeStates.TryGetValue(sessionId, out state);
             byte status;
             long resumeFrom;
+            bool isNew = (state == null);
 
-            if (!_resumeStates.TryGetValue(sessionId, out state))
+            if (isNew)
             {
-                state = new ResumeState
+                var newState = new ResumeState
                 {
                     SessionId = sessionId,
                     TotalSize = totalSize,
                     FileName = fileName,
                     ReceivedBytes = 0
                 };
-                state.SavePath = Utils.GetUniqueSavePath(_saveDirectory, fileName);
-                state.WriteStream = new FileStream(state.SavePath, FileMode.Create, FileAccess.Write,
+                newState.SavePath = Utils.GetUniqueSavePath(_saveDirectory, fileName);
+                newState.WriteStream = new FileStream(newState.SavePath, FileMode.Create, FileAccess.Write,
                     FileShare.None, _bufferSize, FileOptions.RandomAccess);
-                state.WriteStream.SetLength(totalSize);
-                _resumeStates[sessionId] = state;
+                newState.WriteStream.SetLength(totalSize);
+
+                if (_resumeStates.TryAdd(sessionId, newState))
+                {
+                    state = newState;
+                }
+                else
+                {
+                    newState.WriteStream.Dispose();
+                    try { File.Delete(newState.SavePath); } catch { }
+                    _resumeStates.TryGetValue(sessionId, out state);
+                    isNew = false;
+                }
+            }
+
+            if (isNew)
+            {
                 status = 0;
                 resumeFrom = 0;
             }
@@ -412,7 +429,7 @@ namespace TrFileTransfer
                 {
                     status = 2;
                     resumeFrom = totalSize;
-                    SendResumeResponse(stream, resumeFrom, status, ct);
+                    await SendResumeResponse(stream, resumeFrom, status, ct).ConfigureAwait(false);
                     return;
                 }
                 status = 1;
@@ -421,7 +438,7 @@ namespace TrFileTransfer
 
             // Negotiate: use max of client's claim and server's actual received
             long actualStart = Math.Max(clientOffset, resumeFrom);
-            SendResumeResponse(stream, actualStart, status, ct);
+            await SendResumeResponse(stream, actualStart, status, ct).ConfigureAwait(false);
 
             // If client has less than server, it'll re-send from actualStart
             long remaining = totalSize - actualStart;
@@ -430,53 +447,60 @@ namespace TrFileTransfer
 
             // Receive remaining data + SHA256
             state.WriteStream.Seek(actualStart, SeekOrigin.Begin);
-            var sha256 = System.Security.Cryptography.SHA256.Create();
-            long bytesRead = 0;
-            var buf = new byte[_bufferSize];
-
-            while (bytesRead < remaining && !ct.IsCancellationRequested)
+            using (var sha256 = System.Security.Cryptography.SHA256.Create())
             {
-                int toRead = (int)Math.Min(remaining - bytesRead, (long)buf.Length);
-                int read = await stream.ReadAsync(buf, 0, toRead, ct);
-                if (read == 0)
-                    throw new IOException(L.S_ConnClosedPrematurely);
-                sha256.TransformBlock(buf, 0, read, null, 0);
-                await state.WriteStream.WriteAsync(buf, 0, read, ct);
-                bytesRead += read;
-                state.ReceivedBytes = actualStart + bytesRead;
-            }
+                long bytesRead = 0;
+                var buf = new byte[_bufferSize];
 
-            sha256.TransformFinalBlock(buf, 0, 0);
-            var computedHash = sha256.Hash;
-            var receivedHash = new byte[32];
-            await ReadExactAsync(stream, receivedHash, 0, 32, ct);
+                while (bytesRead < remaining && !ct.IsCancellationRequested)
+                {
+                    int toRead = (int)Math.Min(remaining - bytesRead, (long)buf.Length);
+                    int read = await stream.ReadAsync(buf, 0, toRead, ct).ConfigureAwait(false);
+                    if (read == 0)
+                        throw new IOException(L.S_ConnClosedPrematurely);
+                    sha256.TransformBlock(buf, 0, read, null, 0);
+                    await state.WriteStream.WriteAsync(buf, 0, read, ct).ConfigureAwait(false);
+                    bytesRead += read;
+                    state.ReceivedBytes = actualStart + bytesRead;
+                }
 
-            if (Utils.ConstantTimeEquals(computedHash, receivedHash))
-            {
-                state.WriteStream.Dispose();
-                state.WriteStream = null;
-                ResumeState removed;
-                _resumeStates.TryRemove(sessionId, out removed);
-                Log(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
-                SendResumeResponse(stream, totalSize, 2, ct);
-                var completeHandler = OnTransferComplete;
-                if (completeHandler != null) completeHandler();
-            }
-            else
-            {
-                Log(L.S_HashFailed(fileName));
-                var errHandler = OnError;
-                if (errHandler != null) errHandler(L.S_HashFailed(fileName));
+                sha256.TransformFinalBlock(buf, 0, 0);
+                var computedHash = sha256.Hash;
+                var receivedHash = new byte[32];
+                await ReadExactAsync(stream, receivedHash, 0, 32, ct).ConfigureAwait(false);
+
+                if (Utils.ConstantTimeEquals(computedHash, receivedHash))
+                {
+                    state.WriteStream.Dispose();
+                    state.WriteStream = null;
+                    ResumeState removed;
+                    _resumeStates.TryRemove(sessionId, out removed);
+                    Log(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
+                    await SendResumeResponse(stream, totalSize, 2, ct).ConfigureAwait(false);
+                    var completeHandler = OnTransferComplete;
+                    if (completeHandler != null) completeHandler();
+                }
+                else
+                {
+                    // Clean up on hash failure
+                    try { state.WriteStream.Dispose(); } catch { }
+                    state.WriteStream = null;
+                    ResumeState removed;
+                    _resumeStates.TryRemove(sessionId, out removed);
+                    Log(L.S_HashFailed(fileName));
+                    var errHandler = OnError;
+                    if (errHandler != null) errHandler(L.S_HashFailed(fileName));
+                }
             }
         }
 
-        private static void SendResumeResponse(NetworkStream stream, long offset, byte status, CancellationToken ct)
+        private static async Task SendResumeResponse(NetworkStream stream, long offset, byte status, CancellationToken ct)
         {
             var resp = new byte[10]; // type(1) + offset(8) + status(1)
             resp[0] = 0x10;
             Buffer.BlockCopy(BitConverter.GetBytes(offset), 0, resp, 1, 8);
             resp[9] = status;
-            stream.WriteAsync(resp, 0, 10, ct).Wait();
+            await stream.WriteAsync(resp, 0, 10, ct).ConfigureAwait(false);
         }
 
         private async Task HandleFolderTransfer(NetworkStream stream, CancellationToken ct)
