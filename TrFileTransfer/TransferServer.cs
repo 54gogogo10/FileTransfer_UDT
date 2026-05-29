@@ -21,6 +21,8 @@ namespace TrFileTransfer
         private volatile bool _isRunning;
         private readonly ConcurrentDictionary<string, ChunkTracker> _chunkTrackers
             = new ConcurrentDictionary<string, ChunkTracker>();
+        private readonly ConcurrentDictionary<Guid, ResumeState> _resumeStates
+            = new ConcurrentDictionary<Guid, ResumeState>();
 
         /// <summary>Fired for every log message.</summary>
         public event Action<string> OnLog;
@@ -181,13 +183,20 @@ namespace TrFileTransfer
                     {
                         await HandleChunkedFile(stream, ct);
                     }
+                    else if (transferType == 0x03)
+                    {
+                        await HandleResumableFile(stream, ct);
+                    }
                     else
                     {
                         await HandleFileTransfer(stream, ct);
                     }
 
-                    var ccHandler = OnClientTransferComplete;
-                    if (ccHandler != null) ccHandler(clientEp);
+                    if (transferType != 0x03)
+                    {
+                        var ccHandler = OnClientTransferComplete;
+                        if (ccHandler != null) ccHandler(clientEp);
+                    }
                 }
                 catch (OperationCanceledException) { }
                 catch (ObjectDisposedException) { }
@@ -342,6 +351,132 @@ namespace TrFileTransfer
                 var errHandler = OnError;
                 if (errHandler != null) errHandler(L.S_HashFailed(fileName));
             }
+        }
+
+        private async Task HandleResumableFile(NetworkStream stream, CancellationToken ct)
+        {
+            // Read 0x03 header: sessionId(16) + totalSize(8) + resumeOffset(8) + nameLen(4) = 36
+            var headerBuf = new byte[36];
+            await ReadExactAsync(stream, headerBuf, 0, 36, ct);
+
+            var sidBytes = new byte[16];
+            Buffer.BlockCopy(headerBuf, 0, sidBytes, 0, 16);
+            var sessionId = new Guid(sidBytes);
+            long totalSize = BitConverter.ToInt64(headerBuf, 16);
+            long clientOffset = BitConverter.ToInt64(headerBuf, 24);
+            int nameLen = BitConverter.ToInt32(headerBuf, 32);
+
+            if (totalSize <= 0 || nameLen <= 0 || nameLen > 4096)
+            {
+                Log(L.S_InvalidHeader(totalSize, nameLen));
+                return;
+            }
+
+            var nameBuf = new byte[nameLen];
+            await ReadExactAsync(stream, nameBuf, 0, nameLen, ct);
+            string fileName = System.Text.Encoding.UTF8.GetString(nameBuf);
+            fileName = Path.GetFileName(fileName);
+            if (string.IsNullOrWhiteSpace(fileName))
+                fileName = L.S_ReceivedFile;
+
+            ResumeState state;
+            byte status;
+            long resumeFrom;
+
+            if (!_resumeStates.TryGetValue(sessionId, out state))
+            {
+                state = new ResumeState
+                {
+                    SessionId = sessionId,
+                    TotalSize = totalSize,
+                    FileName = fileName,
+                    ReceivedBytes = 0
+                };
+                state.SavePath = Utils.GetUniqueSavePath(_saveDirectory, fileName);
+                state.WriteStream = new FileStream(state.SavePath, FileMode.Create, FileAccess.Write,
+                    FileShare.None, _bufferSize, FileOptions.RandomAccess);
+                state.WriteStream.SetLength(totalSize);
+                _resumeStates[sessionId] = state;
+                status = 0;
+                resumeFrom = 0;
+            }
+            else
+            {
+                if (state.TotalSize != totalSize)
+                {
+                    Log(string.Format("Resume size mismatch: session={0} expect={1} got={2}",
+                        sessionId.ToString("N"), state.TotalSize, totalSize));
+                    return;
+                }
+                if (state.ReceivedBytes >= totalSize)
+                {
+                    status = 2;
+                    resumeFrom = totalSize;
+                    SendResumeResponse(stream, resumeFrom, status, ct);
+                    return;
+                }
+                status = 1;
+                resumeFrom = state.ReceivedBytes;
+            }
+
+            // Negotiate: use max of client's claim and server's actual received
+            long actualStart = Math.Max(clientOffset, resumeFrom);
+            SendResumeResponse(stream, actualStart, status, ct);
+
+            // If client has less than server, it'll re-send from actualStart
+            long remaining = totalSize - actualStart;
+            Log(string.Format("Resume: {0} offset={1} remaining={2} status={3}",
+                fileName, actualStart, Utils.FormatSize(remaining), status));
+
+            // Receive remaining data + SHA256
+            state.WriteStream.Seek(actualStart, SeekOrigin.Begin);
+            var sha256 = System.Security.Cryptography.SHA256.Create();
+            long bytesRead = 0;
+            var buf = new byte[_bufferSize];
+
+            while (bytesRead < remaining && !ct.IsCancellationRequested)
+            {
+                int toRead = (int)Math.Min(remaining - bytesRead, (long)buf.Length);
+                int read = await stream.ReadAsync(buf, 0, toRead, ct);
+                if (read == 0)
+                    throw new IOException(L.S_ConnClosedPrematurely);
+                sha256.TransformBlock(buf, 0, read, null, 0);
+                await state.WriteStream.WriteAsync(buf, 0, read, ct);
+                bytesRead += read;
+                state.ReceivedBytes = actualStart + bytesRead;
+            }
+
+            sha256.TransformFinalBlock(buf, 0, 0);
+            var computedHash = sha256.Hash;
+            var receivedHash = new byte[32];
+            await ReadExactAsync(stream, receivedHash, 0, 32, ct);
+
+            if (Utils.ConstantTimeEquals(computedHash, receivedHash))
+            {
+                state.WriteStream.Dispose();
+                state.WriteStream = null;
+                ResumeState removed;
+                _resumeStates.TryRemove(sessionId, out removed);
+                Log(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
+                SendResumeResponse(stream, totalSize, 2, ct);
+                var completeHandler = OnTransferComplete;
+                if (completeHandler != null) completeHandler();
+            }
+            else
+            {
+                Log(L.S_HashFailed(fileName));
+                var errHandler = OnError;
+                if (errHandler != null) errHandler(L.S_HashFailed(fileName));
+            }
+        }
+
+        private static void SendResumeResponse(NetworkStream stream, long offset, byte status, CancellationToken ct)
+        {
+            var resp = new byte[10]; // type(1) + offset(8) + status(1)
+            resp[0] = 0x10;
+            Buffer.BlockCopy(BitConverter.GetBytes(offset), 0, resp, 1, 8);
+            resp[9] = status;
+            stream.WriteAsync(resp, 0, 10, ct).Wait();
         }
 
         private async Task HandleFolderTransfer(NetworkStream stream, CancellationToken ct)
