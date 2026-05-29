@@ -282,6 +282,27 @@ namespace TrFileTransfer
                 ? string.Format("[监控] 开始监控: {0}", path)
                 : string.Format("[Monitor] Started: {0}", path);
         }
+        // ---- Resume / client log messages ----
+        public static string C_Resuming(object fileName, object offset, string sizeStr)
+        {
+            return IsChinese
+                ? string.Format("续传 {0} 从偏移 {1} ({2})", fileName, offset, sizeStr)
+                : string.Format("Resuming {0} from offset {1} ({2})", fileName, offset, sizeStr);
+        }
+        public static string C_AlreadyReceived(object fileName)
+        {
+            return IsChinese
+                ? string.Format("{0} 已被服务器完整接收。", fileName)
+                : string.Format("{0} already fully received by server.", fileName);
+        }
+        public static string C_ResumeNegotiated(object start, object serverHad, object clientHad)
+        {
+            return IsChinese
+                ? string.Format("续传协商: 起点={0} 服务端={1} 客户端={2}", start, serverHad, clientHad)
+                : string.Format("Resume negotiated: start={0} server={1} client={2}", start, serverHad, clientHad);
+        }
+        public static string C_ResumeConnClosed { get { return IsChinese ? "续传连接意外关闭" : "Resume connection closed unexpectedly"; } }
+
         public static string MonitorLogStopped
         {
             get

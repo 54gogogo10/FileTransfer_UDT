@@ -307,8 +307,7 @@ namespace TrFileTransfer
             if (existingState != null)
             {
                 sentBytes = existingState.SentBytes;
-                Log(string.Format("Resuming {0} from offset {1} ({2})", fileName,
-                    sentBytes, Utils.FormatSize(sentBytes)));
+                Log(L.C_Resuming(fileName, sentBytes, Utils.FormatSize(sentBytes)));
             }
             else
             {
@@ -353,12 +352,15 @@ namespace TrFileTransfer
                 var respBuf = new byte[10];
                 await ReadExactResumeAsync(stream, respBuf, 0, 10, ct).ConfigureAwait(false);
 
+                if (respBuf[0] != 0x10)
+                    throw new InvalidDataException(string.Format("Unexpected resume response type: {0}", respBuf[0]));
+
                 byte respStatus = respBuf[9];
                 long serverOffset = BitConverter.ToInt64(respBuf, 1);
 
                 if (respStatus == 2)
                 {
-                    Log(fileName + " already fully received by server.");
+                    Log(L.C_AlreadyReceived(fileName));
                     ResumeState.Delete(sessionId);
                     var completeHandler = OnTransferComplete;
                     if (completeHandler != null) completeHandler();
@@ -367,11 +369,10 @@ namespace TrFileTransfer
 
                 // Server is authoritative: use its offset
                 long actualStart = Math.Max(sentBytes, serverOffset);
-                Log(string.Format("Resume negotiated: start={0} serverHad={1} clientHad={2}",
-                    actualStart, serverOffset, sentBytes));
+                Log(L.C_ResumeNegotiated(actualStart, serverOffset, sentBytes));
 
                 // Send file data from actualStart
-                await SendFilePayload(stream, _filePath, fileSize, fileName, ct, (int)actualStart).ConfigureAwait(false);
+                await SendFilePayload(stream, _filePath, fileSize, fileName, ct, actualStart).ConfigureAwait(false);
 
                 // Success — delete resume state
                 ResumeState.Delete(sessionId);
@@ -385,7 +386,7 @@ namespace TrFileTransfer
             {
                 int read = await stream.ReadAsync(buf, offset + total, count - total, ct).ConfigureAwait(false);
                 if (read == 0)
-                    throw new IOException("Connection closed during resume response");
+                    throw new IOException(L.C_ResumeConnClosed);
                 total += read;
             }
         }
