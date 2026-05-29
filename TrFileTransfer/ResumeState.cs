@@ -38,12 +38,13 @@ namespace TrFileTransfer
         {
             EnsureDir();
             var sb = new StringBuilder();
+            // SessionId stored for human readability only; not used on load
             sb.AppendLine("SessionId=" + SessionId.ToString("N"));
             sb.AppendLine("TotalSize=" + TotalSize);
             sb.AppendLine("SentBytes=" + SentBytes);
-            sb.AppendLine("FileName=" + FileName);
-            sb.AppendLine("FilePath=" + FilePath);
-            sb.AppendLine("ServerIp=" + ServerIp);
+            sb.AppendLine("FileName=" + (FileName ?? "").Replace("\r", "").Replace("\n", ""));
+            sb.AppendLine("FilePath=" + (FilePath ?? "").Replace("\r", "").Replace("\n", ""));
+            sb.AppendLine("ServerIp=" + (ServerIp ?? "").Replace("\r", "").Replace("\n", ""));
             sb.AppendLine("Port=" + Port);
             sb.AppendLine("IsUdt=" + (IsUdt ? "1" : "0"));
             sb.AppendLine("Created=" + Created.ToString("o"));
@@ -63,14 +64,16 @@ namespace TrFileTransfer
                 string val = line.Substring(idx + 1);
                 switch (key)
                 {
-                    case "TotalSize": state.TotalSize = long.Parse(val); break;
-                    case "SentBytes": state.SentBytes = long.Parse(val); break;
+                    case "TotalSize": { long v; if (long.TryParse(val, out v)) state.TotalSize = v; break; }
+                    case "SentBytes": { long v; if (long.TryParse(val, out v)) state.SentBytes = v; break; }
                     case "FileName": state.FileName = val; break;
                     case "FilePath": state.FilePath = val; break;
                     case "ServerIp": state.ServerIp = val; break;
-                    case "Port": state.Port = int.Parse(val); break;
+                    case "Port": { int v; if (int.TryParse(val, out v)) state.Port = v; break; }
                     case "IsUdt": state.IsUdt = val == "1"; break;
-                    case "Created": state.Created = DateTime.Parse(val); break;
+                    case "Created": state.Created = DateTime.Parse(val,
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.RoundtripKind); break;
                 }
             }
             return state;
@@ -79,22 +82,29 @@ namespace TrFileTransfer
         public static void Delete(Guid sessionId)
         {
             string path = GetPath(sessionId);
-            try { if (File.Exists(path)) File.Delete(path); } catch { }
+            try { File.Delete(path); } catch { }
         }
 
         public static ResumeState[] ListAll()
         {
             EnsureDir();
             var files = Directory.GetFiles(ResumeDir, "*.json");
-            var list = new ResumeState[files.Length];
+            var result = new System.Collections.Generic.List<ResumeState>(files.Length);
             for (int i = 0; i < files.Length; i++)
             {
                 string name = Path.GetFileNameWithoutExtension(files[i]);
                 Guid sid;
                 if (Guid.TryParseExact(name, "N", out sid))
-                    list[i] = Load(sid);
+                {
+                    try
+                    {
+                        var state = Load(sid);
+                        if (state != null) result.Add(state);
+                    }
+                    catch { }
+                }
             }
-            return list;
+            return result.ToArray();
         }
     }
 }
