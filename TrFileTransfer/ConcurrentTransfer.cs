@@ -16,6 +16,7 @@ namespace TrFileTransfer
         private readonly string _filePath;
         private readonly int _concurrency;
         private readonly bool _isUdt;
+        private readonly int _srcPort;
         private const int ChunkMinSize = 1048576; // 1 MB minimum chunk size
 
         private long _totalBytes;
@@ -27,13 +28,14 @@ namespace TrFileTransfer
         public event Action OnTransferComplete;
 
         public ConcurrentTransfer(string serverIp, int port, string filePath,
-            int concurrency, bool isTcp)
+            int concurrency, bool isTcp, int srcPort = 0)
         {
             _serverIp = serverIp;
             _port = port;
             _filePath = filePath;
             _concurrency = Math.Max(1, Math.Min(16, concurrency));
             _isUdt = !isTcp;
+            _srcPort = srcPort;
         }
 
         public async Task SendAsync()
@@ -199,7 +201,7 @@ namespace TrFileTransfer
 
         private int FindLocalPort(int index)
         {
-            int basePort = _port + index + 1;
+            int basePort = _srcPort > 0 ? _srcPort + index : _port + index + 1;
             return Utils.FindFreePort(basePort, _isUdt);
         }
 
