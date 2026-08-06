@@ -309,7 +309,7 @@ namespace TrFileTransfer
                 return;
             }
 
-            if (UdtNative.udt_listen(_socket, 10) == UdtNative.ERROR)
+            if (UdtNative.udt_listen(_socket, 32) == UdtNative.ERROR)
             {
                 string err = UdtNative.GetErrorDesc();
                 Log(L.S_BindFailed(_bindAddress, _port.ToString(), err));
@@ -352,6 +352,18 @@ namespace TrFileTransfer
                 _chunkTrackers.TryRemove(kv.Key, out removed);
                 try { kv.Value.Dispose(); } catch { }
             }
+            // Persist incomplete resume states before releasing file handles
+            foreach (var kv in _udtResumeStates)
+            {
+                try
+                {
+                    if (kv.Value.WriteStream != null) kv.Value.WriteStream.Flush();
+                    ServerResumeStore.Save(kv.Value);
+                    if (kv.Value.WriteStream != null) { kv.Value.WriteStream.Dispose(); kv.Value.WriteStream = null; }
+                }
+                catch { }
+            }
+            _udtResumeStates.Clear();
             // Close all active client sockets so HandleClient tasks unblock immediately
             lock (_clientSockets)
             {
@@ -698,12 +710,75 @@ namespace TrFileTransfer
             string fileName = System.Text.Encoding.UTF8.GetString(nameBuf);
             fileName = Path.GetFileName(fileName);
 
+            // Session is ours from here: persist incomplete state on the way out
+            // (connection drop / server restart) and clear it once complete/discarded.
+            try
+            {
+                return await HandleResumableCoreUdt(clientSocket, ct, sessionId, totalSize, clientOffset, fileName).ConfigureAwait(false);
+            }
+            finally
+            {
+                ResumeState st;
+                if (_udtResumeStates.TryGetValue(sessionId, out st))
+                    ServerResumeStore.Save(st);
+                else
+                    ServerResumeStore.Delete(sessionId);
+            }
+        }
+
+        private async Task<bool> HandleResumableCoreUdt(int clientSocket, CancellationToken ct,
+            Guid sessionId, long totalSize, long clientOffset, string fileName)
+        {
             ResumeState state;
             byte status;
             long resumeFrom;
+            bool isNew;
 
             if (!_udtResumeStates.TryGetValue(sessionId, out state))
             {
+                // No in-memory state: try to recover from a previous server run.
+                var disk = ServerResumeStore.Load(sessionId);
+                if (disk != null && disk.TotalSize == totalSize
+                    && !string.IsNullOrEmpty(disk.SavePath) && File.Exists(disk.SavePath)
+                    && disk.ReceivedBytes >= 0 && disk.ReceivedBytes < totalSize)
+                {
+                    var fi = new FileInfo(disk.SavePath);
+                    if (fi.Length == totalSize)
+                    {
+                        try
+                        {
+                            disk.WriteStream = new FileStream(disk.SavePath, FileMode.Open, FileAccess.Write,
+                                FileShare.None, 4096, FileOptions.RandomAccess);
+                            disk.WriteStream.Seek(disk.ReceivedBytes, SeekOrigin.Begin);
+                            if (_udtResumeStates.TryAdd(sessionId, disk))
+                            {
+                                state = disk;
+                                isNew = false;
+                                resumeFrom = disk.ReceivedBytes;
+                                status = 1;
+                                Log(string.Format("Resume: restored server state for session {0} at offset {1}",
+                                    sessionId.ToString("N"), disk.ReceivedBytes));
+                                goto HaveState;
+                            }
+                            disk.WriteStream.Dispose();
+                        }
+                        catch (IOException)
+                        {
+                            try { disk.WriteStream.Dispose(); } catch { }
+                        }
+                        ServerResumeStore.Delete(sessionId);
+                    }
+                    else
+                    {
+                        ServerResumeStore.Delete(sessionId);
+                    }
+                }
+                else if (disk != null)
+                {
+                    ServerResumeStore.Delete(sessionId);
+                }
+
+                isNew = true;
                 state = new ResumeState
                 {
                     SessionId = sessionId, TotalSize = totalSize,
@@ -716,10 +791,21 @@ namespace TrFileTransfer
                 _udtResumeStates[sessionId] = state;
                 status = 0;
                 resumeFrom = 0;
+                if (clientOffset > 0)
+                {
+                    Log(string.Format("Resume: no server state for session {0}, restarting from 0 (client claimed {1})",
+                        sessionId.ToString("N"), clientOffset));
+                }
             }
             else
             {
-                if (state.TotalSize != totalSize) return false;
+                isNew = false;
+                if (state.TotalSize != totalSize)
+                {
+                    Log(string.Format("Resume size mismatch: session={0} expect={1} got={2}",
+                        sessionId.ToString("N"), state.TotalSize, totalSize));
+                    return false;
+                }
                 if (state.ReceivedBytes >= totalSize)
                 {
                     // Already complete — send status=2
@@ -734,7 +820,12 @@ namespace TrFileTransfer
                 resumeFrom = state.ReceivedBytes;
             }
 
-            long actualStart = Math.Max(clientOffset, resumeFrom);
+        HaveState:
+
+            // When the server has no state for this session (e.g. server restarted),
+            // the client's offset claim is NOT trusted — restart from 0 so a fresh
+            // pre-allocated file is never zero-padded behind a stale client offset.
+            long actualStart = isNew ? 0 : Math.Max(clientOffset, resumeFrom);
             var resp = new byte[10];
             resp[0] = 0x10;
             Buffer.BlockCopy(BitConverter.GetBytes(actualStart), 0, resp, 1, 8);
@@ -748,6 +839,8 @@ namespace TrFileTransfer
             {
                 var buf = new byte[4194304]; // 4 MB
                 long bytesRead = 0;
+                var progressTimer = System.Diagnostics.Stopwatch.StartNew();
+                var elapsedSw = System.Diagnostics.Stopwatch.StartNew();
                 while (bytesRead < remaining)
                 {
                     int toRead = (int)Math.Min(remaining - bytesRead, (long)buf.Length);
@@ -758,6 +851,23 @@ namespace TrFileTransfer
                     state.WriteStream.Write(buf, 0, read);
                     bytesRead += read;
                     state.ReceivedBytes = actualStart + bytesRead;
+
+                    if (progressTimer.ElapsedMilliseconds >= 100)
+                    {
+                        progressTimer.Restart();
+                        var progressHandler = OnProgress;
+                        if (progressHandler != null)
+                        {
+                            progressHandler(new TransferProgress
+                            {
+                                BytesTransferred = state.ReceivedBytes,
+                                TotalBytes = totalSize,
+                                SpeedBytesPerSecond = state.ReceivedBytes / Math.Max(elapsedSw.Elapsed.TotalSeconds, 0.001),
+                                Elapsed = elapsedSw.Elapsed,
+                                FileName = fileName
+                            });
+                        }
+                    }
                 }
                 sha256.TransformFinalBlock(buf, 0, 0);
                 var computedHash = sha256.Hash;
@@ -771,10 +881,18 @@ namespace TrFileTransfer
                     ResumeState removed;
                     _udtResumeStates.TryRemove(sessionId, out removed);
                     Log(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
-                    var ch = OnTransferComplete;
-                    if (ch != null) ch();
                     return true;
                 }
+
+                // Hash mismatch — discard server state so a retry starts a fresh file
+                // instead of answering status=2 ("already complete") on a corrupt file.
+                try { state.WriteStream.Dispose(); } catch { }
+                state.WriteStream = null;
+                ResumeState removed2;
+                _udtResumeStates.TryRemove(sessionId, out removed2);
+                Log(L.S_HashFailed(fileName));
+                var errHandler = OnError;
+                if (errHandler != null) errHandler(L.S_HashFailed(fileName));
             }
             return false;
         }
@@ -1355,13 +1473,17 @@ namespace TrFileTransfer
 
     internal static class UdtIo
     {
+        /// <summary>Last native UDT error description (set on the thread that called udt_recv/udt_send).</summary>
+        public static string LastError;
+
         public static async Task<int> UdtReadExactAsync(int socket, byte[] buffer, int offset, int count, CancellationToken ct)
         {
             int totalRead = 0;
             while (totalRead < count)
             {
                 int read = await UdtReadAsync(socket, buffer, offset + totalRead, count - totalRead, ct);
-                if (read <= 0) throw new IOException(L.S_ConnClosedUnexpectedly);
+                if (read <= 0)
+                    throw new IOException(L.S_ConnClosedUnexpectedly + (LastError != null ? " [" + LastError + "]" : ""));
                 totalRead += read;
             }
             return totalRead;
@@ -1371,7 +1493,12 @@ namespace TrFileTransfer
         {
             // Short reads: if offset != 0, need a temp buffer or slice
             byte[] target = offset == 0 ? buffer : new byte[count];
-            int result = await Task.Run(() => UdtNative.udt_recv(socket, target, count, 0), ct);
+            int result = await Task.Run(() =>
+            {
+                int r = UdtNative.udt_recv(socket, target, count, 0);
+                LastError = r <= 0 ? UdtNative.GetErrorDesc() : null;
+                return r;
+            }, ct);
             if (result > 0 && offset != 0)
                 Buffer.BlockCopy(target, 0, buffer, offset, result);
             return result;
@@ -1393,11 +1520,15 @@ namespace TrFileTransfer
                     sendBuf = new byte[remaining];
                     Buffer.BlockCopy(buffer, offset + totalSent, sendBuf, 0, remaining);
                 }
-                int sent = await Task.Run(
-                    () => UdtNative.udt_send(socket, sendBuf, remaining, 0), ct);
+                int sent = await Task.Run(() =>
+                {
+                    int s = UdtNative.udt_send(socket, sendBuf, remaining, 0);
+                    LastError = s < 0 ? UdtNative.GetErrorDesc() : null;
+                    return s;
+                }, ct);
                 if (sent < 0)
                 {
-                    string err = UdtNative.GetErrorDesc();
+                    string err = LastError ?? "unknown";
                     throw new IOException("UDT send failed: " + err);
                 }
                 totalSent += sent;

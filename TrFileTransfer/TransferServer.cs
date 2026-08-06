@@ -117,6 +117,19 @@ namespace TrFileTransfer
             }
             _chunkTrackers.Clear();
 
+            // Persist incomplete resume states before releasing file handles
+            foreach (var kv in _resumeStates)
+            {
+                try
+                {
+                    if (kv.Value.WriteStream != null) kv.Value.WriteStream.Flush();
+                    ServerResumeStore.Save(kv.Value);
+                    if (kv.Value.WriteStream != null) { kv.Value.WriteStream.Dispose(); kv.Value.WriteStream = null; }
+                }
+                catch { }
+            }
+            _resumeStates.Clear();
+
             var handler = OnStopped;
             if (handler != null) handler();
 
@@ -192,11 +205,8 @@ namespace TrFileTransfer
                         await HandleFileTransfer(stream, ct);
                     }
 
-                    if (transferType != 0x03)
-                    {
-                        var ccHandler = OnClientTransferComplete;
-                        if (ccHandler != null) ccHandler(clientEp);
-                    }
+                    var ccHandler = OnClientTransferComplete;
+                    if (ccHandler != null) ccHandler(clientEp);
                 }
                 catch (OperationCanceledException) { }
                 catch (ObjectDisposedException) { }
@@ -379,11 +389,81 @@ namespace TrFileTransfer
             if (string.IsNullOrWhiteSpace(fileName))
                 fileName = L.S_ReceivedFile;
 
+            // From here on, the session is ours: persist any incomplete state to disk
+            // on the way out (connection drop / server restart) and clear it once the
+            // transfer completes or is discarded.
+            try
+            {
+                await HandleResumableCore(stream, ct, sessionId, totalSize, clientOffset, fileName).ConfigureAwait(false);
+            }
+            finally
+            {
+                ResumeState st;
+                if (_resumeStates.TryGetValue(sessionId, out st))
+                    ServerResumeStore.Save(st);
+                else
+                    ServerResumeStore.Delete(sessionId);
+            }
+        }
+
+        private async Task HandleResumableCore(NetworkStream stream, CancellationToken ct,
+            Guid sessionId, long totalSize, long clientOffset, string fileName)
+        {
             ResumeState state = null;
             _resumeStates.TryGetValue(sessionId, out state);
             byte status;
             long resumeFrom;
             bool isNew = (state == null);
+
+            if (isNew)
+            {
+                // No in-memory state: try to recover from a previous server run.
+                var disk = ServerResumeStore.Load(sessionId);
+                if (disk != null && disk.TotalSize == totalSize
+                    && !string.IsNullOrEmpty(disk.SavePath) && File.Exists(disk.SavePath)
+                    && disk.ReceivedBytes >= 0 && disk.ReceivedBytes < totalSize)
+                {
+                    var fi = new FileInfo(disk.SavePath);
+                    if (fi.Length == totalSize)
+                    {
+                        try
+                        {
+                            disk.WriteStream = new FileStream(disk.SavePath, FileMode.Open, FileAccess.Write,
+                                FileShare.None, _bufferSize, FileOptions.RandomAccess);
+                            disk.WriteStream.Seek(disk.ReceivedBytes, SeekOrigin.Begin);
+                            if (_resumeStates.TryAdd(sessionId, disk))
+                            {
+                                state = disk;
+                                isNew = false;
+                                Log(string.Format("Resume: restored server state for session {0} at offset {1}",
+                                    sessionId.ToString("N"), disk.ReceivedBytes));
+                            }
+                            else
+                            {
+                                disk.WriteStream.Dispose();
+                                _resumeStates.TryGetValue(sessionId, out state);
+                                isNew = false;
+                            }
+                        }
+                        catch (IOException)
+                        {
+                            // File locked or otherwise unusable — discard disk state
+                            try { disk.WriteStream.Dispose(); } catch { }
+                            ServerResumeStore.Delete(sessionId);
+                        }
+                    }
+                    else
+                    {
+                        // Stale disk state (file size changed) — restart from scratch
+                        ServerResumeStore.Delete(sessionId);
+                    }
+                }
+                else if (disk != null)
+                {
+                    // Size mismatch or already-complete record — discard
+                    ServerResumeStore.Delete(sessionId);
+                }
+            }
 
             if (isNew)
             {
@@ -416,6 +496,11 @@ namespace TrFileTransfer
             {
                 status = 0;
                 resumeFrom = 0;
+                if (clientOffset > 0)
+                {
+                    Log(string.Format("Resume: no server state for session {0}, restarting from 0 (client claimed {1})",
+                        sessionId.ToString("N"), clientOffset));
+                }
             }
             else
             {
@@ -436,8 +521,11 @@ namespace TrFileTransfer
                 resumeFrom = state.ReceivedBytes;
             }
 
-            // Negotiate: use max of client's claim and server's actual received
-            long actualStart = Math.Max(clientOffset, resumeFrom);
+            // Negotiate: use max of client's claim and server's actual received.
+            // When the server has no state for this session (e.g. server restarted),
+            // the client's offset claim is NOT trusted — restart from 0 so a fresh
+            // pre-allocated file is never zero-padded behind a stale client offset.
+            long actualStart = isNew ? 0 : Math.Max(clientOffset, resumeFrom);
             await SendResumeResponse(stream, actualStart, status, ct).ConfigureAwait(false);
 
             // If client has less than server, it'll re-send from actualStart
@@ -451,6 +539,8 @@ namespace TrFileTransfer
             {
                 long bytesRead = 0;
                 var buf = new byte[_bufferSize];
+                var progressTimer = System.Diagnostics.Stopwatch.StartNew();
+                var elapsedSw = System.Diagnostics.Stopwatch.StartNew();
 
                 while (bytesRead < remaining && !ct.IsCancellationRequested)
                 {
@@ -462,6 +552,23 @@ namespace TrFileTransfer
                     await state.WriteStream.WriteAsync(buf, 0, read, ct).ConfigureAwait(false);
                     bytesRead += read;
                     state.ReceivedBytes = actualStart + bytesRead;
+
+                    if (progressTimer.ElapsedMilliseconds >= 100)
+                    {
+                        progressTimer.Restart();
+                        var progressHandler = OnProgress;
+                        if (progressHandler != null)
+                        {
+                            progressHandler(new TransferProgress
+                            {
+                                BytesTransferred = state.ReceivedBytes,
+                                TotalBytes = totalSize,
+                                SpeedBytesPerSecond = state.ReceivedBytes / Math.Max(elapsedSw.Elapsed.TotalSeconds, 0.001),
+                                Elapsed = elapsedSw.Elapsed,
+                                FileName = fileName
+                            });
+                        }
+                    }
                 }
 
                 sha256.TransformFinalBlock(buf, 0, 0);
@@ -477,8 +584,7 @@ namespace TrFileTransfer
                     _resumeStates.TryRemove(sessionId, out removed);
                     Log(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
                     await SendResumeResponse(stream, totalSize, 2, ct).ConfigureAwait(false);
-                    var completeHandler = OnTransferComplete;
-                    if (completeHandler != null) completeHandler();
+                    // Completion is reported by HandleClient via OnClientTransferComplete(clientEp).
                 }
                 else
                 {
