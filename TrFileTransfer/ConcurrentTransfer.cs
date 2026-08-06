@@ -17,6 +17,7 @@ namespace TrFileTransfer
         private readonly int _concurrency;
         private readonly bool _isUdt;
         private readonly int _srcPort;
+        private readonly int _maxBytesPerSec;
         private const int ChunkMinSize = 1048576; // 1 MB minimum chunk size
 
         private long _totalBytes;
@@ -28,7 +29,7 @@ namespace TrFileTransfer
         public event Action OnTransferComplete;
 
         public ConcurrentTransfer(string serverIp, int port, string filePath,
-            int concurrency, bool isTcp, int srcPort = 0)
+            int concurrency, bool isTcp, int srcPort = 0, int maxBytesPerSec = 0)
         {
             _serverIp = serverIp;
             _port = port;
@@ -36,6 +37,7 @@ namespace TrFileTransfer
             _concurrency = Math.Max(1, Math.Min(8, concurrency));
             _isUdt = !isTcp;
             _srcPort = srcPort;
+            _maxBytesPerSec = maxBytesPerSec;
         }
 
         public async Task SendAsync()
@@ -154,19 +156,27 @@ namespace TrFileTransfer
             }
         }
 
+        private int PerConnectionLimit()
+        {
+            // Total limit is split evenly across connections (floor 1 KB/s when enabled)
+            if (_maxBytesPerSec <= 0) return 0;
+            return Math.Max(_maxBytesPerSec / _concurrency, 1024);
+        }
+
         private async Task SendChunkAsync(long offset, long size, long totalSize,
             int localPort)
         {
             try
             {
+                int perConn = PerConnectionLimit();
                 if (_isUdt)
                 {
-                    var client = new TransferUdtClient(_serverIp, _port, _filePath, localPort);
+                    var client = new TransferUdtClient(_serverIp, _port, _filePath, localPort, 4194304, perConn);
                     await client.SendChunkedAsync(offset, size, totalSize);
                 }
                 else
                 {
-                    var client = new TransferClient(_serverIp, _port, _filePath, localPort);
+                    var client = new TransferClient(_serverIp, _port, _filePath, localPort, 4194304, perConn);
                     await client.SendChunkedAsync(offset, size, totalSize);
                 }
 
@@ -187,14 +197,15 @@ namespace TrFileTransfer
 
         private async Task SendFileAsync(string filePath, int localPort)
         {
+            int perConn = PerConnectionLimit();
             if (_isUdt)
             {
-                var client = new TransferUdtClient(_serverIp, _port, filePath, localPort);
+                var client = new TransferUdtClient(_serverIp, _port, filePath, localPort, 4194304, perConn);
                 await client.SendAsync();
             }
             else
             {
-                var client = new TransferClient(_serverIp, _port, filePath, localPort);
+                var client = new TransferClient(_serverIp, _port, filePath, localPort, 4194304, perConn);
                 await client.SendAsync();
             }
         }

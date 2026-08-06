@@ -46,6 +46,7 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_TCP_ResumeInterrupted", TcpResumeInterrupted);
             runner.Run("Integration_TCP_ResumeAcrossRestart", TcpResumeAcrossRestart);
             runner.Run("Integration_TCP_ResumeFullHashCorrupt", TcpResumeFullHashCorrupt);
+            runner.Run("Integration_TCP_RateLimit", TcpRateLimit);
             runner.Run("Integration_UDT_ResumeSingleFile", UdtResumeSingleFile);
             runner.Run("Integration_UDT_SingleFile", UdtSingleFile);
             runner.Run("Integration_UDT_LargeSingle", UdtLargeSingle);
@@ -923,6 +924,76 @@ namespace TrFileTransfer.Tests
 
                 // Client resume state kept for retry
                 Assert.True(File.Exists(ResumeState.GetPath(sessionId)), "client state kept for retry");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        private static void TcpRateLimit()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_rl_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_rl_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+
+            TransferServer server = null;
+            try
+            {
+                var testFile = Path.Combine(sendDir, "rate_test.bin");
+                var rng = new Random(42);
+                var content = new byte[1024 * 1024 * 8]; // 8 MB
+                rng.NextBytes(content);
+                File.WriteAllBytes(testFile, content);
+
+                var serverStarted = new ManualResetEvent(false);
+                var serverDone = new ManualResetEvent(false);
+                bool serverOk = false;
+                string serverError = null;
+
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => serverStarted.Set();
+                server.OnTransferComplete += () => { serverOk = true; serverDone.Set(); };
+                server.OnError += msg => { serverError = msg; serverDone.Set(); };
+                server.Start();
+                if (!serverStarted.WaitOne(5000))
+                    throw new Exception("Server did not start");
+
+                // 512 KB/s limit on an 8 MB file ⇒ at least ~16 s of transfer
+                var client = new TransferClient("127.0.0.1", port, testFile, 0, 4194304, 512 * 1024);
+                var clientDone = new ManualResetEvent(false);
+                bool clientOk = false;
+                client.OnTransferComplete += () => { clientOk = true; clientDone.Set(); };
+                client.OnError += msg => clientDone.Set();
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var sendTask = client.SendAsync();
+                if (!serverDone.WaitOne(60000))
+                    throw new Exception("Server did not complete within 60s");
+                if (!serverOk)
+                    throw new Exception("Server error: " + (serverError ?? "unknown"));
+                sendTask.Wait(60000);
+                if (!clientDone.WaitOne(5000))
+                    throw new Exception("Client did not fire completion event");
+                if (!clientOk)
+                    throw new Exception("Client transfer failed");
+                sw.Stop();
+
+                // 8 MB at 512 KB/s = 16 s nominal; allow generous slack (limit applies
+                // per send-chunk so the total is always at or above the limit)
+                Assert.True(sw.Elapsed.TotalSeconds >= 10.0,
+                    "rate-limited transfer took " + sw.Elapsed.TotalSeconds.ToString("F1") + "s (expected >= 10s)");
+
+                Thread.Sleep(300);
+                var receivedFile = Path.Combine(recvDir, "rate_test.bin");
+                Assert.True(File.Exists(receivedFile), "received file exists");
+                var receivedContent = File.ReadAllBytes(receivedFile);
+                Assert.Equal(content.Length, receivedContent.Length, "file size matches");
+                Assert.True(Utils.ConstantTimeEquals(content, receivedContent), "content match");
             }
             finally
             {

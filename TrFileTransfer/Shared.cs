@@ -100,7 +100,37 @@ namespace TrFileTransfer
     }
     #pragma warning restore 1591
 
-    /// <summary>General-purpose utility helpers.</summary>
+        /// <summary>Token-bucket rate limiter for throttling transfer throughput.</summary>
+        public class SpeedLimiter
+        {
+            private readonly long _maxBytesPerSec;
+            private long _totalSent;
+            private readonly System.Diagnostics.Stopwatch _sw = System.Diagnostics.Stopwatch.StartNew();
+
+            /// <param name="maxBytesPerSec">0 = unlimited.</param>
+            public SpeedLimiter(long maxBytesPerSec)
+            {
+                _maxBytesPerSec = maxBytesPerSec;
+            }
+
+            /// <summary>Records a chunk of bytes sent and sleeps as needed to stay within the limit.</summary>
+            public void Throttle(int bytes)
+            {
+                if (_maxBytesPerSec <= 0) return;
+                _totalSent += bytes;
+                double expectedSeconds = (double)_totalSent / _maxBytesPerSec;
+                double elapsed = _sw.Elapsed.TotalSeconds;
+                double deficit = expectedSeconds - elapsed;
+                if (deficit > 0.002)
+                {
+                    int ms = (int)(deficit * 1000.0);
+                    if (ms > 0)
+                        System.Threading.Thread.Sleep(ms);
+                }
+            }
+        }
+
+        /// <summary>General-purpose utility helpers.</summary>
     public static class Utils
     {
         /// <summary>Reusable empty byte array (avoids per-call allocations).</summary>

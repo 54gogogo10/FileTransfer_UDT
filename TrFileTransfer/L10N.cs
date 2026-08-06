@@ -285,6 +285,7 @@ namespace TrFileTransfer
         public static string ResumeListEmpty { get { return IsChinese ? "没有未完成的传输任务。" : "No incomplete transfer tasks."; } }
         public static string ResumeQueued { get { return IsChinese ? "已选择续传任务，点击“发送”开始续传。" : "Resume task selected. Click Send to resume."; } }
         public static string VerifyHashLabel { get { return IsChinese ? "完整校验（续传）" : "Full hash verify (resume)"; } }
+        public static string SpeedLimitLabel { get { return IsChinese ? "限速(KB/s)" : "Limit(KB/s)"; } }
         public static string MonitorStarted(object path)
         {
             return IsChinese

@@ -52,6 +52,9 @@ namespace TrFileTransfer
         private NumericUpDown _numSrcPort;
         private Button _btnResumeList;
         private CheckBox _chkVerifyHash;
+        private Label _lblSpeed;
+        private NumericUpDown _numSpeed;
+        private int _monitorSpeedBytesPerSec;
         private Guid? _pendingResumeSession;
 
         // Progress
@@ -180,6 +183,13 @@ namespace TrFileTransfer
             _btnResumeList.Click += BtnResumeList_Click;
             _chkVerifyHash = new CheckBox { Location = new Point(15, 118), Width = 170, TextAlign = ContentAlignment.MiddleLeft };
             _chkVerifyHash.Checked = Config.GetBool("VerifyHash", false);
+            _lblSpeed = new Label { Location = new Point(195, 118), Width = 60, TextAlign = ContentAlignment.MiddleRight };
+            _numSpeed = new NumericUpDown
+            {
+                Location = new Point(260, 118), Width = 70,
+                Minimum = 0, Maximum = 1048576, Value = Config.GetInt("SpeedLimit", 0)
+            };
+            _numSpeed.ValueChanged += (s2, e2) => Config.SetInt("SpeedLimit", (int)_numSpeed.Value);
             _gbClient.Controls.Add(_lblServerIp);
             _gbClient.Controls.Add(_txtServerIp);
             _gbClient.Controls.Add(_lblPortC);
@@ -194,6 +204,8 @@ namespace TrFileTransfer
             _gbClient.Controls.Add(_chkFolder);
             _gbClient.Controls.Add(_chkMonitor);
             _gbClient.Controls.Add(_chkVerifyHash);
+            _gbClient.Controls.Add(_lblSpeed);
+            _gbClient.Controls.Add(_numSpeed);
             _gbClient.Controls.Add(_lblConcurrency);
             _gbClient.Controls.Add(_numConcurrency);
             _gbClient.Controls.Add(_btnResumeList);
@@ -268,6 +280,7 @@ namespace TrFileTransfer
             _chkFolder.Text = L.FolderMode;
             _btnResumeList.Text = L.ResumeBtn;
             _chkVerifyHash.Text = L.VerifyHashLabel;
+            _lblSpeed.Text = L.SpeedLimitLabel;
             _chkMonitor.Text = L.MonitorMode;
             _lblConcurrency.Text = L.ConcurrencyLabel;
             _lblSrcPort.Text = L.SrcPortLabel;
@@ -660,6 +673,7 @@ namespace TrFileTransfer
             _numSrcPort.Enabled = false;
             _btnResumeList.Enabled = false;
             _chkVerifyHash.Enabled = false;
+            _numSpeed.Enabled = false;
         }
 
         private void OnServerStarted()
@@ -739,6 +753,7 @@ namespace TrFileTransfer
             int concurrency = (int)_numConcurrency.Value;
             bool isTcp = _rbClientTcp.Checked;
             int srcPort = (int)_numSrcPort.Value;
+            int speedLimit = (int)_numSpeed.Value * 1024;
 
             // Resume is only valid for single-file, single-connection sends, and only
             // when the selected file still matches the one recorded in the resume state.
@@ -755,7 +770,7 @@ namespace TrFileTransfer
             if (!isFolder && concurrency > 1)
             {
                 // Multi-concurrent transfer
-                var concurrent = new ConcurrentTransfer(ip, port, path, concurrency, isTcp, srcPort);
+                var concurrent = new ConcurrentTransfer(ip, port, path, concurrency, isTcp, srcPort, speedLimit);
                 WireConcurrentEvents(concurrent);
                 if (isFolder)
                     await concurrent.SendFolderAsync();
@@ -765,8 +780,8 @@ namespace TrFileTransfer
             else if (isTcp)
             {
                 _client = srcPort > 0
-                    ? new TransferClient(ip, port, path, srcPort)
-                    : new TransferClient(ip, port, path);
+                    ? new TransferClient(ip, port, path, srcPort, 4194304, speedLimit)
+                    : new TransferClient(ip, port, path, 4194304, speedLimit);
                 WireClientEvents(_client);
                 if (isFolder)
                     await _client.SendFolderAsync(path);
@@ -781,8 +796,8 @@ namespace TrFileTransfer
             else
             {
                 _clientUdt = srcPort > 0
-                    ? new TransferUdtClient(ip, port, path, srcPort)
-                    : new TransferUdtClient(ip, port, path);
+                    ? new TransferUdtClient(ip, port, path, srcPort, 4194304, speedLimit)
+                    : new TransferUdtClient(ip, port, path, 4194304, speedLimit);
                 WireUdtClientEvents(_clientUdt);
                 if (isFolder)
                     await _clientUdt.SendFolderAsync(path);
@@ -890,6 +905,7 @@ namespace TrFileTransfer
             _numSrcPort.Enabled = true;
             _btnResumeList.Enabled = true;
             _chkVerifyHash.Enabled = true;
+            _numSpeed.Enabled = true;
         }
 
         private static string FormatEta(TransferProgress p)
@@ -1014,6 +1030,7 @@ namespace TrFileTransfer
         {
             _monitorCts = new System.Threading.CancellationTokenSource();
             _monitorSrcPort = (int)_numSrcPort.Value;
+            _monitorSpeedBytesPerSec = (int)_numSpeed.Value * 1024;
 
             DisableClientInputs();
             _lblStatusC.Text = L.MonitorWaiting;
@@ -1099,8 +1116,8 @@ namespace TrFileTransfer
                 if (_rbClientTcp.Checked)
                 {
                     var client = _monitorSrcPort > 0
-                        ? new TransferClient(ip, port, filePath, _monitorSrcPort)
-                        : new TransferClient(ip, port, filePath);
+                        ? new TransferClient(ip, port, filePath, _monitorSrcPort, 4194304, _monitorSpeedBytesPerSec)
+                        : new TransferClient(ip, port, filePath, 4194304, _monitorSpeedBytesPerSec);
                     client.OnLog += msg => this.Invoke((Action)(() => AddLog(msg)));
                     client.OnProgress += p => this.Invoke((Action)(() => UpdateCardProgress(card, p)));
                     client.OnError += msg => this.Invoke((Action)(() => AddLog(L.MonitorFileSendFailed(fileName, msg))));
@@ -1111,8 +1128,8 @@ namespace TrFileTransfer
                 else
                 {
                     var clientUdt = _monitorSrcPort > 0
-                        ? new TransferUdtClient(ip, port, filePath, _monitorSrcPort)
-                        : new TransferUdtClient(ip, port, filePath);
+                        ? new TransferUdtClient(ip, port, filePath, _monitorSrcPort, 4194304, _monitorSpeedBytesPerSec)
+                        : new TransferUdtClient(ip, port, filePath, 4194304, _monitorSpeedBytesPerSec);
                     clientUdt.OnLog += msg => this.Invoke((Action)(() => AddLog(msg)));
                     clientUdt.OnProgress += p => this.Invoke((Action)(() => UpdateCardProgress(card, p)));
                     clientUdt.OnError += msg => this.Invoke((Action)(() => AddLog(L.MonitorFileSendFailed(fileName, msg))));

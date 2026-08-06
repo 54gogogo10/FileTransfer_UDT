@@ -1073,6 +1073,7 @@ namespace TrFileTransfer
         private readonly string _filePath;
         private readonly int _bufferSize;
         private readonly int _localPort;
+        private readonly SpeedLimiter _limiter;
         private volatile bool _isRunning;
 
         /// <summary>Fired for every log message.</summary>
@@ -1097,21 +1098,25 @@ namespace TrFileTransfer
         /// <param name="filePath">Path to the file or folder to send.</param>
         /// <param name="bufferSize">I/O buffer size in bytes (default 1 MB).</param>
         public TransferUdtClient(string serverIp, int port, string filePath, int bufferSize = 4194304)
+            : this(serverIp, port, filePath, 0, bufferSize, 0)
         {
-            _serverIp = serverIp;
-            _port = port;
-            _filePath = filePath;
-            _bufferSize = bufferSize;
         }
 
         /// <summary>Creates a UDT client bound to a specific local port for concurrent transfers.</summary>
         public TransferUdtClient(string serverIp, int port, string filePath, int localPort, int bufferSize = 4194304)
+            : this(serverIp, port, filePath, localPort, bufferSize, 0)
+        {
+        }
+
+        /// <summary>Full constructor with rate limiting (maxBytesPerSec = 0 means unlimited).</summary>
+        public TransferUdtClient(string serverIp, int port, string filePath, int localPort, int bufferSize, int maxBytesPerSec)
         {
             _serverIp = serverIp;
             _port = port;
             _filePath = filePath;
             _bufferSize = bufferSize;
             _localPort = localPort;
+            _limiter = new SpeedLimiter(maxBytesPerSec);
         }
 
         /// <summary>Sends the file specified in the constructor over UDT.</summary>
@@ -1533,6 +1538,7 @@ namespace TrFileTransfer
                     sha256.TransformBlock(cur, 0, read, null, 0);
                     await UdtIo.UdtWriteExactAsync(clientSocket, cur, 0, read, ct);
                     bytesSent += read;
+                    _limiter.Throttle(read);
 
                     read = await nextReadTask;
                     if (read <= 0) break;
