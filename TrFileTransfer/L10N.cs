@@ -286,6 +286,13 @@ namespace TrFileTransfer
         public static string ResumeQueued { get { return IsChinese ? "已选择续传任务，点击“发送”开始续传。" : "Resume task selected. Click Send to resume."; } }
         public static string VerifyHashLabel { get { return IsChinese ? "完整校验（续传）" : "Full hash verify (resume)"; } }
         public static string SpeedLimitLabel { get { return IsChinese ? "限速(KB/s)" : "Limit(KB/s)"; } }
+        public static string QueueBtn { get { return IsChinese ? "发送队列" : "Send Queue"; } }
+        public static string QueueTitle { get { return IsChinese ? "发送队列" : "Send Queue"; } }
+        public static string QueueAdd { get { return IsChinese ? "添加当前文件" : "Add Current"; } }
+        public static string QueueDelete { get { return IsChinese ? "删除" : "Delete"; } }
+        public static string QueueClear { get { return IsChinese ? "全部清空" : "Clear All"; } }
+        public static string QueueStart { get { return IsChinese ? "开始" : "Start"; } }
+        public static string QueueInvalidTask { get { return IsChinese ? "请先填写有效的文件/文件夹、IP 和端口。" : "Fill in a valid file/folder, IP and port first."; } }
         public static string MonitorStarted(object path)
         {
             return IsChinese

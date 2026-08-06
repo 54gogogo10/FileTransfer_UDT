@@ -5,6 +5,7 @@ using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace TrFileTransfer
@@ -54,6 +55,7 @@ namespace TrFileTransfer
         private CheckBox _chkVerifyHash;
         private Label _lblSpeed;
         private NumericUpDown _numSpeed;
+        private Button _btnQueue;
         private int _monitorSpeedBytesPerSec;
         private Guid? _pendingResumeSession;
 
@@ -190,6 +192,8 @@ namespace TrFileTransfer
                 Minimum = 0, Maximum = 1048576, Value = Config.GetInt("SpeedLimit", 0)
             };
             _numSpeed.ValueChanged += (s2, e2) => Config.SetInt("SpeedLimit", (int)_numSpeed.Value);
+            _btnQueue = new Button { Location = new Point(455, 118), Width = 110, Height = 22 };
+            _btnQueue.Click += BtnQueue_Click;
             _gbClient.Controls.Add(_lblServerIp);
             _gbClient.Controls.Add(_txtServerIp);
             _gbClient.Controls.Add(_lblPortC);
@@ -206,6 +210,7 @@ namespace TrFileTransfer
             _gbClient.Controls.Add(_chkVerifyHash);
             _gbClient.Controls.Add(_lblSpeed);
             _gbClient.Controls.Add(_numSpeed);
+            _gbClient.Controls.Add(_btnQueue);
             _gbClient.Controls.Add(_lblConcurrency);
             _gbClient.Controls.Add(_numConcurrency);
             _gbClient.Controls.Add(_btnResumeList);
@@ -281,6 +286,7 @@ namespace TrFileTransfer
             _btnResumeList.Text = L.ResumeBtn;
             _chkVerifyHash.Text = L.VerifyHashLabel;
             _lblSpeed.Text = L.SpeedLimitLabel;
+            _btnQueue.Text = L.QueueBtn;
             _chkMonitor.Text = L.MonitorMode;
             _lblConcurrency.Text = L.ConcurrencyLabel;
             _lblSrcPort.Text = L.SrcPortLabel;
@@ -492,6 +498,41 @@ namespace TrFileTransfer
             }
         }
 
+        private void BtnQueue_Click(object sender, EventArgs e)
+        {
+            if (_chkMonitor.Checked || _monitorCts != null) return;
+            using (var dlg = new QueueDialog(CaptureQueuedTask, ExecuteQueuedTask))
+                dlg.ShowDialog(this);
+        }
+
+        private QueuedTask CaptureQueuedTask()
+        {
+            int port;
+            if (!int.TryParse(_txtPortC.Text.Trim(), out port) || port < 1 || port > 65535)
+                return null;
+            string path = _txtFile.Text.Trim();
+            if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(_txtServerIp.Text.Trim()))
+                return null;
+            return new QueuedTask
+            {
+                FilePath = path,
+                IsFolder = _chkFolder.Checked,
+                ServerIp = _txtServerIp.Text.Trim(),
+                Port = port,
+                IsUdp = _rbClientUdt.Checked,
+                SrcPort = (int)_numSrcPort.Value,
+                Concurrency = (int)_numConcurrency.Value,
+                VerifyHash = _chkVerifyHash.Checked,
+                SpeedLimit = (int)_numSpeed.Value * 1024
+            };
+        }
+
+        private async Task<bool> ExecuteQueuedTask(QueuedTask t)
+        {
+            return await StartTransfer(t.FilePath, t.IsFolder, t.ServerIp, t.Port, !t.IsUdp,
+                t.SrcPort, t.Concurrency, t.VerifyHash, t.SpeedLimit, null);
+        }
+
         private void BtnBrowseFile_Click(object sender, EventArgs e)
         {
             if (_chkFolder.Checked || _chkMonitor.Checked)
@@ -674,6 +715,7 @@ namespace TrFileTransfer
             _btnResumeList.Enabled = false;
             _chkVerifyHash.Enabled = false;
             _numSpeed.Enabled = false;
+            _btnQueue.Enabled = false;
         }
 
         private void OnServerStarted()
@@ -730,30 +772,10 @@ namespace TrFileTransfer
                 return;
             }
 
-            // Normal send branch
-            if (isFolder)
-            {
-                if (!Directory.Exists(path))
-                {
-                    MessageBox.Show(L.DirNotExist, L.DlgError, MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
-                }
-            }
-            else
-            {
-                if (!File.Exists(path))
-                {
-                    MessageBox.Show(L.FileNotFound, L.DlgError, MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
-                }
-            }
-
-            DisableClientInputs();
-
+            // Normal send branch — delegate to the shared transfer runner
             int concurrency = (int)_numConcurrency.Value;
             bool isTcp = _rbClientTcp.Checked;
             int srcPort = (int)_numSrcPort.Value;
-            int speedLimit = (int)_numSpeed.Value * 1024;
 
             // Resume is only valid for single-file, single-connection sends, and only
             // when the selected file still matches the one recorded in the resume state.
@@ -767,50 +789,89 @@ namespace TrFileTransfer
                     _pendingResumeSession = null;
             }
 
-            if (!isFolder && concurrency > 1)
-            {
-                // Multi-concurrent transfer
-                var concurrent = new ConcurrentTransfer(ip, port, path, concurrency, isTcp, srcPort, speedLimit);
-                WireConcurrentEvents(concurrent);
-                if (isFolder)
-                    await concurrent.SendFolderAsync();
-                else
-                    await concurrent.SendAsync();
-            }
-            else if (isTcp)
-            {
-                _client = srcPort > 0
-                    ? new TransferClient(ip, port, path, srcPort, 4194304, speedLimit)
-                    : new TransferClient(ip, port, path, 4194304, speedLimit);
-                WireClientEvents(_client);
-                if (isFolder)
-                    await _client.SendFolderAsync(path);
-                else if (resumeSession.HasValue)
-                {
-                    await _client.SendResumableAsync(resumeSession.Value, _chkVerifyHash.Checked);
-                    _pendingResumeSession = null;
-                }
-                else
-                    await _client.SendAsync();
-            }
-            else
-            {
-                _clientUdt = srcPort > 0
-                    ? new TransferUdtClient(ip, port, path, srcPort, 4194304, speedLimit)
-                    : new TransferUdtClient(ip, port, path, 4194304, speedLimit);
-                WireUdtClientEvents(_clientUdt);
-                if (isFolder)
-                    await _clientUdt.SendFolderAsync(path);
-                else if (resumeSession.HasValue)
-                {
-                    await _clientUdt.SendResumableAsync(resumeSession.Value, _chkVerifyHash.Checked);
-                    _pendingResumeSession = null;
-                }
-                else
-                    await _clientUdt.SendAsync();
-            }
+            await StartTransfer(path, isFolder, ip, port, isTcp, srcPort, concurrency,
+                _chkVerifyHash.Checked, (int)_numSpeed.Value * 1024, resumeSession);
+        }
 
-            try { ResetClientUI(); } catch { }
+        /// <summary>
+        /// Runs a single send (single or concurrent, TCP or UDT). Disables client inputs
+        /// while running and restores them afterwards. Returns false on failure — the
+        /// error is already surfaced via OnError event handlers.
+        /// </summary>
+        private async Task<bool> StartTransfer(string path, bool isFolder, string ip, int port,
+            bool isTcp, int srcPort, int concurrency, bool verifyHash, int speedLimit, Guid? resumeSession)
+        {
+            try
+            {
+                if (isFolder)
+                {
+                    if (!Directory.Exists(path))
+                    {
+                        MessageBox.Show(L.DirNotExist, L.DlgError, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        return false;
+                    }
+                }
+                else if (!File.Exists(path))
+                {
+                    MessageBox.Show(L.FileNotFound, L.DlgError, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return false;
+                }
+
+                DisableClientInputs();
+
+                if (!isFolder && concurrency > 1)
+                {
+                    // Multi-concurrent transfer
+                    var concurrent = new ConcurrentTransfer(ip, port, path, concurrency, isTcp, srcPort, speedLimit);
+                    WireConcurrentEvents(concurrent);
+                    if (isFolder)
+                        await concurrent.SendFolderAsync();
+                    else
+                        await concurrent.SendAsync();
+                }
+                else if (isTcp)
+                {
+                    _client = srcPort > 0
+                        ? new TransferClient(ip, port, path, srcPort, 4194304, speedLimit)
+                        : new TransferClient(ip, port, path, 4194304, speedLimit);
+                    WireClientEvents(_client);
+                    if (isFolder)
+                        await _client.SendFolderAsync(path);
+                    else if (resumeSession.HasValue)
+                    {
+                        await _client.SendResumableAsync(resumeSession.Value, verifyHash);
+                        _pendingResumeSession = null;
+                    }
+                    else
+                        await _client.SendAsync();
+                }
+                else
+                {
+                    _clientUdt = srcPort > 0
+                        ? new TransferUdtClient(ip, port, path, srcPort, 4194304, speedLimit)
+                        : new TransferUdtClient(ip, port, path, 4194304, speedLimit);
+                    WireUdtClientEvents(_clientUdt);
+                    if (isFolder)
+                        await _clientUdt.SendFolderAsync(path);
+                    else if (resumeSession.HasValue)
+                    {
+                        await _clientUdt.SendResumableAsync(resumeSession.Value, verifyHash);
+                        _pendingResumeSession = null;
+                    }
+                    else
+                        await _clientUdt.SendAsync();
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                AddLog(L.ErrorPrefix + ex.Message);
+                return false;
+            }
+            finally
+            {
+                try { ResetClientUI(); } catch { }
+            }
         }
 
         private void WireClientEvents(TransferClient c)
@@ -906,6 +967,7 @@ namespace TrFileTransfer
             _btnResumeList.Enabled = true;
             _chkVerifyHash.Enabled = true;
             _numSpeed.Enabled = true;
+            _btnQueue.Enabled = true;
         }
 
         private static string FormatEta(TransferProgress p)
@@ -1324,6 +1386,145 @@ namespace TrFileTransfer
             }
             _list.Items.Clear();
             _states = new ResumeState[0];
+        }
+    }
+
+    /// <summary>One queued send task (captured from the client panel).</summary>
+    public class QueuedTask
+    {
+        public string FilePath;
+        public bool IsFolder;
+        public string ServerIp;
+        public int Port;
+        public bool IsUdp;
+        public int SrcPort;
+        public int Concurrency;
+        public bool VerifyHash;
+        public int SpeedLimit;
+
+        public string DisplayName
+        {
+            get
+            {
+                string name = IsFolder ? Path.GetFileName(FilePath.TrimEnd('\\', '/')) : Path.GetFileName(FilePath);
+                if (string.IsNullOrEmpty(name)) name = FilePath;
+                return name;
+            }
+        }
+    }
+
+    /// <summary>Send-queue dialog: batch tasks executed serially.</summary>
+    public class QueueDialog : Form
+    {
+        private readonly Func<QueuedTask> _capture;
+        private readonly Func<QueuedTask, Task<bool>> _executor;
+        private readonly System.Collections.Generic.List<QueuedTask> _tasks
+            = new System.Collections.Generic.List<QueuedTask>();
+        private ListBox _list;
+        private Button _btnAdd, _btnDelete, _btnClear, _btnStart, _btnClose;
+        private bool _running;
+
+        public QueueDialog(Func<QueuedTask> capture, Func<QueuedTask, Task<bool>> executor)
+        {
+            _capture = capture;
+            _executor = executor;
+            Text = L.QueueTitle;
+            Size = new Size(560, 360);
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            Font = new Font("Segoe UI", 9f);
+
+            _list = new ListBox
+            {
+                Location = new Point(12, 12), Width = 520, Height = 240,
+                IntegralHeight = false
+            };
+            Controls.Add(_list);
+
+            _btnAdd = new Button { Text = L.QueueAdd, Location = new Point(12, 262), Width = 100 };
+            _btnAdd.Click += BtnAdd_Click;
+            Controls.Add(_btnAdd);
+
+            _btnDelete = new Button { Text = L.QueueDelete, Location = new Point(120, 262), Width = 100 };
+            _btnDelete.Click += BtnDelete_Click;
+            Controls.Add(_btnDelete);
+
+            _btnClear = new Button { Text = L.QueueClear, Location = new Point(228, 262), Width = 100 };
+            _btnClear.Click += BtnClear_Click;
+            Controls.Add(_btnClear);
+
+            _btnStart = new Button { Text = L.QueueStart, Location = new Point(336, 262), Width = 100 };
+            _btnStart.Click += BtnStart_Click;
+            Controls.Add(_btnStart);
+
+            _btnClose = new Button { Text = L.CancelBtn, Location = new Point(444, 262), Width = 90 };
+            _btnClose.Click += (__, ___) => Close();
+            Controls.Add(_btnClose);
+        }
+
+        private void BtnAdd_Click(object sender, EventArgs e)
+        {
+            if (_running) return;
+            var task = _capture();
+            if (task == null)
+            {
+                MessageBox.Show(L.QueueInvalidTask, L.DlgError, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            _tasks.Add(task);
+            _list.Items.Add(FormatTask(task));
+        }
+
+        private void BtnDelete_Click(object sender, EventArgs e)
+        {
+            if (_running) return;
+            int idx = _list.SelectedIndex;
+            if (idx >= 0 && idx < _tasks.Count)
+            {
+                _tasks.RemoveAt(idx);
+                _list.Items.RemoveAt(idx);
+            }
+        }
+
+        private void BtnClear_Click(object sender, EventArgs e)
+        {
+            if (_running) return;
+            _tasks.Clear();
+            _list.Items.Clear();
+        }
+
+        private async void BtnStart_Click(object sender, EventArgs e)
+        {
+            if (_running || _tasks.Count == 0) return;
+            _running = true;
+            _btnStart.Enabled = false;
+            _btnAdd.Enabled = false;
+            _btnDelete.Enabled = false;
+            _btnClear.Enabled = false;
+            try
+            {
+                for (int i = 0; i < _tasks.Count; i++)
+                {
+                    _list.Items[i] = "\u25B6 " + FormatTask(_tasks[i]); // ▶
+                    bool ok = await _executor(_tasks[i]);
+                    _list.Items[i] = (ok ? "\u2713 " : "\u2717 ") + FormatTask(_tasks[i]); // ✓ / ✗
+                }
+            }
+            finally
+            {
+                _running = false;
+                _btnStart.Enabled = true;
+                _btnAdd.Enabled = true;
+                _btnDelete.Enabled = true;
+                _btnClear.Enabled = true;
+            }
+        }
+
+        private static string FormatTask(QueuedTask t)
+        {
+            return string.Format("{0} -> {1}:{2} ({3})", t.DisplayName, t.ServerIp, t.Port, t.IsUdp ? "UDT" : "TCP");
         }
     }
 }
