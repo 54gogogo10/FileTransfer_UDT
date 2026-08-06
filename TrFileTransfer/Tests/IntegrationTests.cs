@@ -394,6 +394,8 @@ namespace TrFileTransfer.Tests
             {
                 try { if (tcpServer != null) tcpServer.Stop(); } catch { }
                 try { if (udtServer != null) udtServer.Stop(); } catch { }
+                // Let handler threads release file handles before deleting directories
+                System.Threading.Thread.Sleep(500);
                 try { Directory.Delete(sendDir, true); } catch { }
                 try { Directory.Delete(recvDir, true); } catch { }
             }
