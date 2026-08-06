@@ -710,11 +710,21 @@ namespace TrFileTransfer
             string fileName = System.Text.Encoding.UTF8.GetString(nameBuf);
             fileName = Path.GetFileName(fileName);
 
+            // Optional full-file hash verification extension: [verifyFlag(1) + fullHash(32)]
+            var flagBuf = new byte[1];
+            await UdtIo.UdtReadExactAsync(clientSocket, flagBuf, 0, 1, ct);
+            byte[] expectedFullHash = null;
+            if (flagBuf[0] == 1)
+            {
+                expectedFullHash = new byte[32];
+                await UdtIo.UdtReadExactAsync(clientSocket, expectedFullHash, 0, 32, ct);
+            }
+
             // Session is ours from here: persist incomplete state on the way out
             // (connection drop / server restart) and clear it once complete/discarded.
             try
             {
-                return await HandleResumableCoreUdt(clientSocket, ct, sessionId, totalSize, clientOffset, fileName).ConfigureAwait(false);
+                return await HandleResumableCoreUdt(clientSocket, ct, sessionId, totalSize, clientOffset, fileName, expectedFullHash).ConfigureAwait(false);
             }
             finally
             {
@@ -727,7 +737,7 @@ namespace TrFileTransfer
         }
 
         private async Task<bool> HandleResumableCoreUdt(int clientSocket, CancellationToken ct,
-            Guid sessionId, long totalSize, long clientOffset, string fileName)
+            Guid sessionId, long totalSize, long clientOffset, string fileName, byte[] expectedFullHash)
         {
             ResumeState state;
             byte status;
@@ -876,12 +886,36 @@ namespace TrFileTransfer
 
                 if (Utils.ConstantTimeEquals(computedHash, receivedHash))
                 {
+                    // Close the write stream so the file can be re-read for full verification
                     state.WriteStream.Dispose();
                     state.WriteStream = null;
-                    ResumeState removed;
-                    _udtResumeStates.TryRemove(sessionId, out removed);
-                    Log(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
-                    return true;
+
+                    if (expectedFullHash == null || await VerifyFullHashFileUdt(state.SavePath, expectedFullHash, ct).ConfigureAwait(false))
+                    {
+                        ResumeState removed;
+                        _udtResumeStates.TryRemove(sessionId, out removed);
+                        Log(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
+                        var okResp = new byte[10];
+                        okResp[0] = 0x10;
+                        Buffer.BlockCopy(BitConverter.GetBytes(totalSize), 0, okResp, 1, 8);
+                        okResp[9] = 2;
+                        await Task.Run(() => UdtNative.udt_send(clientSocket, okResp, 10, 0), ct);
+                        return true;
+                    }
+
+                    // Full-file hash mismatch — discard the mixed file and tell the client to retry
+                    ResumeState removedFh;
+                    _udtResumeStates.TryRemove(sessionId, out removedFh);
+                    try { File.Delete(state.SavePath); } catch { }
+                    Log(L.S_FullHashFailed(fileName));
+                    var errFh = OnError;
+                    if (errFh != null) errFh(L.S_FullHashFailed(fileName));
+                    var badResp = new byte[10];
+                    badResp[0] = 0x10;
+                    Buffer.BlockCopy(BitConverter.GetBytes(totalSize), 0, badResp, 1, 8);
+                    badResp[9] = 3;
+                    await Task.Run(() => UdtNative.udt_send(clientSocket, badResp, 10, 0), ct);
+                    return false;
                 }
 
                 // Hash mismatch — discard server state so a retry starts a fresh file
@@ -895,6 +929,26 @@ namespace TrFileTransfer
                 if (errHandler != null) errHandler(L.S_HashFailed(fileName));
             }
             return false;
+        }
+
+        private static async Task<bool> VerifyFullHashFileUdt(string savePath, byte[] expected, CancellationToken ct)
+        {
+            try
+            {
+                using (var fs = new FileStream(savePath, FileMode.Open, FileAccess.Read,
+                    FileShare.Read, 4194304, FileOptions.SequentialScan))
+                using (var sha = System.Security.Cryptography.SHA256.Create())
+                {
+                    var buf = new byte[4194304];
+                    int read;
+                    while ((read = await fs.ReadAsync(buf, 0, buf.Length, ct).ConfigureAwait(false)) > 0)
+                        sha.TransformBlock(buf, 0, read, null, 0);
+                    sha.TransformFinalBlock(Utils.EmptyBytes, 0, 0);
+                    return Utils.ConstantTimeEquals(expected, sha.Hash);
+                }
+            }
+            catch (IOException) { return false; }
+            catch (UnauthorizedAccessException) { return false; }
         }
 
         private async Task<bool> ReceiveFilePayload(int clientSocket, string savePath, long fileSize,
@@ -1079,10 +1133,10 @@ namespace TrFileTransfer
             await RunUdtTransfer(ct => SendChunkedInternal(offset, chunkSize, totalSize, ct));
         }
 
-        public async Task<Guid> SendResumableAsync(Guid? existingSessionId = null)
+        public async Task<Guid> SendResumableAsync(Guid? existingSessionId = null, bool verifyHash = false)
         {
             var sessionId = existingSessionId ?? Guid.NewGuid();
-            await RunUdtTransfer(ct => SendResumableUdtInternal(sessionId, ct));
+            await RunUdtTransfer(ct => SendResumableUdtInternal(sessionId, ct, verifyHash));
             return sessionId;
         }
 
@@ -1197,7 +1251,7 @@ namespace TrFileTransfer
                 Utils.FormatSize((long)(chunkSize / Math.Max(sw.Elapsed.TotalSeconds, 0.001)))));
         }
 
-        private async Task SendResumableUdtInternal(Guid sessionId, CancellationToken ct)
+        private async Task SendResumableUdtInternal(Guid sessionId, CancellationToken ct, bool verifyHash)
         {
             ResumeState.EnsureDir();
             var fileInfo = new FileInfo(_filePath);
@@ -1207,6 +1261,17 @@ namespace TrFileTransfer
             long sourceMTime;
             try { sourceMTime = File.GetLastWriteTimeUtc(_filePath).Ticks; }
             catch { sourceMTime = 0; }
+
+            // Full-file hash for verification (computed up front; only when requested)
+            byte[] fullHash = null;
+            if (verifyHash)
+            {
+                using (var fs = new FileStream(_filePath, FileMode.Open, FileAccess.Read,
+                    FileShare.Read, 4194304, FileOptions.SequentialScan))
+                using (var sha = System.Security.Cryptography.SHA256.Create())
+                    fullHash = sha.ComputeHash(fs);
+                Log(L.C_ComputingFullHash(fileName));
+            }
 
             var existingState = ResumeState.Load(sessionId);
             if (existingState != null && existingState.SourceMTime != 0 && existingState.SourceMTime != sourceMTime)
@@ -1242,15 +1307,21 @@ namespace TrFileTransfer
             await UdtConnect(ct).ConfigureAwait(false);
 
             // Build 0x03 header: type(1) + sessionId(16) + totalSize(8) + offset(8) + nameLen(4) + name
+            // + [verifyFlag(1)] + [fullHash(32)] when verifyHash is enabled. The flag byte is
+            // always present so the server can parse the stream unambiguously.
             byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(fileName);
-            var header = new byte[1 + 16 + 8 + 8 + 4 + nameBytes.Length];
+            int extra = 1 + (verifyHash ? 32 : 0);
+            var header = new byte[1 + 16 + 8 + 8 + 4 + nameBytes.Length + extra];
             int pos = 0;
             header[pos++] = 0x03;
             Buffer.BlockCopy(sessionId.ToByteArray(), 0, header, pos, 16); pos += 16;
             Buffer.BlockCopy(BitConverter.GetBytes(fileSize), 0, header, pos, 8); pos += 8;
             Buffer.BlockCopy(BitConverter.GetBytes(sentBytes), 0, header, pos, 8); pos += 8;
             Buffer.BlockCopy(BitConverter.GetBytes(nameBytes.Length), 0, header, pos, 4); pos += 4;
-            Buffer.BlockCopy(nameBytes, 0, header, pos, nameBytes.Length);
+            Buffer.BlockCopy(nameBytes, 0, header, pos, nameBytes.Length); pos += nameBytes.Length;
+            header[pos++] = verifyHash ? (byte)1 : (byte)0;
+            if (verifyHash)
+                Buffer.BlockCopy(fullHash, 0, header, pos, 32);
 
             await UdtIo.UdtWriteExactAsync(_socket, header, 0, header.Length, ct).ConfigureAwait(false);
 
@@ -1263,6 +1334,16 @@ namespace TrFileTransfer
 
             byte respStatus = respBuf[9];
             long serverOffset = BitConverter.ToInt64(respBuf, 1);
+
+            if (respStatus == 3)
+            {
+                // Full-file verification failed on the server — file was discarded.
+                // Keep the local resume state so the transfer can be retried.
+                Log(L.C_VerifyFailed(fileName));
+                var errHandler = OnError;
+                if (errHandler != null) errHandler(L.C_VerifyFailed(fileName));
+                return;
+            }
 
             if (respStatus == 2)
             {
@@ -1278,6 +1359,20 @@ namespace TrFileTransfer
             Log(L.C_ResumeNegotiated(actualStart, serverOffset, sentBytes));
 
             await SendFilePayload(_socket, _filePath, remainingSize, fileName, ct, actualStart).ConfigureAwait(false);
+
+            // Read the final 0x10 response: status 2 = success, 3 = full-file
+            // verification failed (server discarded the file, keep local state).
+            var finalResp = new byte[10];
+            await UdtIo.UdtReadExactAsync(_socket, finalResp, 0, 10, ct).ConfigureAwait(false);
+            if (finalResp[0] != 0x10)
+                throw new InvalidDataException(string.Format("Unexpected resume response type: {0}", finalResp[0]));
+            if (finalResp[9] == 3)
+            {
+                Log(L.C_VerifyFailed(fileName));
+                var errHandler = OnError;
+                if (errHandler != null) errHandler(L.C_VerifyFailed(fileName));
+                return;
+            }
 
             ResumeState.Delete(sessionId);
             var ch = OnTransferComplete;

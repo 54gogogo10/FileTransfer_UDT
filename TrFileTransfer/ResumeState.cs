@@ -10,6 +10,8 @@ namespace TrFileTransfer
         public long TotalSize;
         public long SentBytes;
         public long SourceMTime;
+        // Server-side only (not persisted)
+        public byte[] ExpectedFullHash;
         public string FileName;
         public string FilePath;
         public string ServerIp;

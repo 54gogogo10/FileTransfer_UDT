@@ -389,12 +389,22 @@ namespace TrFileTransfer
             if (string.IsNullOrWhiteSpace(fileName))
                 fileName = L.S_ReceivedFile;
 
+            // Optional full-file hash verification extension: [verifyFlag(1) + fullHash(32)]
+            var flagBuf = new byte[1];
+            await ReadExactAsync(stream, flagBuf, 0, 1, ct).ConfigureAwait(false);
+            byte[] expectedFullHash = null;
+            if (flagBuf[0] == 1)
+            {
+                expectedFullHash = new byte[32];
+                await ReadExactAsync(stream, expectedFullHash, 0, 32, ct).ConfigureAwait(false);
+            }
+
             // From here on, the session is ours: persist any incomplete state to disk
             // on the way out (connection drop / server restart) and clear it once the
             // transfer completes or is discarded.
             try
             {
-                await HandleResumableCore(stream, ct, sessionId, totalSize, clientOffset, fileName).ConfigureAwait(false);
+                await HandleResumableCore(stream, ct, sessionId, totalSize, clientOffset, fileName, expectedFullHash).ConfigureAwait(false);
             }
             finally
             {
@@ -407,7 +417,7 @@ namespace TrFileTransfer
         }
 
         private async Task HandleResumableCore(NetworkStream stream, CancellationToken ct,
-            Guid sessionId, long totalSize, long clientOffset, string fileName)
+            Guid sessionId, long totalSize, long clientOffset, string fileName, byte[] expectedFullHash)
         {
             ResumeState state = null;
             _resumeStates.TryGetValue(sessionId, out state);
@@ -578,13 +588,29 @@ namespace TrFileTransfer
 
                 if (Utils.ConstantTimeEquals(computedHash, receivedHash))
                 {
+                    // Close the write stream so the file can be re-read for full verification
                     state.WriteStream.Dispose();
                     state.WriteStream = null;
-                    ResumeState removed;
-                    _resumeStates.TryRemove(sessionId, out removed);
-                    Log(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
-                    await SendResumeResponse(stream, totalSize, 2, ct).ConfigureAwait(false);
-                    // Completion is reported by HandleClient via OnClientTransferComplete(clientEp).
+
+                    if (expectedFullHash == null || await VerifyFullHashFile(state.SavePath, expectedFullHash, ct).ConfigureAwait(false))
+                    {
+                        ResumeState removed;
+                        _resumeStates.TryRemove(sessionId, out removed);
+                        Log(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
+                        await SendResumeResponse(stream, totalSize, 2, ct).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        // Full-file hash mismatch — the resumed file mixes old and new
+                        // segments; discard it and tell the client to retry.
+                        ResumeState removed;
+                        _resumeStates.TryRemove(sessionId, out removed);
+                        try { File.Delete(state.SavePath); } catch { }
+                        Log(L.S_FullHashFailed(fileName));
+                        var errHandler = OnError;
+                        if (errHandler != null) errHandler(L.S_FullHashFailed(fileName));
+                        await SendResumeResponse(stream, totalSize, 3, ct).ConfigureAwait(false);
+                    }
                 }
                 else
                 {
@@ -607,6 +633,26 @@ namespace TrFileTransfer
             Buffer.BlockCopy(BitConverter.GetBytes(offset), 0, resp, 1, 8);
             resp[9] = status;
             await stream.WriteAsync(resp, 0, 10, ct).ConfigureAwait(false);
+        }
+
+        private static async Task<bool> VerifyFullHashFile(string savePath, byte[] expected, CancellationToken ct)
+        {
+            try
+            {
+                using (var fs = new FileStream(savePath, FileMode.Open, FileAccess.Read,
+                    FileShare.Read, 4194304, FileOptions.SequentialScan))
+                using (var sha = System.Security.Cryptography.SHA256.Create())
+                {
+                    var buf = new byte[4194304];
+                    int read;
+                    while ((read = await fs.ReadAsync(buf, 0, buf.Length, ct).ConfigureAwait(false)) > 0)
+                        sha.TransformBlock(buf, 0, read, null, 0);
+                    sha.TransformFinalBlock(Utils.EmptyBytes, 0, 0);
+                    return Utils.ConstantTimeEquals(expected, sha.Hash);
+                }
+            }
+            catch (IOException) { return false; }
+            catch (UnauthorizedAccessException) { return false; }
         }
 
         private async Task HandleFolderTransfer(NetworkStream stream, CancellationToken ct)

@@ -10,16 +10,30 @@ namespace TrFileTransfer.Tests
     {
         private static int FindFreePort()
         {
-            var listener = new TcpListener(System.Net.IPAddress.Loopback, 0);
-            try
+            for (int attempt = 0; attempt < 64; attempt++)
             {
-                listener.Start();
-                return ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
+                var listener = new TcpListener(System.Net.IPAddress.Loopback, 0);
+                try
+                {
+                    listener.Start();
+                    int port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
+                    // UDT servers bind UDP on the same port — verify it is not inside a
+                    // Windows reserved/excluded UDP range (Hyper-V/WSL dynamic ports).
+                    try
+                    {
+                        var udp = new UdpClient(port);
+                        udp.Close();
+                        return port;
+                    }
+                    catch { }
+                    finally
+                    {
+                        try { listener.Stop(); } catch { }
+                    }
+                }
+                catch { }
             }
-            finally
-            {
-                try { listener.Stop(); } catch { }
-            }
+            return 0;
         }
 
         public static void RunAll(TestRunner runner)
@@ -31,6 +45,7 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_TCP_ResumeSingleFile", TcpResumeSingleFile);
             runner.Run("Integration_TCP_ResumeInterrupted", TcpResumeInterrupted);
             runner.Run("Integration_TCP_ResumeAcrossRestart", TcpResumeAcrossRestart);
+            runner.Run("Integration_TCP_ResumeFullHashCorrupt", TcpResumeFullHashCorrupt);
             runner.Run("Integration_UDT_ResumeSingleFile", UdtResumeSingleFile);
             runner.Run("Integration_UDT_SingleFile", UdtSingleFile);
             runner.Run("Integration_UDT_LargeSingle", UdtLargeSingle);
@@ -781,8 +796,145 @@ namespace TrFileTransfer.Tests
             }
         }
 
+        private static void TcpResumeFullHashCorrupt()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_fh_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_fh_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+
+            TransferServer server = null;
+            try
+            {
+                var testFile = Path.Combine(sendDir, "resume_corrupt.bin");
+                var rng = new Random(42);
+                var content = new byte[1024 * 1024 * 128];
+                rng.NextBytes(content);
+                File.WriteAllBytes(testFile, content);
+                DateTime originalMTime = File.GetLastWriteTimeUtc(testFile);
+
+                var serverStarted = new ManualResetEvent(false);
+                var serverDone = new ManualResetEvent(false);
+                bool serverOk = false;
+                string serverError = null;
+                bool secondPhase = false;
+                var serverLogs = new System.Collections.Generic.List<string>();
+
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => serverStarted.Set();
+                server.OnLog += msg => { lock (serverLogs) serverLogs.Add(msg); };
+                server.OnClientTransferComplete += ep => { serverOk = true; serverDone.Set(); };
+                server.OnError += msg =>
+                {
+                    lock (serverLogs) serverLogs.Add("[OnError] " + msg);
+                    if (secondPhase) { serverError = msg; serverDone.Set(); }
+                };
+                server.Start();
+                if (!serverStarted.WaitOne(5000))
+                    throw new Exception("Server did not start");
+
+                var sessionId = Guid.NewGuid();
+                var state = new ResumeState
+                {
+                    SessionId = sessionId,
+                    TotalSize = content.Length,
+                    FileName = Path.GetFileName(testFile),
+                    FilePath = testFile,
+                    ServerIp = "127.0.0.1",
+                    Port = port,
+                    IsUdt = false,
+                    Created = DateTime.UtcNow,
+                    SentBytes = 0
+                };
+                state.Save();
+
+                // Phase 1: partial transfer with full-hash verification enabled
+                var client1 = new TransferClient("127.0.0.1", port, testFile);
+                var client1Done = new ManualResetEvent(false);
+                client1.OnStopped += () => client1Done.Set();
+                var sendTask1 = client1.SendResumableAsync(sessionId, true);
+
+                var partialReceived = new ManualResetEvent(false);
+                Action<System.Net.IPEndPoint, TransferProgress> progressHandler = null;
+                progressHandler = (ep, p) =>
+                {
+                    if (p.BytesTransferred >= 1024 * 1024)
+                    {
+                        server.OnClientProgress -= progressHandler;
+                        client1.Cancel();
+                        partialReceived.Set();
+                    }
+                };
+                server.OnClientProgress += progressHandler;
+
+                if (!partialReceived.WaitOne(30000))
+                    throw new Exception("Server did not receive partial data within 30s");
+                sendTask1.Wait(30000);
+                if (!client1Done.WaitOne(5000))
+                    throw new Exception("Client 1 did not stop after cancel");
+
+                // Phase 2: tamper with the source file (same size) but restore the
+                // mtime so the mtime check passes — the server's full-file hash
+                // verification must still catch the mixed content.
+                var tampered = new byte[content.Length];
+                var rng2 = new Random(99);
+                rng2.NextBytes(tampered);
+                File.WriteAllBytes(testFile, tampered);
+                File.SetLastWriteTimeUtc(testFile, originalMTime);
+
+                secondPhase = true;
+                var client2 = new TransferClient("127.0.0.1", port, testFile);
+                var client2Done = new ManualResetEvent(false);
+                bool client2Ok = false;
+                bool client2Error = false;
+                client2.OnTransferComplete += () => { client2Ok = true; client2Done.Set(); };
+                client2.OnError += msg => { client2Error = true; client2Done.Set(); };
+
+                var sendTask2 = client2.SendResumableAsync(sessionId, true);
+
+                // The server must reject the transfer: full-hash mismatch
+                if (!client2Done.WaitOne(60000))
+                    throw new Exception("Client 2 did not finish within 60s");
+                sendTask2.Wait(60000);
+                if (!client2Error)
+                {
+                    string logs;
+                    lock (serverLogs) logs = string.Join(" | ", serverLogs);
+                    throw new Exception("client 2 reported verification error — ok=" + client2Ok
+                        + " taskStatus=" + sendTask2.Status + " — server logs: " + logs);
+                }
+                Assert.False(client2Ok, "client 2 did NOT report success");
+
+                Thread.Sleep(500);
+
+                // Server discarded the mixed file
+                var leftover = Directory.GetFiles(recvDir);
+                Assert.Equal(0, leftover.Length, "server discarded the corrupt file");
+
+                // Server logged the full-hash failure
+                bool sawFullHashFailed = false;
+                lock (serverLogs)
+                {
+                    foreach (var line in serverLogs)
+                        if (line.Contains("Full-file hash")) sawFullHashFailed = true;
+                }
+                Assert.True(sawFullHashFailed, "server logged full-hash failure");
+
+                // Client resume state kept for retry
+                Assert.True(File.Exists(ResumeState.GetPath(sessionId)), "client state kept for retry");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
         private static void UdtResumeSingleFile()
-        {            int port = FindFreePort();
+        {
+            int port = FindFreePort();
             string sendDir = Path.Combine(@"D:\cc\tmp", "tr_ur_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             string recvDir = Path.Combine(@"D:\cc\tmp", "tr_ur_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(sendDir);
@@ -802,14 +954,16 @@ namespace TrFileTransfer.Tests
                 bool serverOk = false;
                 string serverError = null;
 
+                var serverLogs = new System.Collections.Generic.List<string>();
                 server = new TransferUdtServer("127.0.0.1", port, recvDir);
                 server.OnStarted += () => serverStarted.Set();
+                server.OnLog += msg => { lock (serverLogs) serverLogs.Add(msg); };
                 server.OnClientTransferComplete += ep => { serverOk = true; serverDone.Set(); };
                 server.OnError += msg => { serverError = msg; serverDone.Set(); };
                 server.Start();
 
                 if (!serverStarted.WaitOne(5000))
-                    throw new Exception("UDT server did not start");
+                    throw new Exception("UDT server did not start" + (serverError != null ? " — " + serverError : ""));
 
                 var sessionId = Guid.NewGuid();
                 var state = new ResumeState
@@ -829,8 +983,9 @@ namespace TrFileTransfer.Tests
                 var client = new TransferUdtClient("127.0.0.1", port, testFile);
                 var clientDone = new ManualResetEvent(false);
                 bool clientOk = false;
+                string clientError = null;
                 client.OnTransferComplete += () => { clientOk = true; clientDone.Set(); };
-                client.OnError += msg => clientDone.Set();
+                client.OnError += msg => { clientError = msg; clientDone.Set(); };
 
                 var sendTask = client.SendResumableAsync(sessionId);
 
@@ -842,7 +997,11 @@ namespace TrFileTransfer.Tests
                 if (!clientDone.WaitOne(5000))
                     throw new Exception("UDT client did not fire completion event");
                 if (!clientOk)
-                    throw new Exception("UDT resume transfer failed");
+                {
+                    string logs;
+                    lock (serverLogs) logs = string.Join(" | ", serverLogs);
+                    throw new Exception("UDT resume transfer failed: " + (clientError ?? "unknown") + " — server logs: " + logs);
+                }
 
                 Thread.Sleep(300);
 

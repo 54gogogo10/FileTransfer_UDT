@@ -284,6 +284,7 @@ namespace TrFileTransfer
         public static string ResumeClearAll { get { return IsChinese ? "全部清空" : "Clear All"; } }
         public static string ResumeListEmpty { get { return IsChinese ? "没有未完成的传输任务。" : "No incomplete transfer tasks."; } }
         public static string ResumeQueued { get { return IsChinese ? "已选择续传任务，点击“发送”开始续传。" : "Resume task selected. Click Send to resume."; } }
+        public static string VerifyHashLabel { get { return IsChinese ? "完整校验（续传）" : "Full hash verify (resume)"; } }
         public static string MonitorStarted(object path)
         {
             return IsChinese
@@ -315,6 +316,24 @@ namespace TrFileTransfer
             return IsChinese
                 ? string.Format("源文件已修改（{0}），放弃旧断点，从头发送。", fileName)
                 : string.Format("Source file changed ({0}) — discarding old checkpoint, sending from scratch.", fileName);
+        }
+        public static string C_ComputingFullHash(object fileName)
+        {
+            return IsChinese
+                ? string.Format("正在计算 {0} 的完整校验值...", fileName)
+                : string.Format("Computing full hash of {0}...", fileName);
+        }
+        public static string C_VerifyFailed(object fileName)
+        {
+            return IsChinese
+                ? string.Format("{0} 完整校验失败，服务器已丢弃文件，请重试。", fileName)
+                : string.Format("{0} failed full-file verification; server discarded the file. Retry.", fileName);
+        }
+        public static string S_FullHashFailed(object fileName)
+        {
+            return IsChinese
+                ? string.Format("完整校验失败，文件已删除: {0}", fileName)
+                : string.Format("Full-file hash mismatch, file discarded: {0}", fileName);
         }
 
         public static string MonitorLogStopped

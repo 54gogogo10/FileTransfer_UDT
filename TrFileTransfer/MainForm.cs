@@ -51,6 +51,8 @@ namespace TrFileTransfer
         private Label _lblSrcPort;
         private NumericUpDown _numSrcPort;
         private Button _btnResumeList;
+        private CheckBox _chkVerifyHash;
+        private Guid? _pendingResumeSession;
 
         // Progress
         private GroupBox _gbProgressS;
@@ -171,11 +173,13 @@ namespace TrFileTransfer
             _numConcurrency = new NumericUpDown
             {
                 Location = new Point(466, 93), Width = 50,
-                Minimum = 1, Maximum = 16, Value = 4
+                Minimum = 1, Maximum = 8, Value = 4
             };
             _numConcurrency.ValueChanged += NumConcurrency_ValueChanged;
             _btnResumeList = new Button { Location = new Point(520, 93), Width = 45, Height = 22 };
             _btnResumeList.Click += BtnResumeList_Click;
+            _chkVerifyHash = new CheckBox { Location = new Point(15, 118), Width = 170, TextAlign = ContentAlignment.MiddleLeft };
+            _chkVerifyHash.Checked = Config.GetBool("VerifyHash", false);
             _gbClient.Controls.Add(_lblServerIp);
             _gbClient.Controls.Add(_txtServerIp);
             _gbClient.Controls.Add(_lblPortC);
@@ -189,6 +193,7 @@ namespace TrFileTransfer
             _gbClient.Controls.Add(_btnBrowseFile);
             _gbClient.Controls.Add(_chkFolder);
             _gbClient.Controls.Add(_chkMonitor);
+            _gbClient.Controls.Add(_chkVerifyHash);
             _gbClient.Controls.Add(_lblConcurrency);
             _gbClient.Controls.Add(_numConcurrency);
             _gbClient.Controls.Add(_btnResumeList);
@@ -262,6 +267,7 @@ namespace TrFileTransfer
             _btnCancel.Text = L.CancelBtn;
             _chkFolder.Text = L.FolderMode;
             _btnResumeList.Text = L.ResumeBtn;
+            _chkVerifyHash.Text = L.VerifyHashLabel;
             _chkMonitor.Text = L.MonitorMode;
             _lblConcurrency.Text = L.ConcurrencyLabel;
             _lblSrcPort.Text = L.SrcPortLabel;
@@ -305,7 +311,7 @@ namespace TrFileTransfer
             _txtFile.Text = Config.Get("LastPath", "");
             _chkFolder.Checked = Config.GetBool("FolderMode", false);
             _chkMonitor.Checked = Config.GetBool("MonitorMode", false);
-            _numConcurrency.Value = Math.Max(1, Math.Min(16, Config.GetInt("Concurrency", 4)));
+            _numConcurrency.Value = Math.Max(1, Math.Min(8, Config.GetInt("Concurrency", 4)));
             _numSrcPort.Value = Math.Max(0, Math.Min(65535, Config.GetInt("SrcPort", 0)));
         }
 
@@ -457,6 +463,8 @@ namespace TrFileTransfer
                     _txtFile.Text = s.FilePath;
                     _chkFolder.Checked = false;
                     _numConcurrency.Value = 1;
+                    _pendingResumeSession = s.SessionId;
+                    AddLog(L.ResumeQueued);
                     if (s.IsUdt)
                     {
                         _rbClientTcp.Checked = false;
@@ -651,6 +659,7 @@ namespace TrFileTransfer
             _numConcurrency.Enabled = false;
             _numSrcPort.Enabled = false;
             _btnResumeList.Enabled = false;
+            _chkVerifyHash.Enabled = false;
         }
 
         private void OnServerStarted()
@@ -731,6 +740,18 @@ namespace TrFileTransfer
             bool isTcp = _rbClientTcp.Checked;
             int srcPort = (int)_numSrcPort.Value;
 
+            // Resume is only valid for single-file, single-connection sends, and only
+            // when the selected file still matches the one recorded in the resume state.
+            Guid? resumeSession = null;
+            if (!isFolder && concurrency == 1 && _pendingResumeSession.HasValue)
+            {
+                var st = ResumeState.Load(_pendingResumeSession.Value);
+                if (st != null && string.Equals(st.FilePath, path, StringComparison.OrdinalIgnoreCase))
+                    resumeSession = _pendingResumeSession;
+                else
+                    _pendingResumeSession = null;
+            }
+
             if (!isFolder && concurrency > 1)
             {
                 // Multi-concurrent transfer
@@ -749,6 +770,11 @@ namespace TrFileTransfer
                 WireClientEvents(_client);
                 if (isFolder)
                     await _client.SendFolderAsync(path);
+                else if (resumeSession.HasValue)
+                {
+                    await _client.SendResumableAsync(resumeSession.Value, _chkVerifyHash.Checked);
+                    _pendingResumeSession = null;
+                }
                 else
                     await _client.SendAsync();
             }
@@ -760,6 +786,11 @@ namespace TrFileTransfer
                 WireUdtClientEvents(_clientUdt);
                 if (isFolder)
                     await _clientUdt.SendFolderAsync(path);
+                else if (resumeSession.HasValue)
+                {
+                    await _clientUdt.SendResumableAsync(resumeSession.Value, _chkVerifyHash.Checked);
+                    _pendingResumeSession = null;
+                }
                 else
                     await _clientUdt.SendAsync();
             }
@@ -858,6 +889,7 @@ namespace TrFileTransfer
             _numConcurrency.Enabled = true;
             _numSrcPort.Enabled = true;
             _btnResumeList.Enabled = true;
+            _chkVerifyHash.Enabled = true;
         }
 
         private static string FormatEta(TransferProgress p)

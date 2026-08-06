@@ -77,10 +77,13 @@ namespace TrFileTransfer
         }
 
         /// <summary>Sends a file with resume support (type 0x03), negotiating with server via 0x10 response.</summary>
-        public async Task<Guid> SendResumableAsync(Guid? existingSessionId = null)
+        /// <param name="existingSessionId">Session to resume, or null for a new session.</param>
+        /// <param name="verifyHash">When true, sends a full-file SHA256 so the server can
+        /// reject a resumed file whose earlier segments no longer match the source.</param>
+        public async Task<Guid> SendResumableAsync(Guid? existingSessionId = null, bool verifyHash = false)
         {
             var sessionId = existingSessionId ?? Guid.NewGuid();
-            await RunTransfer(ct => SendResumableInternal(sessionId, ct));
+            await RunTransfer(ct => SendResumableInternal(sessionId, ct, verifyHash));
             return sessionId;
         }
 
@@ -294,7 +297,7 @@ namespace TrFileTransfer
             }
         }
 
-        private async Task SendResumableInternal(Guid sessionId, CancellationToken ct)
+        private async Task SendResumableInternal(Guid sessionId, CancellationToken ct, bool verifyHash)
         {
             ResumeState.EnsureDir();
             var fileInfo = new FileInfo(_filePath);
@@ -304,6 +307,17 @@ namespace TrFileTransfer
             long sourceMTime;
             try { sourceMTime = File.GetLastWriteTimeUtc(_filePath).Ticks; }
             catch { sourceMTime = 0; }
+
+            // Full-file hash for verification (computed up front; only when requested)
+            byte[] fullHash = null;
+            if (verifyHash)
+            {
+                using (var fs = new FileStream(_filePath, FileMode.Open, FileAccess.Read,
+                    FileShare.Read, 4194304, FileOptions.SequentialScan))
+                using (var sha = SHA256.Create())
+                    fullHash = sha.ComputeHash(fs);
+                Log(L.C_ComputingFullHash(fileName));
+            }
 
             // Load existing state if resuming
             var existingState = ResumeState.Load(sessionId);
@@ -349,14 +363,21 @@ namespace TrFileTransfer
                 var stream = client.GetStream();
 
                 // Build 0x03 header: type(1) + sessionId(16) + totalSize(8) + resumeOffset(8) + nameLen(4) + name
+                // + [verifyFlag(1)] + [fullHash(32)] when verifyHash is enabled. The flag byte is
+                // always present so the server can parse the stream unambiguously.
                 byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(fileName);
-                var header = new byte[1 + 16 + 8 + 8 + 4 + nameBytes.Length];
+                int extra = 1 + (verifyHash ? 32 : 0);
+                var header = new byte[1 + 16 + 8 + 8 + 4 + nameBytes.Length + extra];
                 header[0] = 0x03;
                 Buffer.BlockCopy(sessionId.ToByteArray(), 0, header, 1, 16);
                 Buffer.BlockCopy(BitConverter.GetBytes(fileSize), 0, header, 17, 8);
                 Buffer.BlockCopy(BitConverter.GetBytes(sentBytes), 0, header, 25, 8);
                 Buffer.BlockCopy(BitConverter.GetBytes(nameBytes.Length), 0, header, 33, 4);
                 Buffer.BlockCopy(nameBytes, 0, header, 37, nameBytes.Length);
+                int base2 = 37 + nameBytes.Length;
+                header[base2] = verifyHash ? (byte)1 : (byte)0;
+                if (verifyHash)
+                    Buffer.BlockCopy(fullHash, 0, header, base2 + 1, 32);
                 await stream.WriteAsync(header, 0, header.Length, ct).ConfigureAwait(false);
 
                 // Read 0x10 server response (10 bytes: 0x10 + offset8 + status1)
@@ -368,6 +389,16 @@ namespace TrFileTransfer
 
                 byte respStatus = respBuf[9];
                 long serverOffset = BitConverter.ToInt64(respBuf, 1);
+
+                if (respStatus == 3)
+                {
+                    // Full-file verification failed on the server — file was discarded.
+                    // Keep the local resume state so the transfer can be retried.
+                    Log(L.C_VerifyFailed(fileName));
+                    var errHandler = OnError;
+                    if (errHandler != null) errHandler(L.C_VerifyFailed(fileName));
+                    return;
+                }
 
                 if (respStatus == 2)
                 {
@@ -384,6 +415,20 @@ namespace TrFileTransfer
 
                 // Send file data from actualStart
                 await SendFilePayload(stream, _filePath, fileSize, fileName, ct, actualStart).ConfigureAwait(false);
+
+                // Read the final 0x10 response: status 2 = success, 3 = full-file
+                // verification failed (server discarded the file, keep local state).
+                var finalResp = new byte[10];
+                await ReadExactResumeAsync(stream, finalResp, 0, 10, ct).ConfigureAwait(false);
+                if (finalResp[0] != 0x10)
+                    throw new InvalidDataException(string.Format("Unexpected resume response type: {0}", finalResp[0]));
+                if (finalResp[9] == 3)
+                {
+                    Log(L.C_VerifyFailed(fileName));
+                    var errHandler = OnError;
+                    if (errHandler != null) errHandler(L.C_VerifyFailed(fileName));
+                    return;
+                }
 
                 // Success — delete resume state
                 ResumeState.Delete(sessionId);

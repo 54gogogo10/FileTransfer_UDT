@@ -85,8 +85,8 @@ namespace TrFileTransfer
                     WriteStream.SetLength(TotalSize);
                 }
                 WriteStream.Seek(chunkOffset, SeekOrigin.Begin);
-                WriteStream.Write(data, 0, data.Length);
-                BytesReceived += data.Length;
+                WriteStream.Write(data, 0, bufferSize);
+                BytesReceived += bufferSize;
                 ChunksCompleted++;
 
                 if (BytesReceived >= TotalSize && !Complete)
