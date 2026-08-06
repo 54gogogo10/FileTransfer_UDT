@@ -242,6 +242,8 @@ namespace TrFileTransfer
         public event Action<string> OnError;
         /// <summary>Fired when a single transfer completes. Server keeps listening.</summary>
         public event Action OnTransferComplete;
+        /// <summary>Fired when a file has been fully received and saved (path, size).</summary>
+        public event Action<string, long> OnFileReceived;
         /// <summary>Fired when the server starts listening.</summary>
         public event Action OnStarted;
         /// <summary>Fired when the server stops.</summary>
@@ -532,9 +534,16 @@ namespace TrFileTransfer
                     Utils.FormatSize((long)(fileSize / Math.Max(sw.Elapsed.TotalSeconds, 0.001)))));
                 var completeHandler = OnTransferComplete;
                 if (completeHandler != null) completeHandler();
+                RaiseFileReceived(savePath, fileSize);
                 return true;
             }
             return false;
+        }
+
+        private void RaiseFileReceived(string path, long size)
+        {
+            var handler = OnFileReceived;
+            if (handler != null) handler(path, size);
         }
 
         private async Task<bool> HandleFolderTransfer(int clientSocket, CancellationToken ct)
@@ -585,6 +594,7 @@ namespace TrFileTransfer
 
                 bool hashOk = await ReceiveFilePayload(clientSocket, savePath, fileSize, relativePath, ct);
                 if (!hashOk) return false;
+                RaiseFileReceived(savePath, fileSize);
 
                 totalSize += fileSize;
                 filesReceived++;
@@ -680,6 +690,7 @@ namespace TrFileTransfer
                 Log(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0, ""));
                 var completeHandler = OnTransferComplete;
                 if (completeHandler != null) completeHandler();
+                if (tracker != null) RaiseFileReceived(tracker.SavePath, totalSize);
                 return true;
             }
             return false;
@@ -895,6 +906,7 @@ namespace TrFileTransfer
                         ResumeState removed;
                         _udtResumeStates.TryRemove(sessionId, out removed);
                         Log(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
+                        RaiseFileReceived(state.SavePath, totalSize);
                         var okResp = new byte[10];
                         okResp[0] = 0x10;
                         Buffer.BlockCopy(BitConverter.GetBytes(totalSize), 0, okResp, 1, 8);
@@ -1084,6 +1096,8 @@ namespace TrFileTransfer
         public event Action<string> OnError;
         /// <summary>Fired when the transfer completes successfully.</summary>
         public event Action OnTransferComplete;
+        /// <summary>Fired when a file has been fully received and saved (path, size).</summary>
+        public event Action<string, long> OnFileReceived;
         /// <summary>Fired when the transfer starts.</summary>
         public event Action OnStarted;
         /// <summary>Fired when the transfer stops (completed, cancelled, or error).</summary>

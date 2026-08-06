@@ -301,6 +301,10 @@ namespace TrFileTransfer
         public static string Scanning { get { return IsChinese ? "正在扫描..." : "Scanning..."; } }
         public static string NotifySendDone { get { return IsChinese ? "发送完成" : "Send complete"; } }
         public static string NotifyReceiveDone { get { return IsChinese ? "收到文件" : "File received"; } }
+        public static string OpenSaveDir { get { return IsChinese ? "打开目录" : "Open Folder"; } }
+        public static string RecentFiles { get { return IsChinese ? "最近接收" : "Recent Files"; } }
+        public static string RecentFilesEmpty { get { return IsChinese ? "还没有收到文件。" : "No files received yet."; } }
+        public static string RecentOpen { get { return IsChinese ? "打开位置" : "Open Location"; } }
         public static string MonitorStarted(object path)
         {
             return IsChinese

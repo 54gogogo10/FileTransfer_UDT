@@ -60,6 +60,10 @@ namespace TrFileTransfer
         private int _monitorSpeedBytesPerSec;
         private DiscoveryServer _discoveryServer;
         private NotifyIcon _notifyIcon;
+        private Button _btnOpenDir;
+        private Button _btnRecent;
+        private readonly System.Collections.Generic.List<string> _recentFiles
+            = new System.Collections.Generic.List<string>();
         private Guid? _pendingResumeSession;
 
         // Progress
@@ -142,6 +146,10 @@ namespace TrFileTransfer
             _btnStartServer.Click += BtnStartServer_Click;
             _btnStopServer = new Button { Location = new Point(175, 95), Width = 110, Height = 30, Enabled = false };
             _btnStopServer.Click += BtnStopServer_Click;
+            _btnOpenDir = new Button { Location = new Point(55, 128), Width = 110, Height = 22 };
+            _btnOpenDir.Click += BtnOpenDir_Click;
+            _btnRecent = new Button { Location = new Point(175, 128), Width = 110, Height = 22 };
+            _btnRecent.Click += BtnRecent_Click;
             _gbServer.Controls.Add(_lblBind);
             _gbServer.Controls.Add(_cmbBind);
             _gbServer.Controls.Add(_lblPortS);
@@ -153,6 +161,8 @@ namespace TrFileTransfer
             _gbServer.Controls.Add(_btnBrowseDir);
             _gbServer.Controls.Add(_btnStartServer);
             _gbServer.Controls.Add(_btnStopServer);
+            _gbServer.Controls.Add(_btnOpenDir);
+            _gbServer.Controls.Add(_btnRecent);
 
             // Client panel
             _gbClient = new GroupBox { Location = new Point(12, 223), Size = new Size(580, 150) };
@@ -294,6 +304,8 @@ namespace TrFileTransfer
             _btnBrowseDir.Text = L.Browse;
             _btnStartServer.Text = L.StartServer;
             _btnStopServer.Text = L.StopServer;
+            _btnOpenDir.Text = L.OpenSaveDir;
+            _btnRecent.Text = L.RecentFiles;
 
             _gbClient.Text = L.ClientSettings;
             _lblServerIp.Text = L.ServerIP;
@@ -614,6 +626,44 @@ namespace TrFileTransfer
             }
         }
 
+        private void BtnOpenDir_Click(object sender, EventArgs e)
+        {
+            string dir = _txtSaveDir.Text.Trim();
+            if (Directory.Exists(dir))
+            {
+                try { System.Diagnostics.Process.Start("explorer.exe", dir); } catch { }
+            }
+            else
+            {
+                MessageBox.Show(L.DirNotExist, L.DlgError, MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void BtnRecent_Click(object sender, EventArgs e)
+        {
+            using (var dlg = new RecentFilesDialog(_recentFiles.ToArray()))
+                dlg.ShowDialog(this);
+        }
+
+        /// <summary>Records a received file and shows a tray notification.</summary>
+        private void OnFileReceived(string path, long size)
+        {
+            if (!string.IsNullOrEmpty(path))
+            {
+                _recentFiles.Add(path + "|" + size.ToString());
+                if (_recentFiles.Count > 100)
+                    _recentFiles.RemoveAt(0);
+            }
+            Notify(L.NotifyReceiveDone, Path.GetFileName(path));
+        }
+
+        /// <summary>Applies the optional date-archive layout to the save directory.</summary>
+        private static string GetArchiveDir(string saveDir)
+        {
+            if (!Config.GetBool("AutoArchive", false)) return saveDir;
+            return Path.Combine(saveDir, DateTime.Now.ToString("yyyy-MM-dd"));
+        }
+
         private void BtnStartServer_Click(object sender, EventArgs e)
         {
             int port;
@@ -645,9 +695,10 @@ namespace TrFileTransfer
             if (_chkServerTcp.Checked)
             {
                 bool tcpStarted = false;
-                var tcpServer = new TransferServer(bindAddr, port, saveDir);
+                var tcpServer = new TransferServer(bindAddr, port, GetArchiveDir(saveDir));
                 tcpServer.OnLog += msg => this.Invoke((Action)(() => AddLog(msg)));
                 tcpServer.OnError += msg => this.Invoke((Action)(() => _lblStatusS.Text = L.ErrorPrefix + msg));
+                tcpServer.OnFileReceived += (path, size) => this.Invoke((Action)(() => OnFileReceived(path, size)));
                 tcpServer.OnClientConnected += ep => this.Invoke((Action)(() => { }));
                 tcpServer.OnClientProgress += (ep, p) => this.Invoke((Action)(() =>
                 {
@@ -686,9 +737,10 @@ namespace TrFileTransfer
             if (_chkServerUdt.Checked)
             {
                 bool udtStarted = false;
-                var udtServer = new TransferUdtServer(bindAddr, port, saveDir);
+                var udtServer = new TransferUdtServer(bindAddr, port, GetArchiveDir(saveDir));
                 udtServer.OnLog += msg => this.Invoke((Action)(() => AddLog(msg)));
                 udtServer.OnError += msg => this.Invoke((Action)(() => _lblStatusS.Text = L.ErrorPrefix + msg));
+                udtServer.OnFileReceived += (path, size) => this.Invoke((Action)(() => OnFileReceived(path, size)));
                 udtServer.OnClientConnected += ep => this.Invoke((Action)(() => { }));
                 udtServer.OnClientProgress += (ep, p) => this.Invoke((Action)(() =>
                 {
@@ -1683,6 +1735,75 @@ namespace TrFileTransfer
             {
                 _useDevice(_devices[idx]);
                 Close();
+            }
+        }
+    }
+
+    /// <summary>Recent received files dialog: list, open location, clear.</summary>
+    public class RecentFilesDialog : Form
+    {
+        private readonly string[] _entries;
+        private ListBox _list;
+        private Button _btnOpen, _btnClose;
+
+        public RecentFilesDialog(string[] entries)
+        {
+            _entries = entries;
+            Text = L.RecentFiles;
+            Size = new Size(560, 340);
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            Font = new Font("Segoe UI", 9f);
+
+            _list = new ListBox
+            {
+                Location = new Point(12, 12), Width = 520, Height = 230,
+                IntegralHeight = false
+            };
+            if (entries == null || entries.Length == 0)
+            {
+                _list.Items.Add(L.RecentFilesEmpty);
+            }
+            else
+            {
+                for (int i = entries.Length - 1; i >= 0; i--)
+                    _list.Items.Add(FormatEntry(entries[i]));
+            }
+            _list.DoubleClick += (s2, e2) => BtnOpen_Click(null, null);
+            Controls.Add(_list);
+
+            _btnOpen = new Button { Text = L.RecentOpen, Location = new Point(12, 252), Width = 110 };
+            _btnOpen.Click += BtnOpen_Click;
+            Controls.Add(_btnOpen);
+
+            _btnClose = new Button { Text = L.CancelBtn, Location = new Point(130, 252), Width = 110 };
+            _btnClose.Click += (__, ___) => Close();
+            Controls.Add(_btnClose);
+        }
+
+        private static string FormatEntry(string entry)
+        {
+            int idx = entry.LastIndexOf('|');
+            if (idx <= 0) return entry;
+            string path = entry.Substring(0, idx);
+            long size;
+            long.TryParse(entry.Substring(idx + 1), out size);
+            return Path.GetFileName(path) + "  (" + Utils.FormatSize(size) + ")" + "  — " + path;
+        }
+
+        private void BtnOpen_Click(object sender, EventArgs e)
+        {
+            int idx = _list.SelectedIndex;
+            if (idx < 0) return;
+            string line = _list.Items[idx].ToString();
+            int pipe = line.LastIndexOf("  — ");
+            if (pipe < 0) return;
+            string path = line.Substring(pipe + 4);
+            if (File.Exists(path))
+            {
+                try { System.Diagnostics.Process.Start("explorer.exe", "/select,\"" + path + "\""); } catch { }
             }
         }
     }

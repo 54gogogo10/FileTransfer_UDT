@@ -32,6 +32,8 @@ namespace TrFileTransfer
         public event Action<string> OnError;
         /// <summary>Fired when a single transfer completes. Server keeps listening.</summary>
         public event Action OnTransferComplete;
+        /// <summary>Fired when a file has been fully received and saved (path, size).</summary>
+        public event Action<string, long> OnFileReceived;
         /// <summary>Fired when the server starts listening.</summary>
         public event Action OnStarted;
         /// <summary>Fired when the server stops.</summary>
@@ -266,6 +268,7 @@ namespace TrFileTransfer
                     Utils.FormatSize((long)(fileSize / Math.Max(sw.Elapsed.TotalSeconds, 0.001)))));
                 var completeHandler = OnTransferComplete;
                 if (completeHandler != null) completeHandler();
+                RaiseFileReceived(savePath, fileSize);
             }
         }
 
@@ -347,6 +350,7 @@ namespace TrFileTransfer
                     Log(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
                     var completeHandler = OnTransferComplete;
                     if (completeHandler != null) completeHandler();
+                    RaiseFileReceived(tracker.SavePath, totalSize);
                 }
             }
             else
@@ -598,6 +602,7 @@ namespace TrFileTransfer
                         _resumeStates.TryRemove(sessionId, out removed);
                         Log(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
                         await SendResumeResponse(stream, totalSize, 2, ct).ConfigureAwait(false);
+                        RaiseFileReceived(state.SavePath, totalSize);
                     }
                     else
                     {
@@ -655,6 +660,12 @@ namespace TrFileTransfer
             catch (UnauthorizedAccessException) { return false; }
         }
 
+        private void RaiseFileReceived(string path, long size)
+        {
+            var handler = OnFileReceived;
+            if (handler != null) handler(path, size);
+        }
+
         private async Task HandleFolderTransfer(NetworkStream stream, CancellationToken ct)
         {
             // Read folder header: folderNameLen(2) + folderName + fileCount(4)
@@ -704,6 +715,7 @@ namespace TrFileTransfer
 
                 bool hashOk = await ReceiveFilePayload(stream, savePath, fileSize, relativePath, ct);
                 if (!hashOk) return;
+                RaiseFileReceived(savePath, fileSize);
 
                 totalSize += fileSize;
                 filesReceived++;
