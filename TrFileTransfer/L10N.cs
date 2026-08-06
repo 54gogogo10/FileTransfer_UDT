@@ -299,6 +299,8 @@ namespace TrFileTransfer
         public static string ScanUse { get { return IsChinese ? "使用" : "Use"; } }
         public static string ScanEmpty { get { return IsChinese ? "未发现设备（请确认对方已启动服务器且防火墙允许 UDP 广播）。" : "No devices found (make sure the remote server is running and UDP broadcast is allowed)."; } }
         public static string Scanning { get { return IsChinese ? "正在扫描..." : "Scanning..."; } }
+        public static string NotifySendDone { get { return IsChinese ? "发送完成" : "Send complete"; } }
+        public static string NotifyReceiveDone { get { return IsChinese ? "收到文件" : "File received"; } }
         public static string MonitorStarted(object path)
         {
             return IsChinese

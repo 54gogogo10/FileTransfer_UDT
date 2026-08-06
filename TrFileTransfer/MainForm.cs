@@ -59,6 +59,7 @@ namespace TrFileTransfer
         private Button _btnScan;
         private int _monitorSpeedBytesPerSec;
         private DiscoveryServer _discoveryServer;
+        private NotifyIcon _notifyIcon;
         private Guid? _pendingResumeSession;
 
         // Progress
@@ -198,6 +199,20 @@ namespace TrFileTransfer
             _btnQueue.Click += BtnQueue_Click;
             _btnScan = new Button { Location = new Point(345, 118), Width = 55, Height = 22 };
             _btnScan.Click += BtnScan_Click;
+
+            // Tray icon for completion notifications (Win7-compatible balloon tips)
+            _notifyIcon = new NotifyIcon
+            {
+                Icon = System.Drawing.SystemIcons.Application,
+                Visible = true,
+                Text = L.AppTitle
+            };
+            _notifyIcon.DoubleClick += (s2, e2) =>
+            {
+                this.WindowState = FormWindowState.Normal;
+                this.Show();
+                this.Activate();
+            };
             _gbClient.Controls.Add(_lblServerIp);
             _gbClient.Controls.Add(_txtServerIp);
             _gbClient.Controls.Add(_lblPortC);
@@ -502,6 +517,21 @@ namespace TrFileTransfer
                     }
                 }
             }
+        }
+
+        /// <summary>Shows a tray notification (configurable) with optional sound.</summary>
+        private void Notify(string title, string text)
+        {
+            if (!Config.GetBool("NotifyEnabled", true)) return;
+            try
+            {
+                _notifyIcon.BalloonTipTitle = title;
+                _notifyIcon.BalloonTipText = text;
+                _notifyIcon.ShowBalloonTip(3000);
+                if (Config.GetBool("NotifySound", true))
+                    System.Media.SystemSounds.Asterisk.Play();
+            }
+            catch { }
         }
 
         private void BtnQueue_Click(object sender, EventArgs e)
@@ -965,6 +995,7 @@ namespace TrFileTransfer
             {
                 ResetClientUI();
                 UpdateCardComplete(card);
+                Notify(L.NotifySendDone, L.TransferComplete);
             }));
             c.OnStopped += () => this.Invoke((Action)(() => UpdateCardComplete(card)));
         }
