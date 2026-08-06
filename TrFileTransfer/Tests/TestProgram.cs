@@ -89,6 +89,7 @@ namespace TrFileTransfer.Tests
             RunGetUniqueSavePath(runner);
             RunConfig(runner);
             RunL10N(runner);
+            RunServerResumeStore(runner);
         }
 
         private static void RunFormatSize(TestRunner runner)
@@ -226,6 +227,71 @@ namespace TrFileTransfer.Tests
                 Assert.Equal(-1, Config.GetInt("__nonexistent_xyz", -1), "int fallback");
                 Assert.True(Config.GetBool("__nonexistent_xyz", true), "bool fallback true");
                 Assert.False(Config.GetBool("__nonexistent_xyz", false), "bool fallback false");
+            });
+        }
+
+        private static void RunServerResumeStore(TestRunner runner)
+        {
+            runner.Run("ServerResumeStore_RoundTrip", () =>
+            {
+                var sid = Guid.NewGuid();
+                var state = new ResumeState
+                {
+                    SessionId = sid,
+                    TotalSize = 123456789,
+                    ReceivedBytes = 54321000,
+                    FileName = "test.bin",
+                    SavePath = @"D:\cc\tmp\server-resume-test\test.bin",
+                    Created = new DateTime(2026, 8, 6, 12, 0, 0, DateTimeKind.Utc)
+                };
+                ServerResumeStore.Save(state);
+                try
+                {
+                    var loaded = ServerResumeStore.Load(sid);
+                    Assert.True(loaded != null, "loaded not null");
+                    Assert.Equal(state.TotalSize, loaded.TotalSize, "total size");
+                    Assert.Equal(state.ReceivedBytes, loaded.ReceivedBytes, "received bytes");
+                    Assert.Equal(state.FileName, loaded.FileName, "file name");
+                    Assert.Equal(state.SavePath, loaded.SavePath, "save path");
+                    Assert.Equal(state.Created, loaded.Created, "created");
+                }
+                finally
+                {
+                    ServerResumeStore.Delete(sid);
+                }
+            });
+
+            runner.Run("ServerResumeStore_Missing", () =>
+            {
+                var loaded = ServerResumeStore.Load(Guid.NewGuid());
+                Assert.True(loaded == null, "missing -> null");
+            });
+
+            runner.Run("ServerResumeStore_Delete", () =>
+            {
+                var sid = Guid.NewGuid();
+                var state = new ResumeState { SessionId = sid, TotalSize = 1, SavePath = @"D:\x.bin" };
+                ServerResumeStore.Save(state);
+                ServerResumeStore.Delete(sid);
+                Assert.True(ServerResumeStore.Load(sid) == null, "deleted -> null");
+            });
+
+            runner.Run("ServerResumeStore_CorruptFile", () =>
+            {
+                var sid = Guid.NewGuid();
+                string path = ServerResumeStore.GetPath(sid);
+                ServerResumeStore.EnsureDir();
+                File.WriteAllText(path, "not a valid state file at all\nno equals sign\n");
+                try
+                {
+                    var loaded = ServerResumeStore.Load(sid);
+                    Assert.True(loaded != null, "corrupt file still returns empty state (no throw)");
+                    Assert.Equal(0L, loaded.TotalSize, "corrupt fields default");
+                }
+                finally
+                {
+                    ServerResumeStore.Delete(sid);
+                }
             });
         }
 

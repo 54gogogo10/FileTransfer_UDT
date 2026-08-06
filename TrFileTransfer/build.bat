@@ -48,6 +48,7 @@ echo.
     L10N.cs ^
     TransferServer.cs ^
     ResumeState.cs ^
+    ServerResumeStore.cs ^
     ConcurrentTransfer.cs ^
     TransferUdt.cs ^
     TransferClient.cs ^

@@ -30,6 +30,7 @@ echo.
     ..\TransferUdt.cs ^
     ..\TransferClient.cs ^
     ..\ResumeState.cs ^
+    ..\ServerResumeStore.cs ^
     TestProgram.cs ^
     IntegrationTests.cs
 

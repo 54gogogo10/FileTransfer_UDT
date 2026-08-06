@@ -9,6 +9,7 @@ namespace TrFileTransfer
         public Guid SessionId;
         public long TotalSize;
         public long SentBytes;
+        public long SourceMTime;
         public string FileName;
         public string FilePath;
         public string ServerIp;
@@ -42,6 +43,7 @@ namespace TrFileTransfer
             sb.AppendLine("SessionId=" + SessionId.ToString("N"));
             sb.AppendLine("TotalSize=" + TotalSize);
             sb.AppendLine("SentBytes=" + SentBytes);
+            sb.AppendLine("SourceMTime=" + SourceMTime);
             sb.AppendLine("FileName=" + (FileName ?? "").Replace("\r", "").Replace("\n", ""));
             sb.AppendLine("FilePath=" + (FilePath ?? "").Replace("\r", "").Replace("\n", ""));
             sb.AppendLine("ServerIp=" + (ServerIp ?? "").Replace("\r", "").Replace("\n", ""));
@@ -66,14 +68,21 @@ namespace TrFileTransfer
                 {
                     case "TotalSize": { long v; if (long.TryParse(val, out v)) state.TotalSize = v; break; }
                     case "SentBytes": { long v; if (long.TryParse(val, out v)) state.SentBytes = v; break; }
+                    case "SourceMTime": { long v; if (long.TryParse(val, out v)) state.SourceMTime = v; break; }
                     case "FileName": state.FileName = val; break;
                     case "FilePath": state.FilePath = val; break;
                     case "ServerIp": state.ServerIp = val; break;
                     case "Port": { int v; if (int.TryParse(val, out v)) state.Port = v; break; }
                     case "IsUdt": state.IsUdt = val == "1"; break;
-                    case "Created": state.Created = DateTime.Parse(val,
-                        System.Globalization.CultureInfo.InvariantCulture,
-                        System.Globalization.DateTimeStyles.RoundtripKind); break;
+                    case "Created":
+                        try
+                        {
+                            state.Created = DateTime.Parse(val,
+                                System.Globalization.CultureInfo.InvariantCulture,
+                                System.Globalization.DateTimeStyles.RoundtripKind);
+                        }
+                        catch (FormatException) { }
+                        break;
                 }
             }
             return state;
