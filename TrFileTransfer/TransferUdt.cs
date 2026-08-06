@@ -1204,8 +1204,18 @@ namespace TrFileTransfer
             long fileSize = fileInfo.Length;
             string fileName = fileInfo.Name;
             long sentBytes = 0;
+            long sourceMTime;
+            try { sourceMTime = File.GetLastWriteTimeUtc(_filePath).Ticks; }
+            catch { sourceMTime = 0; }
 
             var existingState = ResumeState.Load(sessionId);
+            if (existingState != null && existingState.SourceMTime != 0 && existingState.SourceMTime != sourceMTime)
+            {
+                // Source file changed since the interrupted transfer — restart from scratch
+                Log(L.C_ResumeSourceChanged(fileName));
+                ResumeState.Delete(sessionId);
+                existingState = null;
+            }
             if (existingState != null)
             {
                 sentBytes = existingState.SentBytes;
@@ -1223,7 +1233,8 @@ namespace TrFileTransfer
                     Port = _port,
                     IsUdt = true,
                     Created = DateTime.UtcNow,
-                    SentBytes = 0
+                    SentBytes = 0,
+                    SourceMTime = sourceMTime
                 };
                 newState.Save();
             }

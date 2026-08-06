@@ -283,6 +283,7 @@ namespace TrFileTransfer
         public static string ResumeDelete { get { return IsChinese ? "删除" : "Delete"; } }
         public static string ResumeClearAll { get { return IsChinese ? "全部清空" : "Clear All"; } }
         public static string ResumeListEmpty { get { return IsChinese ? "没有未完成的传输任务。" : "No incomplete transfer tasks."; } }
+        public static string ResumeQueued { get { return IsChinese ? "已选择续传任务，点击“发送”开始续传。" : "Resume task selected. Click Send to resume."; } }
         public static string MonitorStarted(object path)
         {
             return IsChinese
@@ -309,6 +310,12 @@ namespace TrFileTransfer
                 : string.Format("Resume negotiated: start={0} server={1} client={2}", start, serverHad, clientHad);
         }
         public static string C_ResumeConnClosed { get { return IsChinese ? "续传连接意外关闭" : "Resume connection closed unexpectedly"; } }
+        public static string C_ResumeSourceChanged(object fileName)
+        {
+            return IsChinese
+                ? string.Format("源文件已修改（{0}），放弃旧断点，从头发送。", fileName)
+                : string.Format("Source file changed ({0}) — discarding old checkpoint, sending from scratch.", fileName);
+        }
 
         public static string MonitorLogStopped
         {
