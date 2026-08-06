@@ -293,6 +293,12 @@ namespace TrFileTransfer
         public static string QueueClear { get { return IsChinese ? "全部清空" : "Clear All"; } }
         public static string QueueStart { get { return IsChinese ? "开始" : "Start"; } }
         public static string QueueInvalidTask { get { return IsChinese ? "请先填写有效的文件/文件夹、IP 和端口。" : "Fill in a valid file/folder, IP and port first."; } }
+        public static string ScanBtn { get { return IsChinese ? "扫描" : "Scan"; } }
+        public static string ScanTitle { get { return IsChinese ? "局域网设备" : "LAN Devices"; } }
+        public static string ScanRescan { get { return IsChinese ? "重新扫描" : "Rescan"; } }
+        public static string ScanUse { get { return IsChinese ? "使用" : "Use"; } }
+        public static string ScanEmpty { get { return IsChinese ? "未发现设备（请确认对方已启动服务器且防火墙允许 UDP 广播）。" : "No devices found (make sure the remote server is running and UDP broadcast is allowed)."; } }
+        public static string Scanning { get { return IsChinese ? "正在扫描..." : "Scanning..."; } }
         public static string MonitorStarted(object path)
         {
             return IsChinese

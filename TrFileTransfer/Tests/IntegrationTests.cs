@@ -47,6 +47,7 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_TCP_ResumeAcrossRestart", TcpResumeAcrossRestart);
             runner.Run("Integration_TCP_ResumeFullHashCorrupt", TcpResumeFullHashCorrupt);
             runner.Run("Integration_TCP_RateLimit", TcpRateLimit);
+            runner.Run("Integration_Discovery", DiscoveryTest);
             runner.Run("Integration_UDT_ResumeSingleFile", UdtResumeSingleFile);
             runner.Run("Integration_UDT_SingleFile", UdtSingleFile);
             runner.Run("Integration_UDT_LargeSingle", UdtLargeSingle);
@@ -1000,6 +1001,26 @@ namespace TrFileTransfer.Tests
                 if (server != null) { try { server.Stop(); } catch { } }
                 try { Directory.Delete(sendDir, true); } catch { }
                 try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        private static void DiscoveryTest()
+        {
+            int dPort = FindFreePort();
+            var server = new DiscoveryServer(dPort);
+            server.Start("test-host", 8080, true, false);
+            try
+            {
+                var devices = DiscoveryClient.Scan(dPort, 3000, "127.0.0.1").Result;
+                Assert.True(devices.Length >= 1, "discovered at least one device");
+                Assert.Equal("test-host", devices[0].Name, "device name");
+                Assert.Equal(8080, devices[0].Port, "device port");
+                Assert.True(devices[0].SupportsTcp, "tcp flag set");
+                Assert.False(devices[0].SupportsUdt, "udt flag clear");
+            }
+            finally
+            {
+                server.Stop();
             }
         }
 

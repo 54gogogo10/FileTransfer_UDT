@@ -56,7 +56,9 @@ namespace TrFileTransfer
         private Label _lblSpeed;
         private NumericUpDown _numSpeed;
         private Button _btnQueue;
+        private Button _btnScan;
         private int _monitorSpeedBytesPerSec;
+        private DiscoveryServer _discoveryServer;
         private Guid? _pendingResumeSession;
 
         // Progress
@@ -194,6 +196,8 @@ namespace TrFileTransfer
             _numSpeed.ValueChanged += (s2, e2) => Config.SetInt("SpeedLimit", (int)_numSpeed.Value);
             _btnQueue = new Button { Location = new Point(455, 118), Width = 110, Height = 22 };
             _btnQueue.Click += BtnQueue_Click;
+            _btnScan = new Button { Location = new Point(345, 118), Width = 55, Height = 22 };
+            _btnScan.Click += BtnScan_Click;
             _gbClient.Controls.Add(_lblServerIp);
             _gbClient.Controls.Add(_txtServerIp);
             _gbClient.Controls.Add(_lblPortC);
@@ -211,6 +215,7 @@ namespace TrFileTransfer
             _gbClient.Controls.Add(_lblSpeed);
             _gbClient.Controls.Add(_numSpeed);
             _gbClient.Controls.Add(_btnQueue);
+            _gbClient.Controls.Add(_btnScan);
             _gbClient.Controls.Add(_lblConcurrency);
             _gbClient.Controls.Add(_numConcurrency);
             _gbClient.Controls.Add(_btnResumeList);
@@ -287,6 +292,7 @@ namespace TrFileTransfer
             _chkVerifyHash.Text = L.VerifyHashLabel;
             _lblSpeed.Text = L.SpeedLimitLabel;
             _btnQueue.Text = L.QueueBtn;
+            _btnScan.Text = L.ScanBtn;
             _chkMonitor.Text = L.MonitorMode;
             _lblConcurrency.Text = L.ConcurrencyLabel;
             _lblSrcPort.Text = L.SrcPortLabel;
@@ -533,6 +539,29 @@ namespace TrFileTransfer
                 t.SrcPort, t.Concurrency, t.VerifyHash, t.SpeedLimit, null);
         }
 
+        private void BtnScan_Click(object sender, EventArgs e)
+        {
+            if (_chkMonitor.Checked || _monitorCts != null) return;
+            using (var dlg = new DiscoveryDialog(UseDiscoveredDevice))
+                dlg.ShowDialog(this);
+        }
+
+        private void UseDiscoveredDevice(DeviceInfo d)
+        {
+            _txtServerIp.Text = d.Ip;
+            _txtPortC.Text = d.Port.ToString();
+            if (d.SupportsTcp && !d.SupportsUdt)
+            {
+                _rbClientTcp.Checked = true;
+                _rbClientUdt.Checked = false;
+            }
+            else if (d.SupportsUdt && !d.SupportsTcp)
+            {
+                _rbClientTcp.Checked = false;
+                _rbClientUdt.Checked = true;
+            }
+        }
+
         private void BtnBrowseFile_Click(object sender, EventArgs e)
         {
             if (_chkFolder.Checked || _chkMonitor.Checked)
@@ -671,6 +700,14 @@ namespace TrFileTransfer
                 EnableServerInputs();
                 MessageBox.Show(L.ServerStartFailed, L.DlgError, MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+            else
+            {
+                // Advertise the server over UDP so LAN clients can discover it
+                int dPort = Config.GetInt("DiscoveryPort", DiscoveryProtocol.DefaultPort);
+                if (_discoveryServer == null) _discoveryServer = new DiscoveryServer(dPort);
+                _discoveryServer.Start(Environment.MachineName, port,
+                    _chkServerTcp.Checked, _chkServerUdt.Checked);
+            }
         }
 
         private void DisableServerInputs()
@@ -716,6 +753,7 @@ namespace TrFileTransfer
             _chkVerifyHash.Enabled = false;
             _numSpeed.Enabled = false;
             _btnQueue.Enabled = false;
+            _btnScan.Enabled = false;
         }
 
         private void OnServerStarted()
@@ -736,6 +774,7 @@ namespace TrFileTransfer
         private void BtnStopServer_Click(object sender, EventArgs e)
         {
             _serverCount = 0; // reset before stopping so OnStopped handlers see zero
+            if (_discoveryServer != null) { _discoveryServer.Stop(); _discoveryServer = null; }
             if (_server != null) { _server.Stop(); _server = null; }
             if (_serverUdt != null) { _serverUdt.Stop(); _serverUdt = null; }
         }
@@ -968,6 +1007,7 @@ namespace TrFileTransfer
             _chkVerifyHash.Enabled = true;
             _numSpeed.Enabled = true;
             _btnQueue.Enabled = true;
+            _btnScan.Enabled = true;
         }
 
         private static string FormatEta(TransferProgress p)
@@ -1525,6 +1565,94 @@ namespace TrFileTransfer
         private static string FormatTask(QueuedTask t)
         {
             return string.Format("{0} -> {1}:{2} ({3})", t.DisplayName, t.ServerIp, t.Port, t.IsUdp ? "UDT" : "TCP");
+        }
+    }
+
+    /// <summary>LAN device scan dialog: lists discovered servers, picks one to connect to.</summary>
+    public class DiscoveryDialog : Form
+    {
+        private readonly Action<DeviceInfo> _useDevice;
+        private ListBox _list;
+        private Button _btnRescan, _btnUse, _btnClose;
+        private DeviceInfo[] _devices = new DeviceInfo[0];
+
+        public DiscoveryDialog(Action<DeviceInfo> useDevice)
+        {
+            _useDevice = useDevice;
+            Text = L.ScanTitle;
+            Size = new Size(480, 320);
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            Font = new Font("Segoe UI", 9f);
+
+            _list = new ListBox
+            {
+                Location = new Point(12, 12), Width = 440, Height = 200,
+                IntegralHeight = false
+            };
+            Controls.Add(_list);
+
+            _btnRescan = new Button { Text = L.ScanRescan, Location = new Point(12, 222), Width = 100 };
+            _btnRescan.Click += async (s2, e2) => await ScanAsync();
+            Controls.Add(_btnRescan);
+
+            _btnUse = new Button { Text = L.ScanUse, Location = new Point(120, 222), Width = 100 };
+            _btnUse.Click += BtnUse_Click;
+            Controls.Add(_btnUse);
+
+            _btnClose = new Button { Text = L.CancelBtn, Location = new Point(228, 222), Width = 100 };
+            _btnClose.Click += (__, ___) => Close();
+            Controls.Add(_btnClose);
+
+            Shown += async (s2, e2) => await ScanAsync();
+        }
+
+        private async Task ScanAsync()
+        {
+            _btnRescan.Enabled = false;
+            _list.Items.Clear();
+            _list.Items.Add(L.Scanning);
+            try
+            {
+                int dPort = Config.GetInt("DiscoveryPort", DiscoveryProtocol.DefaultPort);
+                var devices = await DiscoveryClient.Scan(dPort, 2000);
+                _devices = devices;
+                _list.Items.Clear();
+                if (devices.Length == 0)
+                {
+                    _list.Items.Add(L.ScanEmpty);
+                }
+                else
+                {
+                    for (int i = 0; i < devices.Length; i++)
+                    {
+                        var d = devices[i];
+                        string prot = (d.SupportsTcp ? "TCP" : "") + (d.SupportsUdt ? (d.SupportsTcp ? "+UDT" : "UDT") : "");
+                        _list.Items.Add(string.Format("{0}  {1}:{2}  ({3})", d.Name, d.Ip, d.Port, prot));
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _list.Items.Clear();
+                _list.Items.Add(L.ErrorPrefix + ex.Message);
+            }
+            finally
+            {
+                _btnRescan.Enabled = true;
+            }
+        }
+
+        private void BtnUse_Click(object sender, EventArgs e)
+        {
+            int idx = _list.SelectedIndex;
+            if (idx >= 0 && idx < _devices.Length)
+            {
+                _useDevice(_devices[idx]);
+                Close();
+            }
         }
     }
 }

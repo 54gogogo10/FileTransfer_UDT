@@ -52,6 +52,7 @@ echo.
     ConcurrentTransfer.cs ^
     TransferUdt.cs ^
     TransferClient.cs ^
+    DeviceDiscovery.cs ^
     MainForm.cs ^
     Program.cs
 
