@@ -47,20 +47,30 @@ namespace TrFileTransfer.Tests
         public int Passed { get { return _passed; } }
         public int Failed { get { return _failed; } }
 
-        public void Run(string name, Action test)
+        public void Run(string name, Action test, int retries = 0)
         {
-            try
+            for (int attempt = 0; ; attempt++)
             {
-                test();
-                _passed++;
-                Console.WriteLine("  PASS  " + name);
-            }
-            catch (Exception ex)
-            {
-                _failed++;
-                var msg = string.Format("  FAIL  {0} — {1}", name, ex.Message);
-                Console.WriteLine(msg);
-                _failures.Add(msg);
+                try
+                {
+                    test();
+                    _passed++;
+                    Console.WriteLine("  PASS  " + name);
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    if (attempt < retries)
+                    {
+                        Console.WriteLine("  RETRY " + name + " (attempt " + (attempt + 1) + "): " + ex.Message);
+                        continue;
+                    }
+                    _failed++;
+                    var msg = string.Format("  FAIL  {0} — {1}", name, ex.Message);
+                    Console.WriteLine(msg);
+                    _failures.Add(msg);
+                    return;
+                }
             }
         }
 

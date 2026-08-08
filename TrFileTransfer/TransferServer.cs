@@ -412,11 +412,15 @@ namespace TrFileTransfer
             }
             finally
             {
+                // Save only — never Delete here: Stop() may have already saved and
+                // cleared the dict, and blindly deleting would lose the checkpoint.
                 ResumeState st;
                 if (_resumeStates.TryGetValue(sessionId, out st))
+                {
+                    // Flush so the persisted ReceivedBytes always matches what is on disk
+                    try { if (st.WriteStream != null) st.WriteStream.Flush(); } catch { }
                     ServerResumeStore.Save(st);
-                else
-                    ServerResumeStore.Delete(sessionId);
+                }
             }
         }
 
@@ -600,6 +604,7 @@ namespace TrFileTransfer
                     {
                         ResumeState removed;
                         _resumeStates.TryRemove(sessionId, out removed);
+                        ServerResumeStore.Delete(sessionId);
                         Log(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
                         await SendResumeResponse(stream, totalSize, 2, ct).ConfigureAwait(false);
                         RaiseFileReceived(state.SavePath, totalSize);
@@ -610,6 +615,7 @@ namespace TrFileTransfer
                         // segments; discard it and tell the client to retry.
                         ResumeState removed;
                         _resumeStates.TryRemove(sessionId, out removed);
+                        ServerResumeStore.Delete(sessionId);
                         try { File.Delete(state.SavePath); } catch { }
                         Log(L.S_FullHashFailed(fileName));
                         var errHandler = OnError;
@@ -624,6 +630,7 @@ namespace TrFileTransfer
                     state.WriteStream = null;
                     ResumeState removed;
                     _resumeStates.TryRemove(sessionId, out removed);
+                    ServerResumeStore.Delete(sessionId);
                     Log(L.S_HashFailed(fileName));
                     var errHandler = OnError;
                     if (errHandler != null) errHandler(L.S_HashFailed(fileName));
@@ -756,6 +763,13 @@ namespace TrFileTransfer
                 FileShare.None, _bufferSize, FileOptions.SequentialScan))
             {
                 long remaining = fileSize;
+                if (remaining == 0)
+                {
+                    // Empty file: only the 32-byte hash follows
+                    var emptyHash = new byte[32];
+                    await ReadExactAsync(stream, emptyHash, 0, 32, ct).ConfigureAwait(false);
+                    return Utils.ConstantTimeEquals(emptyHash, sha256.ComputeHash(Utils.EmptyBytes));
+                }
                 int toRead = (int)Math.Min(remaining, (long)bufA.Length);
                 int read = await stream.ReadAsync(bufA, 0, toRead, ct);
                 if (read == 0)

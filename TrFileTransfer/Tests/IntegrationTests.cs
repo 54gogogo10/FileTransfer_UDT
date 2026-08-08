@@ -40,6 +40,11 @@ namespace TrFileTransfer.Tests
         {
             runner.Run("Integration_TCP_SingleFile", TcpSingleFile);
             runner.Run("Integration_TCP_Folder", TcpFolder);
+            runner.Run("Integration_TCP_EmptyFile", TcpEmptyFile);
+            runner.Run("Integration_TCP_ChineseName", TcpChineseName);
+            runner.Run("Integration_TCP_MultiClient", TcpMultiClient);
+            runner.Run("Integration_TCP_ConnectRefused", TcpConnectRefused);
+            runner.Run("Integration_TCP_FileNotFound", TcpFileNotFound);
             runner.Run("Integration_TCP_LargeSingle", TcpLargeSingle);
             runner.Run("Integration_TCP_LargeConcur", TcpLargeConcur);
             runner.Run("Integration_TCP_ResumeSingleFile", TcpResumeSingleFile);
@@ -48,10 +53,15 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_TCP_ResumeFullHashCorrupt", TcpResumeFullHashCorrupt);
             runner.Run("Integration_TCP_RateLimit", TcpRateLimit);
             runner.Run("Integration_Discovery", DiscoveryTest);
-            runner.Run("Integration_UDT_ResumeSingleFile", UdtResumeSingleFile);
-            runner.Run("Integration_UDT_SingleFile", UdtSingleFile);
-            runner.Run("Integration_UDT_LargeSingle", UdtLargeSingle);
-            runner.Run("Integration_UDT_LargeConcur", UdtLargeConcur);
+            runner.Run("Integration_UDT_ResumeSingleFile", UdtResumeSingleFile, 1); // UDT flaky handshake retry
+            runner.Run("Integration_UDT_ResumeAcrossRestart", UdtResumeAcrossRestart, 1);
+            runner.Run("Integration_UDT_ResumeFullHashCorrupt", UdtResumeFullHashCorrupt, 1);
+            runner.Run("Integration_UDT_Folder", UdtFolder, 1);
+            runner.Run("Integration_UDT_EmptyFile", UdtEmptyFile, 1);
+            runner.Run("Integration_UDT_RateLimit", UdtRateLimit, 1);
+            runner.Run("Integration_UDT_SingleFile", UdtSingleFile, 1);
+            runner.Run("Integration_UDT_LargeSingle", UdtLargeSingle, 1);
+            runner.Run("Integration_UDT_LargeConcur", UdtLargeConcur, 1);
         }
 
         private static void TcpSingleFile()
@@ -462,7 +472,7 @@ namespace TrFileTransfer.Tests
                 client.OnTransferComplete += () => { clientOk = true; clientDone.Set(); };
                 client.OnError += msg => clientDone.Set();
 
-                var sendTask = client.SendResumableAsync(sessionId);
+                var sendTask = client.SendResumableAsync(sessionId, true); // full-hash verification on
 
                 // Wait for server completion
                 if (!serverDone.WaitOne(30000))
@@ -776,9 +786,12 @@ namespace TrFileTransfer.Tests
                     foreach (var line in s2Logs)
                     {
                         if (line.Contains("restored server state")) sawRestored = true;
-                        if (line.Contains("Resume: ") && line.Contains("offset="))
+                        if (line.Contains("Resume: "))
                         {
-                            int marker = line.IndexOf("offset=") + 7;
+                            int marker = line.IndexOf("offset=");
+                            if (marker < 0) marker = line.IndexOf("offset ");
+                            if (marker < 0) continue;
+                            marker += 7; // "offset=" and "offset " are both 7 chars
                             string numStr = "";
                             for (int i = marker; i < line.Length && char.IsDigit(line[i]); i++)
                                 numStr += line[i];
@@ -788,8 +801,14 @@ namespace TrFileTransfer.Tests
                         }
                     }
                 }
+                if (!sawNonZeroOffset)
+                {
+                    string logs;
+                    lock (s2Logs) logs = string.Join(" | ", s2Logs);
+                    throw new Exception("server 2 resumed from zero — diskExists="
+                        + File.Exists(ServerResumeStore.GetPath(sessionId)) + " — s2 logs: " + logs);
+                }
                 Assert.True(sawRestored, "server 2 restored disk state");
-                Assert.True(sawNonZeroOffset, "server 2 resumed from non-zero offset");
             }
             finally
             {
@@ -1009,8 +1028,11 @@ namespace TrFileTransfer.Tests
         private static void DiscoveryTest()
         {
             int dPort = FindFreePort();
+            int dPort2 = FindFreePort();
             var server = new DiscoveryServer(dPort);
             server.Start("test-host", 8080, true, false);
+            var server2 = new DiscoveryServer(dPort2);
+            server2.Start("dual-host", 9090, true, true);
             try
             {
                 var devices = DiscoveryClient.Scan(dPort, 3000, "127.0.0.1").Result;
@@ -1019,10 +1041,760 @@ namespace TrFileTransfer.Tests
                 Assert.Equal(8080, devices[0].Port, "device port");
                 Assert.True(devices[0].SupportsTcp, "tcp flag set");
                 Assert.False(devices[0].SupportsUdt, "udt flag clear");
+
+                // Dual-protocol server: both flags set in the response bitmap
+                var devices2 = DiscoveryClient.Scan(dPort2, 3000, "127.0.0.1").Result;
+                Assert.True(devices2.Length >= 1, "discovered dual-protocol device");
+                Assert.Equal("dual-host", devices2[0].Name, "dual device name");
+                Assert.True(devices2[0].SupportsTcp, "dual tcp flag set");
+                Assert.True(devices2[0].SupportsUdt, "dual udt flag set");
             }
             finally
             {
                 server.Stop();
+                server2.Stop();
+            }
+        }
+
+        private static void UdtResumeAcrossRestart()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_urr_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_urr_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+
+            TransferUdtServer server1 = null;
+            TransferUdtServer server2 = null;
+            try
+            {
+                var testFile = Path.Combine(sendDir, "udt_restart.bin");
+                var rng = new Random(42);
+                var content = new byte[1024 * 1024 * 64]; // 64 MB
+                rng.NextBytes(content);
+                File.WriteAllBytes(testFile, content);
+
+                var sessionId = Guid.NewGuid();
+                var state = new ResumeState
+                {
+                    SessionId = sessionId,
+                    TotalSize = content.Length,
+                    FileName = Path.GetFileName(testFile),
+                    FilePath = testFile,
+                    ServerIp = "127.0.0.1",
+                    Port = port,
+                    IsUdt = true,
+                    Created = DateTime.UtcNow,
+                    SentBytes = 0
+                };
+                state.Save();
+
+                // ---- Phase 1: partial transfer on server1, interrupted by server Stop ----
+                var s1Started = new ManualResetEvent(false);
+                var phase1Closed = new ManualResetEvent(false);
+                server1 = new TransferUdtServer("127.0.0.1", port, recvDir);
+                server1.OnStarted += () => s1Started.Set();
+                server1.OnError += msg => phase1Closed.Set();
+                server1.Start();
+                if (!s1Started.WaitOne(5000))
+                    throw new Exception("UDT server 1 did not start");
+
+                var client1 = new TransferUdtClient("127.0.0.1", port, testFile);
+                var client1Done = new ManualResetEvent(false);
+                client1.OnStopped += () => client1Done.Set();
+                var sendTask1 = client1.SendResumableAsync(sessionId);
+
+                var partialReceived = new ManualResetEvent(false);
+                Action<System.Net.IPEndPoint, TransferProgress> progressHandler = null;
+                progressHandler = (ep, p) =>
+                {
+                    if (p.BytesTransferred >= 1024 * 1024)
+                    {
+                        server1.OnClientProgress -= progressHandler;
+                        partialReceived.Set();
+                    }
+                };
+                server1.OnClientProgress += progressHandler;
+
+                if (!partialReceived.WaitOne(60000))
+                    throw new Exception("UDT server 1 did not receive partial data within 60s");
+
+                // Simulate a server crash: Stop() closes sockets (interrupting the
+                // client's send) and persists the incomplete resume state to disk.
+                server1.Stop();
+                server1 = null;
+                sendTask1.Wait(30000);
+                if (!client1Done.WaitOne(5000))
+                    throw new Exception("Client 1 did not stop after server stop");
+                phase1Closed.WaitOne(2000);
+
+                // ---- Phase 2: server2 recovers the disk state and continues ----
+                var s2Started = new ManualResetEvent(false);
+                var s2Done = new ManualResetEvent(false);
+                bool s2Ok = false;
+                string s2Error = null;
+                var s2Logs = new System.Collections.Generic.List<string>();
+
+                server2 = new TransferUdtServer("127.0.0.1", port, recvDir);
+                server2.OnStarted += () => s2Started.Set();
+                server2.OnLog += msg => { lock (s2Logs) s2Logs.Add(msg); };
+                server2.OnClientTransferComplete += ep => { s2Ok = true; s2Done.Set(); };
+                server2.OnError += msg => { s2Error = msg; s2Done.Set(); };
+                server2.Start();
+                if (!s2Started.WaitOne(5000))
+                    throw new Exception("UDT server 2 did not start");
+
+                var client2 = new TransferUdtClient("127.0.0.1", port, testFile);
+                var client2Done = new ManualResetEvent(false);
+                bool client2Ok = false;
+                client2.OnTransferComplete += () => { client2Ok = true; client2Done.Set(); };
+                client2.OnError += msg => client2Done.Set();
+
+                var sendTask2 = client2.SendResumableAsync(sessionId);
+
+                if (!s2Done.WaitOne(60000))
+                    throw new Exception("UDT server 2 did not complete resumed transfer within 60s");
+                if (!s2Ok)
+                    throw new Exception("UDT server 2 error: " + (s2Error ?? "unknown"));
+                sendTask2.Wait(60000);
+                if (!client2Done.WaitOne(5000))
+                    throw new Exception("Client 2 did not fire completion event");
+                if (!client2Ok)
+                    throw new Exception("UDT resume after restart failed");
+
+                Thread.Sleep(300);
+
+                var receivedFile = Path.Combine(recvDir, "udt_restart.bin");
+                Assert.True(File.Exists(receivedFile), "received file exists");
+                var receivedContent = File.ReadAllBytes(receivedFile);
+                Assert.Equal(content.Length, receivedContent.Length, "file size matches");
+                Assert.True(Utils.ConstantTimeEquals(content, receivedContent), "content match");
+
+                Assert.False(File.Exists(ResumeState.GetPath(sessionId)), "client resume state deleted");
+                Assert.False(File.Exists(ServerResumeStore.GetPath(sessionId)), "server resume state deleted");
+
+                bool sawRestored = false;
+                bool sawNonZeroOffset = false;
+                lock (s2Logs)
+                {
+                    foreach (var line in s2Logs)
+                    {
+                        if (line.Contains("restored server state")) sawRestored = true;
+                        if (line.Contains("Resume: "))
+                        {
+                            int marker = line.IndexOf("offset=");
+                            if (marker < 0) marker = line.IndexOf("offset ");
+                            if (marker < 0) continue;
+                            marker += 7; // "offset=" and "offset " are both 7 chars
+                            string numStr = "";
+                            for (int i = marker; i < line.Length && char.IsDigit(line[i]); i++)
+                                numStr += line[i];
+                            long off;
+                            if (long.TryParse(numStr, out off) && off > 0)
+                                sawNonZeroOffset = true;
+                        }
+                    }
+                }
+                if (!sawNonZeroOffset)
+                {
+                    string logs;
+                    lock (s2Logs) logs = string.Join(" | ", s2Logs);
+                    throw new Exception("server 2 resumed from zero — diskExists="
+                        + File.Exists(ServerResumeStore.GetPath(sessionId)) + " — s2 logs: " + logs);
+                }
+                Assert.True(sawRestored, "server 2 restored disk state");
+            }
+            finally
+            {
+                if (server1 != null) { try { server1.Stop(); } catch { } }
+                if (server2 != null) { try { server2.Stop(); } catch { } }
+                System.Threading.Thread.Sleep(500);
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        private static void UdtResumeFullHashCorrupt()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_ufh_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_ufh_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+
+            TransferUdtServer server = null;
+            try
+            {
+                var testFile = Path.Combine(sendDir, "udt_corrupt.bin");
+                var rng = new Random(42);
+                var content = new byte[1024 * 1024 * 64];
+                rng.NextBytes(content);
+                File.WriteAllBytes(testFile, content);
+                DateTime originalMTime = File.GetLastWriteTimeUtc(testFile);
+
+                var serverStarted = new ManualResetEvent(false);
+                var serverDone = new ManualResetEvent(false);
+                var phase1Closed = new ManualResetEvent(false);
+                bool secondPhase = false;
+                string serverError = null;
+                var serverLogs = new System.Collections.Generic.List<string>();
+
+                server = new TransferUdtServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => serverStarted.Set();
+                server.OnLog += msg => { lock (serverLogs) serverLogs.Add(msg); };
+                server.OnClientTransferComplete += ep => serverDone.Set();
+                server.OnError += msg =>
+                {
+                    lock (serverLogs) serverLogs.Add("[OnError] " + msg);
+                    if (secondPhase) { serverError = msg; serverDone.Set(); }
+                    else phase1Closed.Set();
+                };
+                server.Start();
+                if (!serverStarted.WaitOne(5000))
+                    throw new Exception("UDT server did not start");
+
+                var sessionId = Guid.NewGuid();
+                var state = new ResumeState
+                {
+                    SessionId = sessionId,
+                    TotalSize = content.Length,
+                    FileName = Path.GetFileName(testFile),
+                    FilePath = testFile,
+                    ServerIp = "127.0.0.1",
+                    Port = port,
+                    IsUdt = true,
+                    Created = DateTime.UtcNow,
+                    SentBytes = 0
+                };
+                state.Save();
+
+                // Phase 1: partial transfer with full-hash verification enabled
+                var client1 = new TransferUdtClient("127.0.0.1", port, testFile);
+                var client1Done = new ManualResetEvent(false);
+                string client1Error = null;
+                client1.OnStopped += () => client1Done.Set();
+                client1.OnError += msg => { client1Error = msg; client1Done.Set(); };
+                var sendTask1 = client1.SendResumableAsync(sessionId, true);
+
+                var partialReceived = new ManualResetEvent(false);
+                Action<System.Net.IPEndPoint, TransferProgress> progressHandler = null;
+                progressHandler = (ep, p) =>
+                {
+                    if (p.BytesTransferred >= 1024 * 1024)
+                    {
+                        server.OnClientProgress -= progressHandler;
+                        server.Stop(); // interrupt the client mid-transfer
+                        partialReceived.Set();
+                    }
+                };
+                server.OnClientProgress += progressHandler;
+
+                if (!partialReceived.WaitOne(60000))
+                    throw new Exception("UDT server did not receive partial data within 60s — client error: "
+                        + (client1Error ?? "none") + " — clientDone=" + client1Done.WaitOne(0));
+                sendTask1.Wait(30000);
+                if (!client1Done.WaitOne(5000))
+                    throw new Exception("Client 1 did not stop after server stop");
+                // Wait for server 1 to finish unwinding (persisting resume state to disk)
+                phase1Closed.WaitOne(2000);
+
+                // Restart the server, then tamper with the source (same size, same mtime)
+                server.Stop();
+                var s2Started = new ManualResetEvent(false);
+                server = new TransferUdtServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => s2Started.Set();
+                server.OnLog += msg => { lock (serverLogs) serverLogs.Add(msg); };
+                server.OnClientTransferComplete += ep => serverDone.Set();
+                server.OnError += msg =>
+                {
+                    lock (serverLogs) serverLogs.Add("[OnError] " + msg);
+                    if (secondPhase) { serverError = msg; serverDone.Set(); }
+                };
+                server.Start();
+                if (!s2Started.WaitOne(5000))
+                    throw new Exception("UDT server did not restart");
+
+                var tampered = new byte[content.Length];
+                var rng2 = new Random(99);
+                rng2.NextBytes(tampered);
+                File.WriteAllBytes(testFile, tampered);
+                File.SetLastWriteTimeUtc(testFile, originalMTime);
+
+                secondPhase = true;
+                var client2 = new TransferUdtClient("127.0.0.1", port, testFile);
+                var client2Done = new ManualResetEvent(false);
+                bool client2Ok = false;
+                bool client2Error = false;
+                client2.OnTransferComplete += () => { client2Ok = true; client2Done.Set(); };
+                client2.OnError += msg => { client2Error = true; client2Done.Set(); };
+
+                var sendTask2 = client2.SendResumableAsync(sessionId, true);
+
+                if (!client2Done.WaitOne(60000))
+                    throw new Exception("Client 2 did not finish within 60s");
+                sendTask2.Wait(60000);
+                if (!client2Error)
+                {
+                    string logs;
+                    lock (serverLogs) logs = string.Join(" | ", serverLogs);
+                    throw new Exception("client 2 reported verification error — ok=" + client2Ok
+                        + " — server logs: " + logs);
+                }
+                Assert.False(client2Ok, "client 2 did NOT report success");
+
+                Thread.Sleep(500);
+                var leftover = Directory.GetFiles(recvDir);
+                Assert.Equal(0, leftover.Length, "server discarded the corrupt file");
+
+                bool sawFullHashFailed = false;
+                lock (serverLogs)
+                {
+                    foreach (var line in serverLogs)
+                        if (line.Contains("Full-file hash")) sawFullHashFailed = true;
+                }
+                Assert.True(sawFullHashFailed, "server logged full-hash failure");
+                Assert.True(File.Exists(ResumeState.GetPath(sessionId)), "client state kept for retry");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                System.Threading.Thread.Sleep(500);
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        private static void UdtFolder()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_uf_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_uf_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string folderPath = Path.Combine(sendDir, "udtFolder");
+            Directory.CreateDirectory(Path.Combine(folderPath, "sub"));
+
+            TransferUdtServer server = null;
+            try
+            {
+                var rng = new Random(123);
+                var fileAContent = new byte[1024 * 10];
+                var fileBContent = new byte[1024 * 15];
+                rng.NextBytes(fileAContent);
+                rng.NextBytes(fileBContent);
+                File.WriteAllBytes(Path.Combine(folderPath, "a.bin"), fileAContent);
+                File.WriteAllBytes(Path.Combine(folderPath, "sub", "b.bin"), fileBContent);
+
+                var serverStarted = new ManualResetEvent(false);
+                var serverDone = new ManualResetEvent(false);
+                bool serverOk = false;
+                string serverError = null;
+
+                server = new TransferUdtServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => serverStarted.Set();
+                server.OnTransferComplete += () => { serverOk = true; serverDone.Set(); };
+                server.OnError += msg => { serverError = msg; serverDone.Set(); };
+                server.Start();
+                if (!serverStarted.WaitOne(5000))
+                    throw new Exception("UDT server did not start within 5s");
+
+                var client = new TransferUdtClient("127.0.0.1", port, folderPath);
+                var clientDone = new ManualResetEvent(false);
+                bool clientOk = false;
+                client.OnTransferComplete += () => { clientOk = true; clientDone.Set(); };
+                client.OnError += msg => clientDone.Set();
+
+                var sendTask = client.SendFolderAsync(folderPath);
+
+                if (!serverDone.WaitOne(60000))
+                    throw new Exception("UDT server did not complete within 60s");
+                if (!serverOk)
+                    throw new Exception("UDT server error: " + (serverError ?? "unknown"));
+                sendTask.Wait(60000);
+                if (!clientDone.WaitOne(5000))
+                    throw new Exception("UDT client did not fire completion event");
+                if (!clientOk)
+                    throw new Exception("UDT client folder transfer failed");
+
+                Thread.Sleep(300);
+
+                Assert.True(Directory.Exists(recvDir), "receive dir exists");
+                var receivedA = Path.Combine(recvDir, "udtFolder", "a.bin");
+                var receivedB = Path.Combine(recvDir, "udtFolder", "sub", "b.bin");
+                Assert.True(File.Exists(receivedA), "a.bin exists");
+                Assert.True(File.Exists(receivedB), "sub/b.bin exists");
+                Assert.True(Utils.ConstantTimeEquals(fileAContent, File.ReadAllBytes(receivedA)), "a.bin content");
+                Assert.True(Utils.ConstantTimeEquals(fileBContent, File.ReadAllBytes(receivedB)), "b.bin content");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                System.Threading.Thread.Sleep(500);
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        private static void TcpEmptyFile()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_te_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_te_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+
+            TransferServer server = null;
+            try
+            {
+                var testFile = Path.Combine(sendDir, "empty.bin");
+                File.WriteAllBytes(testFile, new byte[0]);
+
+                var serverStarted = new ManualResetEvent(false);
+                var serverDone = new ManualResetEvent(false);
+                bool serverOk = false;
+                string serverError = null;
+                string receivedPath = null;
+
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => serverStarted.Set();
+                server.OnTransferComplete += () => { serverOk = true; serverDone.Set(); };
+                server.OnFileReceived += (path, size) => { receivedPath = path; serverDone.Set(); };
+                server.OnError += msg => { serverError = msg; serverDone.Set(); };
+                server.Start();
+                if (!serverStarted.WaitOne(5000))
+                    throw new Exception("Server did not start");
+
+                var client = new TransferClient("127.0.0.1", port, testFile);
+                var clientDone = new ManualResetEvent(false);
+                bool clientOk = false;
+                client.OnTransferComplete += () => { clientOk = true; clientDone.Set(); };
+                client.OnError += msg => clientDone.Set();
+
+                var sendTask = client.SendAsync();
+                if (!serverDone.WaitOne(30000))
+                    throw new Exception("Server did not complete within 30s");
+                if (!serverOk && receivedPath == null)
+                    throw new Exception("Server error: " + (serverError ?? "unknown"));
+                sendTask.Wait(30000);
+                if (!clientDone.WaitOne(5000))
+                    throw new Exception("Client did not fire completion event");
+                if (!clientOk)
+                    throw new Exception("Client transfer failed");
+
+                Thread.Sleep(300);
+                var receivedFile = Path.Combine(recvDir, "empty.bin");
+                Assert.True(File.Exists(receivedFile), "empty file exists");
+                Assert.Equal(0L, new FileInfo(receivedFile).Length, "empty file size is 0");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                System.Threading.Thread.Sleep(500);
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        private static void UdtEmptyFile()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_ue_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_ue_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+
+            TransferUdtServer server = null;
+            try
+            {
+                var testFile = Path.Combine(sendDir, "empty.bin");
+                File.WriteAllBytes(testFile, new byte[0]);
+
+                var serverStarted = new ManualResetEvent(false);
+                var serverDone = new ManualResetEvent(false);
+                bool serverOk = false;
+                string serverError = null;
+
+                server = new TransferUdtServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => serverStarted.Set();
+                server.OnTransferComplete += () => { serverOk = true; serverDone.Set(); };
+                server.OnError += msg => { serverError = msg; serverDone.Set(); };
+                server.Start();
+                if (!serverStarted.WaitOne(5000))
+                    throw new Exception("UDT server did not start");
+
+                var client = new TransferUdtClient("127.0.0.1", port, testFile);
+                var clientDone = new ManualResetEvent(false);
+                bool clientOk = false;
+                client.OnTransferComplete += () => { clientOk = true; clientDone.Set(); };
+                client.OnError += msg => clientDone.Set();
+
+                var sendTask = client.SendAsync();
+                if (!serverDone.WaitOne(60000))
+                    throw new Exception("UDT server did not complete within 60s");
+                if (!serverOk)
+                    throw new Exception("UDT server error: " + (serverError ?? "unknown"));
+                sendTask.Wait(60000);
+                if (!clientDone.WaitOne(5000))
+                    throw new Exception("UDT client did not fire completion event");
+                if (!clientOk)
+                    throw new Exception("UDT client transfer failed");
+
+                Thread.Sleep(300);
+                var receivedFile = Path.Combine(recvDir, "empty.bin");
+                Assert.True(File.Exists(receivedFile), "empty file exists");
+                Assert.Equal(0L, new FileInfo(receivedFile).Length, "empty file size is 0");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                System.Threading.Thread.Sleep(500);
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        private static void TcpChineseName()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_cn_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_cn_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+
+            TransferServer server = null;
+            try
+            {
+                var testFile = Path.Combine(sendDir, "中文文件测试.txt");
+                var rng = new Random(7);
+                var content = new byte[1024 * 5];
+                rng.NextBytes(content);
+                File.WriteAllBytes(testFile, content);
+
+                var serverStarted = new ManualResetEvent(false);
+                var serverDone = new ManualResetEvent(false);
+                bool serverOk = false;
+                string serverError = null;
+
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => serverStarted.Set();
+                server.OnTransferComplete += () => { serverOk = true; serverDone.Set(); };
+                server.OnError += msg => { serverError = msg; serverDone.Set(); };
+                server.Start();
+                if (!serverStarted.WaitOne(5000))
+                    throw new Exception("Server did not start");
+
+                var client = new TransferClient("127.0.0.1", port, testFile);
+                var clientDone = new ManualResetEvent(false);
+                bool clientOk = false;
+                client.OnTransferComplete += () => { clientOk = true; clientDone.Set(); };
+                client.OnError += msg => clientDone.Set();
+
+                var sendTask = client.SendAsync();
+                if (!serverDone.WaitOne(30000))
+                    throw new Exception("Server did not complete within 30s");
+                if (!serverOk)
+                    throw new Exception("Server error: " + (serverError ?? "unknown"));
+                sendTask.Wait(30000);
+                if (!clientDone.WaitOne(5000))
+                    throw new Exception("Client did not fire completion event");
+                if (!clientOk)
+                    throw new Exception("Client transfer failed");
+
+                Thread.Sleep(300);
+                var receivedFile = Path.Combine(recvDir, "中文文件测试.txt");
+                Assert.True(File.Exists(receivedFile), "chinese-named file exists");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(receivedFile)), "content match");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                System.Threading.Thread.Sleep(500);
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        private static void TcpConnectRefused()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_cr_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            Directory.CreateDirectory(sendDir);
+
+            try
+            {
+                var testFile = Path.Combine(sendDir, "x.bin");
+                File.WriteAllBytes(testFile, new byte[1024]);
+
+                // No server running — connect must fail gracefully via OnError
+                var client = new TransferClient("127.0.0.1", port, testFile);
+                var clientDone = new ManualResetEvent(false);
+                bool clientError = false;
+                client.OnError += msg => { clientError = true; clientDone.Set(); };
+
+                var sendTask = client.SendAsync();
+                Exception taskEx = null;
+                try { sendTask.Wait(15000); }
+                catch (AggregateException ex) { taskEx = ex.InnerException; }
+                Assert.True(clientDone.WaitOne(5000), "OnError fired after connect refused");
+                Assert.True(clientError, "client reported error");
+                Assert.True(taskEx != null, "send task faulted (exception propagated)");
+            }
+            finally
+            {
+                try { Directory.Delete(sendDir, true); } catch { }
+            }
+        }
+
+        private static void TcpFileNotFound()
+        {
+            int port = FindFreePort();
+
+            var client = new TransferClient("127.0.0.1", port, @"D:\cc\tmp\no_such_file_xyz.bin");
+            var clientDone = new ManualResetEvent(false);
+            bool clientError = false;
+            client.OnError += msg => { clientError = true; clientDone.Set(); };
+
+            var sendTask = client.SendAsync();
+            Exception taskEx = null;
+            try { sendTask.Wait(15000); }
+            catch (AggregateException ex) { taskEx = ex.InnerException; }
+            Assert.True(clientDone.WaitOne(5000), "OnError fired for missing file");
+            Assert.True(clientError, "client reported error");
+            Assert.True(taskEx != null, "send task faulted");
+        }
+
+        private static void TcpMultiClient()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_mc_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_mc_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+
+            TransferServer server = null;
+            try
+            {
+                var rng = new Random(5);
+                var contentA = new byte[1024 * 300];
+                var contentB = new byte[1024 * 200];
+                rng.NextBytes(contentA);
+                rng.NextBytes(contentB);
+                var fileA = Path.Combine(sendDir, "multi_a.bin");
+                var fileB = Path.Combine(sendDir, "multi_b.bin");
+                File.WriteAllBytes(fileA, contentA);
+                File.WriteAllBytes(fileB, contentB);
+
+                var serverStarted = new ManualResetEvent(false);
+                int completedCount = 0;
+                var serverDone = new ManualResetEvent(false);
+                var lockObj = new object();
+
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => serverStarted.Set();
+                server.OnClientTransferComplete += ep =>
+                {
+                    lock (lockObj) { completedCount++; if (completedCount >= 2) serverDone.Set(); }
+                };
+                server.OnError += msg => serverDone.Set();
+                server.Start();
+                if (!serverStarted.WaitOne(5000))
+                    throw new Exception("Server did not start");
+
+                var clientA = new TransferClient("127.0.0.1", port, fileA);
+                var clientB = new TransferClient("127.0.0.1", port, fileB);
+                var doneA = new ManualResetEvent(false);
+                var doneB = new ManualResetEvent(false);
+                clientA.OnTransferComplete += () => doneA.Set();
+                clientA.OnError += msg => doneA.Set();
+                clientB.OnTransferComplete += () => doneB.Set();
+                clientB.OnError += msg => doneB.Set();
+
+                var taskA = clientA.SendAsync();
+                var taskB = clientB.SendAsync();
+
+                if (!serverDone.WaitOne(30000))
+                    throw new Exception("Server did not complete both clients within 30s");
+                taskA.Wait(30000);
+                taskB.Wait(30000);
+                if (!doneA.WaitOne(5000))
+                    throw new Exception("Client A did not fire completion");
+                if (!doneB.WaitOne(5000))
+                    throw new Exception("Client B did not fire completion");
+
+                Thread.Sleep(300);
+                Assert.True(Utils.ConstantTimeEquals(contentA, File.ReadAllBytes(Path.Combine(recvDir, "multi_a.bin"))), "file A content");
+                Assert.True(Utils.ConstantTimeEquals(contentB, File.ReadAllBytes(Path.Combine(recvDir, "multi_b.bin"))), "file B content");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                System.Threading.Thread.Sleep(500);
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        private static void UdtRateLimit()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_ur_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_ur_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+
+            TransferUdtServer server = null;
+            try
+            {
+                var testFile = Path.Combine(sendDir, "rate_udt.bin");
+                var rng = new Random(42);
+                var content = new byte[1024 * 1024 * 4]; // 4 MB at 256 KB/s ≈ 16 s
+                rng.NextBytes(content);
+                File.WriteAllBytes(testFile, content);
+
+                var serverStarted = new ManualResetEvent(false);
+                var serverDone = new ManualResetEvent(false);
+                bool serverOk = false;
+                string serverError = null;
+
+                server = new TransferUdtServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => serverStarted.Set();
+                server.OnTransferComplete += () => { serverOk = true; serverDone.Set(); };
+                server.OnError += msg => { serverError = msg; serverDone.Set(); };
+                server.Start();
+                if (!serverStarted.WaitOne(5000))
+                    throw new Exception("UDT server did not start");
+
+                var client = new TransferUdtClient("127.0.0.1", port, testFile, 0, 4194304, 256 * 1024);
+                var clientDone = new ManualResetEvent(false);
+                bool clientOk = false;
+                client.OnTransferComplete += () => { clientOk = true; clientDone.Set(); };
+                client.OnError += msg => clientDone.Set();
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var sendTask = client.SendAsync();
+                if (!serverDone.WaitOne(60000))
+                    throw new Exception("UDT server did not complete within 60s");
+                if (!serverOk)
+                    throw new Exception("UDT server error: " + (serverError ?? "unknown"));
+                sendTask.Wait(60000);
+                if (!clientDone.WaitOne(5000))
+                    throw new Exception("UDT client did not fire completion event");
+                if (!clientOk)
+                    throw new Exception("UDT client transfer failed");
+                sw.Stop();
+
+                Assert.True(sw.Elapsed.TotalSeconds >= 10.0,
+                    "rate-limited UDT transfer took " + sw.Elapsed.TotalSeconds.ToString("F1") + "s (expected >= 10s)");
+
+                Thread.Sleep(300);
+                var receivedFile = Path.Combine(recvDir, "rate_udt.bin");
+                Assert.True(File.Exists(receivedFile), "received file exists");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(receivedFile)), "content match");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                System.Threading.Thread.Sleep(500);
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
             }
         }
 

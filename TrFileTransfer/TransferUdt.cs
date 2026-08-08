@@ -739,11 +739,15 @@ namespace TrFileTransfer
             }
             finally
             {
+                // Save only — never Delete here: Stop() may have already saved and
+                // cleared the dict, and blindly deleting would lose the checkpoint.
                 ResumeState st;
                 if (_udtResumeStates.TryGetValue(sessionId, out st))
+                {
+                    // Flush so the persisted ReceivedBytes always matches what is on disk
+                    try { if (st.WriteStream != null) st.WriteStream.Flush(); } catch { }
                     ServerResumeStore.Save(st);
-                else
-                    ServerResumeStore.Delete(sessionId);
+                }
             }
         }
 
@@ -853,6 +857,9 @@ namespace TrFileTransfer
             resp[9] = status;
             await Task.Run(() => UdtNative.udt_send(clientSocket, resp, 10, 0), ct);
 
+            Log(string.Format("Resume: {0} offset={1} remaining={2} status={3}",
+                fileName, actualStart, Utils.FormatSize(totalSize - actualStart), status));
+
             // Receive remaining data + SHA256
             long remaining = totalSize - actualStart;
             state.WriteStream.Seek(actualStart, SeekOrigin.Begin);
@@ -905,6 +912,7 @@ namespace TrFileTransfer
                     {
                         ResumeState removed;
                         _udtResumeStates.TryRemove(sessionId, out removed);
+                        ServerResumeStore.Delete(sessionId);
                         Log(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
                         RaiseFileReceived(state.SavePath, totalSize);
                         var okResp = new byte[10];
@@ -918,6 +926,7 @@ namespace TrFileTransfer
                     // Full-file hash mismatch — discard the mixed file and tell the client to retry
                     ResumeState removedFh;
                     _udtResumeStates.TryRemove(sessionId, out removedFh);
+                    ServerResumeStore.Delete(sessionId);
                     try { File.Delete(state.SavePath); } catch { }
                     Log(L.S_FullHashFailed(fileName));
                     var errFh = OnError;
@@ -936,6 +945,7 @@ namespace TrFileTransfer
                 state.WriteStream = null;
                 ResumeState removed2;
                 _udtResumeStates.TryRemove(sessionId, out removed2);
+                ServerResumeStore.Delete(sessionId);
                 Log(L.S_HashFailed(fileName));
                 var errHandler = OnError;
                 if (errHandler != null) errHandler(L.S_HashFailed(fileName));
@@ -1581,6 +1591,7 @@ namespace TrFileTransfer
                     sha256.TransformBlock(cur, 0, read, null, 0);
                     await UdtIo.UdtWriteExactAsync(clientSocket, cur, 0, read, ct);
                     bytesSent += read;
+                    _limiter.Throttle(read);
                 }
                 sha256.TransformFinalBlock(Utils.EmptyBytes, 0, 0);
                 await UdtIo.UdtWriteExactAsync(clientSocket, sha256.Hash, 0, 32, ct);
