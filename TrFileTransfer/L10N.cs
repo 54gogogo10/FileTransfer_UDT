@@ -36,7 +36,7 @@ namespace TrFileTransfer
         public static string ServerStopped { get { return IsChinese ? "服务器已停止。" : "Server stopped."; } }
         public static string TransferComplete { get { return IsChinese ? "传输完成!" : "Transfer complete!"; } }
         public static string Cancelling { get { return IsChinese ? "正在取消..." : "Cancelling..."; } }
-        public static string ConcurrencyLabel { get { return IsChinese ? "并发(1-16):" : "Concur(1-16):"; } }
+        public static string ConcurrencyLabel { get { return IsChinese ? "并发(1-8):" : "Concur(1-8):"; } }
         public static string SrcPortLabel { get { return IsChinese ? "源端口(0=随机):" : "SrcPort(0=Rnd):"; } }
         public static string AboutBtn { get { return IsChinese ? "关于" : "About"; } }
         public static string AboutTitle { get { return IsChinese ? "关于" : "About"; } }
@@ -299,6 +299,18 @@ namespace TrFileTransfer
         public static string ScanUse { get { return IsChinese ? "使用" : "Use"; } }
         public static string ScanEmpty { get { return IsChinese ? "未发现设备（请确认对方已启动服务器且防火墙允许 UDP 广播）。" : "No devices found (make sure the remote server is running and UDP broadcast is allowed)."; } }
         public static string Scanning { get { return IsChinese ? "正在扫描..." : "Scanning..."; } }
+        public static string ScanKnownTitle { get { return IsChinese ? "— 已保存设备 —" : "— Saved devices —"; } }
+        public static string ScanOnlineTitle { get { return IsChinese ? "— 在线设备 —" : "— Online devices —"; } }
+        public static string ScanOffline { get { return IsChinese ? "离线" : "offline"; } }
+        public static string TrayShow { get { return IsChinese ? "显示主窗口" : "Show Main Window"; } }
+        public static string TrayExit { get { return IsChinese ? "退出" : "Exit"; } }
+        public static string TrayMinimized { get { return IsChinese ? "程序已最小化到托盘。" : "Minimized to tray."; } }
+        public static string DragDropQueued(object count)
+        {
+            return IsChinese
+                ? string.Format("[拖放] 已将 {0} 个项目加入发送队列。", count)
+                : string.Format("[Drop] Enqueued {0} items to the send queue.", count);
+        }
         public static string NotifySendDone { get { return IsChinese ? "发送完成" : "Send complete"; } }
         public static string NotifyReceiveDone { get { return IsChinese ? "收到文件" : "File received"; } }
         public static string OpenSaveDir { get { return IsChinese ? "打开目录" : "Open Folder"; } }

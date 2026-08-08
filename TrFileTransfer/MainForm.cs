@@ -62,8 +62,12 @@ namespace TrFileTransfer
         private NotifyIcon _notifyIcon;
         private Button _btnOpenDir;
         private Button _btnRecent;
+        private ContextMenuStrip _trayMenu;
+        private bool _trayExit;
         private readonly System.Collections.Generic.List<string> _recentFiles
             = new System.Collections.Generic.List<string>();
+        private readonly System.Collections.Generic.List<DeviceInfo> _knownDevices
+            = new System.Collections.Generic.List<DeviceInfo>();
         private Guid? _pendingResumeSession;
 
         // Progress
@@ -223,6 +227,21 @@ namespace TrFileTransfer
                 this.Show();
                 this.Activate();
             };
+            _trayMenu = new ContextMenuStrip();
+            _trayMenu.Items.Add(L.TrayShow, null, (s2, e2) =>
+            {
+                this.Show();
+                this.WindowState = FormWindowState.Normal;
+                this.Activate();
+            });
+            _trayMenu.Items.Add(L.TrayExit, null, (s2, e2) =>
+            {
+                _trayExit = true;
+                this.Close();
+            });
+            _notifyIcon.ContextMenuStrip = _trayMenu;
+            this.Resize += MainForm_Resize;
+            LoadKnownDevices();
             _gbClient.Controls.Add(_lblServerIp);
             _gbClient.Controls.Add(_txtServerIp);
             _gbClient.Controls.Add(_lblPortC);
@@ -471,24 +490,45 @@ namespace TrFileTransfer
         {
             var files = (string[])e.Data.GetData(DataFormats.FileDrop);
             if (files == null || files.Length == 0) return;
-            if (files.Length > 1)
-                AddLog(L.DragDropOnlyFirst(files[0], files.Length));
-            string path = files[0];
 
-            if (Directory.Exists(path))
+            if (files.Length == 1)
             {
-                _chkFolder.Checked = true;
-                _txtFile.Text = path;
+                string path = files[0];
+                if (Directory.Exists(path))
+                {
+                    _chkFolder.Checked = true;
+                    _txtFile.Text = path;
+                }
+                else if (File.Exists(path))
+                {
+                    _chkFolder.Checked = false;
+                    _txtFile.Text = path;
+                }
+                else
+                {
+                    AddLog(L.DragDropInvalid(path));
+                }
+                return;
             }
-            else if (File.Exists(path))
+
+            // Multiple items: enqueue every valid file/folder and open the send queue
+            var tasks = new System.Collections.Generic.List<QueuedTask>();
+            for (int i = 0; i < files.Length; i++)
             {
-                _chkFolder.Checked = false;
-                _txtFile.Text = path;
+                string path = files[i];
+                bool isDir = Directory.Exists(path);
+                if (!isDir && !File.Exists(path))
+                {
+                    AddLog(L.DragDropInvalid(path));
+                    continue;
+                }
+                var t = CaptureQueuedTaskFor(path, isDir);
+                if (t != null) tasks.Add(t);
             }
-            else
-            {
-                AddLog(L.DragDropInvalid(path));
-            }
+            if (tasks.Count == 0) return;
+            AddLog(L.DragDropQueued(tasks.Count));
+            using (var dlg = new QueueDialog(CaptureQueuedTask, ExecuteQueuedTask, tasks))
+                dlg.ShowDialog(this);
         }
 
         private void BtnResumeList_Click(object sender, EventArgs e)
@@ -555,16 +595,22 @@ namespace TrFileTransfer
 
         private QueuedTask CaptureQueuedTask()
         {
+            string path = _txtFile.Text.Trim();
+            if (string.IsNullOrWhiteSpace(path)) return null;
+            return CaptureQueuedTaskFor(path, _chkFolder.Checked);
+        }
+
+        private QueuedTask CaptureQueuedTaskFor(string path, bool isFolder)
+        {
             int port;
             if (!int.TryParse(_txtPortC.Text.Trim(), out port) || port < 1 || port > 65535)
                 return null;
-            string path = _txtFile.Text.Trim();
-            if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(_txtServerIp.Text.Trim()))
+            if (string.IsNullOrWhiteSpace(_txtServerIp.Text.Trim()))
                 return null;
             return new QueuedTask
             {
                 FilePath = path,
-                IsFolder = _chkFolder.Checked,
+                IsFolder = isFolder,
                 ServerIp = _txtServerIp.Text.Trim(),
                 Port = port,
                 IsUdp = _rbClientUdt.Checked,
@@ -584,7 +630,7 @@ namespace TrFileTransfer
         private void BtnScan_Click(object sender, EventArgs e)
         {
             if (_chkMonitor.Checked || _monitorCts != null) return;
-            using (var dlg = new DiscoveryDialog(UseDiscoveredDevice))
+            using (var dlg = new DiscoveryDialog(UseDiscoveredDevice, _knownDevices))
                 dlg.ShowDialog(this);
         }
 
@@ -646,6 +692,85 @@ namespace TrFileTransfer
         }
 
         /// <summary>Records a received file and shows a tray notification.</summary>
+        private void MainForm_Resize(object sender, EventArgs e)
+        {
+            // Minimize-to-tray: hide instead of occupying the taskbar
+            if (this.WindowState == FormWindowState.Minimized && !_trayExit)
+                this.Hide();
+        }
+
+        // ---- Known devices (device memory) ----
+
+        private void LoadKnownDevices()
+        {
+            _knownDevices.Clear();
+            string raw = Config.Get("KnownDevices", "");
+            if (string.IsNullOrEmpty(raw)) return;
+            string[] parts = raw.Split(';');
+            for (int i = 0; i < parts.Length; i++)
+            {
+                string[] fields = parts[i].Split('|');
+                int port, flags;
+                if (fields.Length == 4 && int.TryParse(fields[2], out port) && int.TryParse(fields[3], out flags))
+                {
+                    _knownDevices.Add(new DeviceInfo
+                    {
+                        Name = fields[0],
+                        Ip = fields[1],
+                        Port = port,
+                        SupportsTcp = (flags & 1) != 0,
+                        SupportsUdt = (flags & 2) != 0
+                    });
+                }
+            }
+        }
+
+        private void SaveKnownDevices()
+        {
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < _knownDevices.Count; i++)
+            {
+                if (i > 0) sb.Append(';');
+                var d = _knownDevices[i];
+                sb.Append(d.Name.Replace('|', '_').Replace(';', '_'));
+                sb.Append('|');
+                sb.Append(d.Ip);
+                sb.Append('|');
+                sb.Append(d.Port.ToString());
+                sb.Append('|');
+                sb.Append((d.SupportsTcp ? 1 : 0) | (d.SupportsUdt ? 2 : 0));
+            }
+            Config.Set("KnownDevices", sb.ToString());
+        }
+
+        /// <summary>Remembers a successfully connected device so it can be re-selected without a rescan.</summary>
+        private void RememberDevice(string ip, int port, bool isUdp)
+        {
+            for (int i = 0; i < _knownDevices.Count; i++)
+            {
+                var d = _knownDevices[i];
+                if (d.Ip == ip && d.Port == port)
+                {
+                    if (isUdp) d.SupportsUdt = true;
+                    else d.SupportsTcp = true;
+                    if (d.Name == "?" || string.IsNullOrEmpty(d.Name)) d.Name = ip;
+                    _knownDevices[i] = d;
+                    SaveKnownDevices();
+                    return;
+                }
+            }
+            _knownDevices.Add(new DeviceInfo
+            {
+                Name = ip,
+                Ip = ip,
+                Port = port,
+                SupportsTcp = !isUdp,
+                SupportsUdt = isUdp
+            });
+            if (_knownDevices.Count > 10) _knownDevices.RemoveAt(0);
+            SaveKnownDevices();
+        }
+
         private void OnFileReceived(string path, long size)
         {
             if (!string.IsNullOrEmpty(path))
@@ -982,6 +1107,7 @@ namespace TrFileTransfer
                     else
                         await _clientUdt.SendAsync();
                 }
+                RememberDevice(ip, port, !isTcp);
                 return true;
             }
             catch (Exception ex)
@@ -1207,6 +1333,22 @@ namespace TrFileTransfer
             _lstLog.TopIndex = _lstLog.Items.Count - 1;
             while (_lstLog.Items.Count > 500)
                 _lstLog.Items.RemoveAt(0);
+            AppendLogFile(msg);
+        }
+
+        /// <summary>Appends a log line to the daily log file under %AppData%\TrFileTransfer\logs.</summary>
+        private static void AppendLogFile(string msg)
+        {
+            try
+            {
+                string dir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                    "TrFileTransfer", "logs");
+                Directory.CreateDirectory(dir);
+                string path = Path.Combine(dir, DateTime.Now.ToString("yyyy-MM-dd") + ".txt");
+                File.AppendAllText(path, "[" + DateTime.Now.ToString("HH:mm:ss") + "] " + msg + Environment.NewLine);
+            }
+            catch { }
         }
 
         // ---- Monitor mode ----
@@ -1403,6 +1545,14 @@ namespace TrFileTransfer
         /// <summary>Stops any active transfer before closing the window.</summary>
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            // Closing the window hides to tray; use the tray menu's Exit to quit
+            if (!_trayExit && e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                this.Hide();
+                Notify(L.AppTitle, L.TrayMinimized);
+                return;
+            }
             SaveConfig();
             if (_monitorCts != null)
             {
@@ -1547,10 +1697,16 @@ namespace TrFileTransfer
         private Button _btnAdd, _btnDelete, _btnClear, _btnStart, _btnClose;
         private bool _running;
 
-        public QueueDialog(Func<QueuedTask> capture, Func<QueuedTask, Task<bool>> executor)
+        public QueueDialog(Func<QueuedTask> capture, Func<QueuedTask, Task<bool>> executor,
+            System.Collections.Generic.IEnumerable<QueuedTask> initial = null)
         {
             _capture = capture;
             _executor = executor;
+            if (initial != null)
+            {
+                foreach (var t in initial)
+                    _tasks.Add(t);
+            }
             Text = L.QueueTitle;
             Size = new Size(560, 360);
             StartPosition = FormStartPosition.CenterParent;
@@ -1564,6 +1720,8 @@ namespace TrFileTransfer
                 Location = new Point(12, 12), Width = 520, Height = 240,
                 IntegralHeight = false
             };
+            for (int i = 0; i < _tasks.Count; i++)
+                _list.Items.Add(FormatTask(_tasks[i]));
             Controls.Add(_list);
 
             _btnAdd = new Button { Text = L.QueueAdd, Location = new Point(12, 262), Width = 100 };
@@ -1651,17 +1809,26 @@ namespace TrFileTransfer
         }
     }
 
-    /// <summary>LAN device scan dialog: lists discovered servers, picks one to connect to.</summary>
+    /// <summary>LAN device scan dialog: lists known + discovered servers, picks one to connect to.</summary>
     public class DiscoveryDialog : Form
     {
         private readonly Action<DeviceInfo> _useDevice;
+        private readonly System.Collections.Generic.List<DeviceInfo> _known;
         private ListBox _list;
         private Button _btnRescan, _btnUse, _btnClose;
         private DeviceInfo[] _devices = new DeviceInfo[0];
+        private readonly System.Collections.Generic.List<DeviceInfo> _items
+            = new System.Collections.Generic.List<DeviceInfo>();
 
-        public DiscoveryDialog(Action<DeviceInfo> useDevice)
+        public DiscoveryDialog(Action<DeviceInfo> useDevice,
+            System.Collections.Generic.IEnumerable<DeviceInfo> knownDevices = null)
         {
             _useDevice = useDevice;
+            _known = new System.Collections.Generic.List<DeviceInfo>();
+            if (knownDevices != null)
+            {
+                foreach (var d in knownDevices) _known.Add(d);
+            }
             Text = L.ScanTitle;
             Size = new Size(480, 320);
             StartPosition = FormStartPosition.CenterParent;
@@ -1696,6 +1863,7 @@ namespace TrFileTransfer
         {
             _btnRescan.Enabled = false;
             _list.Items.Clear();
+            _items.Clear();
             _list.Items.Add(L.Scanning);
             try
             {
@@ -1703,17 +1871,34 @@ namespace TrFileTransfer
                 var devices = await DiscoveryClient.Scan(dPort, 2000);
                 _devices = devices;
                 _list.Items.Clear();
+                _items.Clear();
+
+                // Known (remembered) devices first
+                if (_known.Count > 0)
+                {
+                    _list.Items.Add(L.ScanKnownTitle);
+                    _items.Add(new DeviceInfo { Ip = null }); // section header placeholder
+                    for (int i = 0; i < _known.Count; i++)
+                    {
+                        _items.Add(_known[i]);
+                        _list.Items.Add(FormatDevice(_known[i], false));
+                    }
+                }
+
+                // Then live scan results
+                _list.Items.Add(L.ScanOnlineTitle);
+                _items.Add(new DeviceInfo { Ip = null }); // section header placeholder
                 if (devices.Length == 0)
                 {
                     _list.Items.Add(L.ScanEmpty);
+                    _items.Add(new DeviceInfo { Ip = null }); // empty hint placeholder
                 }
                 else
                 {
                     for (int i = 0; i < devices.Length; i++)
                     {
-                        var d = devices[i];
-                        string prot = (d.SupportsTcp ? "TCP" : "") + (d.SupportsUdt ? (d.SupportsTcp ? "+UDT" : "UDT") : "");
-                        _list.Items.Add(string.Format("{0}  {1}:{2}  ({3})", d.Name, d.Ip, d.Port, prot));
+                        _items.Add(devices[i]);
+                        _list.Items.Add(FormatDevice(devices[i], true));
                     }
                 }
             }
@@ -1728,12 +1913,19 @@ namespace TrFileTransfer
             }
         }
 
+        private static string FormatDevice(DeviceInfo d, bool online)
+        {
+            string prot = (d.SupportsTcp ? "TCP" : "") + (d.SupportsUdt ? (d.SupportsTcp ? "+UDT" : "UDT") : "");
+            string tag = online ? "" : "  [" + L.ScanOffline + "]";
+            return string.Format("{0}  {1}:{2}  ({3}){4}", d.Name, d.Ip, d.Port, prot, tag);
+        }
+
         private void BtnUse_Click(object sender, EventArgs e)
         {
             int idx = _list.SelectedIndex;
-            if (idx >= 0 && idx < _devices.Length)
+            if (idx >= 0 && idx < _items.Count && _items[idx].Ip != null)
             {
-                _useDevice(_devices[idx]);
+                _useDevice(_items[idx]);
                 Close();
             }
         }
