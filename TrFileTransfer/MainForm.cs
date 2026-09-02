@@ -15,6 +15,10 @@ namespace TrFileTransfer
     {
         // Language
         private ComboBox _cmbLang;
+        private Label _lblHeader;
+
+        // Progress split (server | client)
+        private SplitContainer _splitProgress;
 
         // Protocol — server checkboxes, client radio buttons
         private CheckBox _chkServerTcp;
@@ -108,111 +112,194 @@ namespace TrFileTransfer
             ApplyConfig();
         }
 
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            // Splitter ratio once the real width is known (50/50)
+            try { _splitProgress.SplitterDistance = _splitProgress.Width / 2; } catch { }
+        }
+
         private void InitializeComponent()
         {
             Text = L.AppTitle;
-            ClientSize = new Size(620, 785);
             StartPosition = FormStartPosition.CenterScreen;
-            FormBorderStyle = FormBorderStyle.FixedSingle;
-            MaximizeBox = false;
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MaximizeBox = true;
+            MinimizeBox = true;
             Font = new Font("Segoe UI", 9f);
+            BackColor = Color.White;
+            DoubleBuffered = true;
             AllowDrop = true;
             DragEnter += MainForm_DragEnter;
             DragDrop += MainForm_DragDrop;
 
-            // Language selector
-            _cmbLang = new ComboBox
+            // Fit the default window to the screen (small laptops get a smaller but usable window)
+            Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+            ClientSize = new Size(Math.Min(720, wa.Width - 24), Math.Min(860, wa.Height - 24));
+            MinimumSize = new Size(Math.Min(660, ClientSize.Width), Math.Min(720, ClientSize.Height));
+
+            // Root layout: header / server / client are content-sized rows;
+            // progress and log share the remaining space equally and grow on resize
+            var root = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Color.White, Padding = new Padding(12, 8, 12, 10) };
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 132));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 196));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+
+            // Header row: app title on the left, language selector on the right
+            var header = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Color.White, Margin = new Padding(0) };
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 116));
+            _lblHeader = new Label
             {
-                Location = new Point(480, 16),
-                Width = 110,
-                DropDownStyle = ComboBoxStyle.DropDownList
+                AutoSize = false,
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Font = new Font("Segoe UI", 11f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(51, 51, 51)
             };
+            _cmbLang = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill, Margin = new Padding(3, 2, 0, 0) };
             _cmbLang.Items.Add("English");
             _cmbLang.Items.Add("中文");
             _cmbLang.SelectedIndex = 0;
             _cmbLang.SelectedIndexChanged += CmbLang_SelectedIndexChanged;
+            header.Controls.Add(_lblHeader, 0, 0);
+            header.Controls.Add(_cmbLang, 1, 0);
+            root.Controls.Add(header, 0, 0);
 
-            // Server protocol checkboxes and client protocol radio buttons are placed inside their panels below
+            // ---- Server panel ----
+            _gbServer = new GroupBox { Dock = DockStyle.Fill, BackColor = Color.White };
+            var tlpS = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Color.White, Padding = new Padding(6, 2, 6, 4) };
+            tlpS.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 86));
+            tlpS.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            tlpS.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 48));
+            tlpS.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 66));
+            tlpS.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 58));
+            tlpS.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 74));
+            tlpS.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+            tlpS.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+            tlpS.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
 
-            // Server panel
-            _gbServer = new GroupBox { Location = new Point(12, 60), Size = new Size(580, 155) };
-            _lblBind = new Label { Location = new Point(15, 28), Width = 70, TextAlign = ContentAlignment.MiddleRight };
-            _cmbBind = new ComboBox { Location = new Point(90, 24), Width = 125, DropDownStyle = ComboBoxStyle.DropDownList };
-            _lblPortS = new Label { Location = new Point(220, 28), Width = 50, TextAlign = ContentAlignment.MiddleRight };
-            _txtPortS = new TextBox { Text = "8080", Location = new Point(275, 25), Width = 55 };
-            _chkServerTcp = new CheckBox { Text = "TCP", Location = new Point(340, 23), Width = 50, Checked = true };
-            _chkServerUdt = new CheckBox { Text = "UDT", Location = new Point(392, 23), Width = 55 };
-            _lblSaveDir = new Label { Location = new Point(15, 63), Width = 60, TextAlign = ContentAlignment.MiddleRight };
-            _txtSaveDir = new TextBox { Text = Environment.GetFolderPath(Environment.SpecialFolder.Desktop), Location = new Point(80, 60), Width = 390 };
-            _btnBrowseDir = new Button { Location = new Point(475, 59), Width = 85 };
+            _lblBind = new Label { AutoSize = false, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight, ForeColor = Color.FromArgb(68, 68, 68), Margin = new Padding(0, 0, 6, 0) };
+            _cmbBind = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill, Margin = new Padding(3, 6, 3, 6) };
+            _lblPortS = new Label { AutoSize = false, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight, ForeColor = Color.FromArgb(68, 68, 68), Margin = new Padding(0, 0, 6, 0) };
+            _txtPortS = new TextBox { Text = "8080", Dock = DockStyle.Fill, Margin = new Padding(3, 6, 3, 6) };
+            _chkServerTcp = new CheckBox { Text = "TCP", AutoSize = true, Checked = true, Margin = new Padding(6, 8, 3, 3) };
+            _chkServerUdt = new CheckBox { Text = "UDT", AutoSize = true, Margin = new Padding(6, 8, 3, 3) };
+            _lblSaveDir = new Label { AutoSize = false, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight, ForeColor = Color.FromArgb(68, 68, 68), Margin = new Padding(0, 0, 6, 0) };
+            _txtSaveDir = new TextBox { Text = Environment.GetFolderPath(Environment.SpecialFolder.Desktop), Dock = DockStyle.Fill, Margin = new Padding(3, 6, 3, 6) };
+            _btnBrowseDir = new Button { Dock = DockStyle.Fill, Margin = new Padding(3, 5, 3, 5) };
+            UiStyle.Secondary(_btnBrowseDir);
             _btnBrowseDir.Click += BtnBrowseDir_Click;
-            _btnStartServer = new Button { Location = new Point(55, 95), Width = 110, Height = 30 };
+            _btnStartServer = new Button { Width = 108, Height = 28, Margin = new Padding(0, 3, 8, 3) };
+            UiStyle.Primary(_btnStartServer);
             _btnStartServer.Click += BtnStartServer_Click;
-            _btnStopServer = new Button { Location = new Point(175, 95), Width = 110, Height = 30, Enabled = false };
+            _btnStopServer = new Button { Width = 108, Height = 28, Margin = new Padding(0, 3, 8, 3), Enabled = false };
+            UiStyle.Secondary(_btnStopServer);
             _btnStopServer.Click += BtnStopServer_Click;
-            _btnOpenDir = new Button { Location = new Point(55, 128), Width = 110, Height = 22 };
+            _btnOpenDir = new Button { Width = 96, Height = 28, Margin = new Padding(0, 3, 8, 3) };
+            UiStyle.Secondary(_btnOpenDir);
             _btnOpenDir.Click += BtnOpenDir_Click;
-            _btnRecent = new Button { Location = new Point(175, 128), Width = 110, Height = 22 };
+            _btnRecent = new Button { Width = 96, Height = 28, Margin = new Padding(0, 3, 0, 3) };
+            UiStyle.Secondary(_btnRecent);
             _btnRecent.Click += BtnRecent_Click;
-            _gbServer.Controls.Add(_lblBind);
-            _gbServer.Controls.Add(_cmbBind);
-            _gbServer.Controls.Add(_lblPortS);
-            _gbServer.Controls.Add(_txtPortS);
-            _gbServer.Controls.Add(_chkServerTcp);
-            _gbServer.Controls.Add(_chkServerUdt);
-            _gbServer.Controls.Add(_lblSaveDir);
-            _gbServer.Controls.Add(_txtSaveDir);
-            _gbServer.Controls.Add(_btnBrowseDir);
-            _gbServer.Controls.Add(_btnStartServer);
-            _gbServer.Controls.Add(_btnStopServer);
-            _gbServer.Controls.Add(_btnOpenDir);
-            _gbServer.Controls.Add(_btnRecent);
+            var serverButtons = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, BackColor = Color.White, Margin = new Padding(0) };
+            serverButtons.Controls.Add(_btnStartServer);
+            serverButtons.Controls.Add(_btnStopServer);
+            serverButtons.Controls.Add(_btnOpenDir);
+            serverButtons.Controls.Add(_btnRecent);
+            tlpS.Controls.Add(_lblBind, 0, 0);
+            tlpS.Controls.Add(_cmbBind, 1, 0);
+            tlpS.Controls.Add(_lblPortS, 2, 0);
+            tlpS.Controls.Add(_txtPortS, 3, 0);
+            tlpS.Controls.Add(_chkServerTcp, 4, 0);
+            tlpS.Controls.Add(_chkServerUdt, 5, 0);
+            tlpS.Controls.Add(_lblSaveDir, 0, 1);
+            tlpS.Controls.Add(_txtSaveDir, 1, 1);
+            tlpS.SetColumnSpan(_txtSaveDir, 4);
+            tlpS.Controls.Add(_btnBrowseDir, 5, 1);
+            tlpS.Controls.Add(serverButtons, 1, 2);
+            tlpS.SetColumnSpan(serverButtons, 5);
+            _gbServer.Controls.Add(tlpS);
+            root.Controls.Add(_gbServer, 0, 1);
 
-            // Client panel
-            _gbClient = new GroupBox { Location = new Point(12, 223), Size = new Size(580, 150) };
-            _lblServerIp = new Label { Location = new Point(15, 28), Width = 90, TextAlign = ContentAlignment.MiddleRight };
-            _txtServerIp = new TextBox { Text = "127.0.0.1", Location = new Point(110, 25), Width = 95 };
-            _lblPortC = new Label { Location = new Point(212, 28), Width = 50, TextAlign = ContentAlignment.MiddleRight };
-            _txtPortC = new TextBox { Text = "8080", Location = new Point(267, 25), Width = 55 };
-            _rbClientTcp = new RadioButton { Text = "TCP", Location = new Point(335, 23), Width = 50, Checked = true };
-            _rbClientUdt = new RadioButton { Text = "UDT", Location = new Point(387, 23), Width = 55 };
-            _btnSend = new Button { Location = new Point(455, 20), Width = 110, Height = 30 };
+            // ---- Client panel ----
+            _gbClient = new GroupBox { Dock = DockStyle.Fill, BackColor = Color.White };
+            var tlpC = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Color.White, Padding = new Padding(6, 2, 6, 4) };
+            tlpC.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
+            tlpC.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            tlpC.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 48));
+            tlpC.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 66));
+            tlpC.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 58));
+            tlpC.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 76));
+            tlpC.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 104));
+            for (int i = 0; i < 5; i++)
+                tlpC.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
+
+            _lblServerIp = new Label { AutoSize = false, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight, ForeColor = Color.FromArgb(68, 68, 68), Margin = new Padding(0, 0, 6, 0) };
+            _txtServerIp = new TextBox { Text = "127.0.0.1", Dock = DockStyle.Fill, Margin = new Padding(3, 6, 3, 6) };
+            _lblPortC = new Label { AutoSize = false, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight, ForeColor = Color.FromArgb(68, 68, 68), Margin = new Padding(0, 0, 6, 0) };
+            _txtPortC = new TextBox { Text = "8080", Dock = DockStyle.Fill, Margin = new Padding(3, 6, 3, 6) };
+            _rbClientTcp = new RadioButton { Text = "TCP", AutoSize = true, Checked = true, Margin = new Padding(6, 8, 3, 3) };
+            _rbClientUdt = new RadioButton { Text = "UDT", AutoSize = true, Margin = new Padding(6, 8, 3, 3) };
+            _btnSend = new Button { Dock = DockStyle.Fill, Margin = new Padding(4, 2, 2, 2) };
+            UiStyle.Primary(_btnSend);
             _btnSend.Click += BtnSend_Click;
-            _btnCancel = new Button { Location = new Point(455, 56), Width = 110, Height = 30, Enabled = false };
+            _btnCancel = new Button { Dock = DockStyle.Fill, Margin = new Padding(4, 2, 2, 2), Enabled = false };
+            UiStyle.Secondary(_btnCancel);
             _btnCancel.Click += BtnCancel_Click;
-            // Source port — on monitor row
-            _lblSrcPort = new Label { Location = new Point(15, 93), Width = 100, TextAlign = ContentAlignment.MiddleRight };
-            _numSrcPort = new NumericUpDown { Location = new Point(118, 93), Width = 50, Minimum = 0, Maximum = 65535, Value = 0 };
-            _lblFile = new Label { Location = new Point(15, 63), Width = 48, TextAlign = ContentAlignment.MiddleRight };
-            _txtFile = new TextBox { Location = new Point(68, 60), Width = 290 };
-            _btnBrowseFile = new Button { Location = new Point(365, 59), Width = 80 };
+            _lblFile = new Label { AutoSize = false, Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleRight, ForeColor = Color.FromArgb(68, 68, 68), Margin = new Padding(0, 0, 6, 0) };
+            _txtFile = new TextBox { Dock = DockStyle.Fill, Margin = new Padding(3, 6, 3, 6) };
+            _btnBrowseFile = new Button { Dock = DockStyle.Fill, Margin = new Padding(3, 5, 3, 5) };
+            UiStyle.Secondary(_btnBrowseFile);
             _btnBrowseFile.Click += BtnBrowseFile_Click;
-            _chkFolder = new CheckBox { Location = new Point(275, 93), Width = 100, TextAlign = ContentAlignment.MiddleLeft };
-            _chkFolder.CheckedChanged += ChkFolder_CheckedChanged;
-            _chkMonitor = new CheckBox { Location = new Point(175, 94), Width = 95, TextAlign = ContentAlignment.MiddleLeft };
+
+            _chkMonitor = new CheckBox { AutoSize = true, Margin = new Padding(2, 8, 16, 3) };
             _chkMonitor.CheckedChanged += ChkMonitor_CheckedChanged;
-            _lblConcurrency = new Label { Location = new Point(378, 93), Width = 85, TextAlign = ContentAlignment.MiddleRight };
-            _numConcurrency = new NumericUpDown
-            {
-                Location = new Point(466, 93), Width = 50,
-                Minimum = 1, Maximum = 8, Value = 4
-            };
-            _numConcurrency.ValueChanged += NumConcurrency_ValueChanged;
-            _btnResumeList = new Button { Location = new Point(520, 93), Width = 45, Height = 22 };
-            _btnResumeList.Click += BtnResumeList_Click;
-            _chkVerifyHash = new CheckBox { Location = new Point(15, 118), Width = 170, TextAlign = ContentAlignment.MiddleLeft };
+            _chkFolder = new CheckBox { AutoSize = true, Margin = new Padding(2, 8, 16, 3) };
+            _chkFolder.CheckedChanged += ChkFolder_CheckedChanged;
+            _chkVerifyHash = new CheckBox { AutoSize = true, Margin = new Padding(2, 8, 16, 3) };
             _chkVerifyHash.Checked = Config.GetBool("VerifyHash", false);
-            _lblSpeed = new Label { Location = new Point(195, 118), Width = 60, TextAlign = ContentAlignment.MiddleRight };
+            var optionsRow = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, BackColor = Color.White, Margin = new Padding(0) };
+            optionsRow.Controls.Add(_chkMonitor);
+            optionsRow.Controls.Add(_chkFolder);
+            optionsRow.Controls.Add(_chkVerifyHash);
+
+            _lblSrcPort = new Label { AutoSize = true, Margin = new Padding(2, 10, 4, 3), ForeColor = Color.FromArgb(68, 68, 68) };
+            _numSrcPort = new NumericUpDown { Width = 58, Minimum = 0, Maximum = 65535, Value = 0, Margin = new Padding(0, 6, 18, 3) };
+            _lblConcurrency = new Label { AutoSize = true, Margin = new Padding(2, 10, 4, 3), ForeColor = Color.FromArgb(68, 68, 68) };
+            _numConcurrency = new NumericUpDown { Width = 50, Minimum = 1, Maximum = 8, Value = 4, Margin = new Padding(0, 6, 18, 3) };
+            _numConcurrency.ValueChanged += NumConcurrency_ValueChanged;
+            _lblSpeed = new Label { AutoSize = true, Margin = new Padding(2, 10, 4, 3), ForeColor = Color.FromArgb(68, 68, 68) };
             _numSpeed = new NumericUpDown
             {
-                Location = new Point(260, 118), Width = 70,
-                Minimum = 0, Maximum = 1048576, Value = Config.GetInt("SpeedLimit", 0)
+                Width = 72, Minimum = 0, Maximum = 1048576,
+                Value = Config.GetInt("SpeedLimit", 0), Margin = new Padding(0, 6, 0, 3)
             };
             _numSpeed.ValueChanged += (s2, e2) => Config.SetInt("SpeedLimit", (int)_numSpeed.Value);
-            _btnQueue = new Button { Location = new Point(455, 118), Width = 110, Height = 22 };
-            _btnQueue.Click += BtnQueue_Click;
-            _btnScan = new Button { Location = new Point(345, 118), Width = 55, Height = 22 };
+            var numericRow = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, BackColor = Color.White, Margin = new Padding(0) };
+            numericRow.Controls.Add(_lblSrcPort);
+            numericRow.Controls.Add(_numSrcPort);
+            numericRow.Controls.Add(_lblConcurrency);
+            numericRow.Controls.Add(_numConcurrency);
+            numericRow.Controls.Add(_lblSpeed);
+            numericRow.Controls.Add(_numSpeed);
+
+            _btnScan = new Button { Width = 72, Height = 26, Margin = new Padding(2, 3, 8, 3) };
+            UiStyle.Secondary(_btnScan);
             _btnScan.Click += BtnScan_Click;
+            _btnQueue = new Button { Width = 96, Height = 26, Margin = new Padding(2, 3, 8, 3) };
+            UiStyle.Secondary(_btnQueue);
+            _btnQueue.Click += BtnQueue_Click;
+            _btnResumeList = new Button { Width = 72, Height = 26, Margin = new Padding(2, 3, 0, 3) };
+            UiStyle.Secondary(_btnResumeList);
+            _btnResumeList.Click += BtnResumeList_Click;
+            var actionRow = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, BackColor = Color.White, Margin = new Padding(0) };
+            actionRow.Controls.Add(_btnScan);
+            actionRow.Controls.Add(_btnQueue);
+            actionRow.Controls.Add(_btnResumeList);
 
             // Tray icon for completion notifications (Win7-compatible balloon tips)
             _notifyIcon = new NotifyIcon
@@ -242,68 +329,99 @@ namespace TrFileTransfer
             _notifyIcon.ContextMenuStrip = _trayMenu;
             this.Resize += MainForm_Resize;
             LoadKnownDevices();
-            _gbClient.Controls.Add(_lblServerIp);
-            _gbClient.Controls.Add(_txtServerIp);
-            _gbClient.Controls.Add(_lblPortC);
-            _gbClient.Controls.Add(_txtPortC);
-            _gbClient.Controls.Add(_rbClientTcp);
-            _gbClient.Controls.Add(_rbClientUdt);
-            _gbClient.Controls.Add(_lblSrcPort);
-            _gbClient.Controls.Add(_numSrcPort);
-            _gbClient.Controls.Add(_lblFile);
-            _gbClient.Controls.Add(_txtFile);
-            _gbClient.Controls.Add(_btnBrowseFile);
-            _gbClient.Controls.Add(_chkFolder);
-            _gbClient.Controls.Add(_chkMonitor);
-            _gbClient.Controls.Add(_chkVerifyHash);
-            _gbClient.Controls.Add(_lblSpeed);
-            _gbClient.Controls.Add(_numSpeed);
-            _gbClient.Controls.Add(_btnQueue);
-            _gbClient.Controls.Add(_btnScan);
-            _gbClient.Controls.Add(_lblConcurrency);
-            _gbClient.Controls.Add(_numConcurrency);
-            _gbClient.Controls.Add(_btnResumeList);
-            _gbClient.Controls.Add(_btnSend);
-            _gbClient.Controls.Add(_btnCancel);
+            tlpC.Controls.Add(_lblServerIp, 0, 0);
+            tlpC.Controls.Add(_txtServerIp, 1, 0);
+            tlpC.Controls.Add(_lblPortC, 2, 0);
+            tlpC.Controls.Add(_txtPortC, 3, 0);
+            tlpC.Controls.Add(_rbClientTcp, 4, 0);
+            tlpC.Controls.Add(_rbClientUdt, 5, 0);
+            tlpC.Controls.Add(_btnSend, 6, 0);
+            tlpC.Controls.Add(_lblFile, 0, 1);
+            tlpC.Controls.Add(_txtFile, 1, 1);
+            tlpC.SetColumnSpan(_txtFile, 4);
+            tlpC.Controls.Add(_btnBrowseFile, 5, 1);
+            tlpC.Controls.Add(_btnCancel, 6, 1);
+            tlpC.Controls.Add(optionsRow, 0, 2);
+            tlpC.SetColumnSpan(optionsRow, 7);
+            tlpC.Controls.Add(numericRow, 0, 3);
+            tlpC.SetColumnSpan(numericRow, 7);
+            tlpC.Controls.Add(actionRow, 0, 4);
+            tlpC.SetColumnSpan(actionRow, 7);
+            _gbClient.Controls.Add(tlpC);
+            root.Controls.Add(_gbClient, 0, 2);
 
-            // Server progress panel
-            _gbProgressS = new GroupBox { Location = new Point(12, 381), Size = new Size(286, 205) };
+            // ---- Progress: server | client side by side in a proportional splitter ----
+            _splitProgress = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Vertical, SplitterWidth = 6, BackColor = Color.White };
+            _splitProgress.Panel1.BackColor = Color.White;
+            _splitProgress.Panel2.BackColor = Color.White;
+
+            _gbProgressS = new GroupBox { Dock = DockStyle.Fill, BackColor = Color.White };
+            var tlpPs = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Color.White, Padding = new Padding(6, 2, 6, 4) };
+            tlpPs.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            tlpPs.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
             _progressPanelS = new FlowLayoutPanel
             {
-                Location = new Point(5, 14), Width = 274, Height = 170,
-                AutoScroll = true, FlowDirection = FlowDirection.TopDown,
-                WrapContents = false
+                Dock = DockStyle.Fill,
+                AutoScroll = true,
+                FlowDirection = FlowDirection.TopDown,
+                WrapContents = false,
+                BackColor = Color.FromArgb(243, 244, 246),
+                Margin = new Padding(0)
             };
-            _lblStatusS = new Label { Location = new Point(5, 186), Width = 274, Text = "" };
-            _gbProgressS.Controls.Add(_progressPanelS);
-            _gbProgressS.Controls.Add(_lblStatusS);
+            _progressPanelS.Resize += (s, e) => SyncCardWidths(_progressPanelS);
+            _lblStatusS = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Color.FromArgb(106, 106, 106), Font = new Font("Segoe UI", 8.25f), Text = "" };
+            tlpPs.Controls.Add(_progressPanelS, 0, 0);
+            tlpPs.Controls.Add(_lblStatusS, 0, 1);
+            _gbProgressS.Controls.Add(tlpPs);
+            _splitProgress.Panel1.Controls.Add(_gbProgressS);
 
-            // Client progress panel
-            _gbProgressC = new GroupBox { Location = new Point(306, 381), Size = new Size(286, 205) };
+            _gbProgressC = new GroupBox { Dock = DockStyle.Fill, BackColor = Color.White };
+            var tlpPc = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Color.White, Padding = new Padding(6, 2, 6, 4) };
+            tlpPc.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            tlpPc.RowStyles.Add(new RowStyle(SizeType.Absolute, 24));
             _progressPanelC = new FlowLayoutPanel
             {
-                Location = new Point(5, 14), Width = 274, Height = 170,
-                AutoScroll = true, FlowDirection = FlowDirection.TopDown,
-                WrapContents = false
+                Dock = DockStyle.Fill,
+                AutoScroll = true,
+                FlowDirection = FlowDirection.TopDown,
+                WrapContents = false,
+                BackColor = Color.FromArgb(243, 244, 246),
+                Margin = new Padding(0)
             };
-            _lblStatusC = new Label { Location = new Point(5, 186), Width = 274, Text = L.Ready };
-            _gbProgressC.Controls.Add(_progressPanelC);
-            _gbProgressC.Controls.Add(_lblStatusC);
+            _progressPanelC.Resize += (s, e) => SyncCardWidths(_progressPanelC);
+            _lblStatusC = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, ForeColor = Color.FromArgb(106, 106, 106), Font = new Font("Segoe UI", 8.25f), Text = L.Ready };
+            tlpPc.Controls.Add(_progressPanelC, 0, 0);
+            tlpPc.Controls.Add(_lblStatusC, 0, 1);
+            _gbProgressC.Controls.Add(tlpPc);
+            _splitProgress.Panel2.Controls.Add(_gbProgressC);
+            root.Controls.Add(_splitProgress, 0, 3);
 
-            // Log panel
-            _gbLog = new GroupBox { Location = new Point(12, 596), Size = new Size(580, 170) };
-            _lstLog = new ListBox { Location = new Point(10, 20), Width = 555, Height = 122, IntegralHeight = false, Font = new Font("Consolas", 8.5f) };
-            _btnExportLog = new Button { Text = "...", Location = new Point(480, 143), Width = 85, Height = 22 };
+            // ---- Log panel: dark console-style list ----
+            _gbLog = new GroupBox { Dock = DockStyle.Fill, BackColor = Color.White };
+            var tlpL = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Color.White, Padding = new Padding(6, 2, 6, 4) };
+            tlpL.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            tlpL.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+            _lstLog = new ListBox
+            {
+                Dock = DockStyle.Fill,
+                IntegralHeight = false,
+                BorderStyle = BorderStyle.None,
+                Font = new Font("Consolas", 9f),
+                BackColor = Color.FromArgb(30, 30, 30),
+                ForeColor = Color.FromArgb(212, 212, 212),
+                Margin = new Padding(0)
+            };
+            var logButtons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, BackColor = Color.White, Margin = new Padding(0), Padding = new Padding(0, 2, 2, 0) };
+            _btnExportLog = new Button { Width = 96, Height = 24 };
+            UiStyle.Secondary(_btnExportLog);
             _btnExportLog.Click += BtnExportLog_Click;
-            _gbLog.Controls.Add(_lstLog);
-            _gbLog.Controls.Add(_btnExportLog);
+            logButtons.Controls.Add(_btnExportLog);
+            tlpL.Controls.Add(_lstLog, 0, 0);
+            tlpL.Controls.Add(logButtons, 0, 1);
+            _gbLog.Controls.Add(tlpL);
+            root.Controls.Add(_gbLog, 0, 4);
 
-            Controls.Add(_cmbLang);
-            Controls.Add(_gbServer);
-            Controls.Add(_gbClient);
-            Controls.Add(_gbProgressS);
-            Controls.Add(_gbProgressC);
-            Controls.Add(_gbLog);
+            Controls.Add(root);
         }
 
         private void CmbLang_SelectedIndexChanged(object sender, EventArgs e)
@@ -315,6 +433,7 @@ namespace TrFileTransfer
         private void ApplyLanguage()
         {
             Text = L.AppTitle;
+            _lblHeader.Text = L.AppTitle;
 
             _gbServer.Text = L.ServerSettings;
             _lblBind.Text = L.BindAddress;
@@ -513,6 +632,7 @@ namespace TrFileTransfer
 
             // Multiple items: enqueue every valid file/folder and open the send queue
             var tasks = new System.Collections.Generic.List<QueuedTask>();
+            int skipped = 0;
             for (int i = 0; i < files.Length; i++)
             {
                 string path = files[i];
@@ -524,7 +644,10 @@ namespace TrFileTransfer
                 }
                 var t = CaptureQueuedTaskFor(path, isDir);
                 if (t != null) tasks.Add(t);
+                else skipped++;
             }
+            if (skipped > 0)
+                AddLog(L.DragDropSkipped(skipped));
             if (tasks.Count == 0) return;
             AddLog(L.DragDropQueued(tasks.Count));
             using (var dlg = new QueueDialog(CaptureQueuedTask, ExecuteQueuedTask, tasks))
@@ -1079,7 +1202,7 @@ namespace TrFileTransfer
                 {
                     _client = srcPort > 0
                         ? new TransferClient(ip, port, path, srcPort, 4194304, speedLimit)
-                        : new TransferClient(ip, port, path, 4194304, speedLimit);
+                        : new TransferClient(ip, port, path, 0, 4194304, speedLimit);
                     WireClientEvents(_client);
                     if (isFolder)
                         await _client.SendFolderAsync(path);
@@ -1095,7 +1218,7 @@ namespace TrFileTransfer
                 {
                     _clientUdt = srcPort > 0
                         ? new TransferUdtClient(ip, port, path, srcPort, 4194304, speedLimit)
-                        : new TransferUdtClient(ip, port, path, 4194304, speedLimit);
+                        : new TransferUdtClient(ip, port, path, 0, 4194304, speedLimit);
                     WireUdtClientEvents(_clientUdt);
                     if (isFolder)
                         await _clientUdt.SendFolderAsync(path);
@@ -1245,23 +1368,41 @@ namespace TrFileTransfer
 
         private Panel CreateTransferCard(FlowLayoutPanel parent)
         {
-            var panel = new Panel { Width = parent.Width - 6, Height = 28, Margin = new Padding(0, 1, 0, 0) };
+            var panel = new Panel { Height = 44, Margin = new Padding(2), BackColor = Color.White };
             var bar = new ProgressBar
             {
-                Location = new Point(2, 1), Width = panel.Width - 6, Height = 14,
+                Location = new Point(6, 5),
+                Width = Math.Max(40, parent.ClientSize.Width - 20),
+                Height = 16,
+                Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right,
                 Style = ProgressBarStyle.Continuous, Minimum = 0, Maximum = 100
             };
             var lbl = new Label
             {
-                Location = new Point(4, 16), Width = panel.Width - 8, Height = 12,
+                Location = new Point(6, 25),
+                Width = Math.Max(40, parent.ClientSize.Width - 20),
+                Height = 15,
+                Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right,
                 Text = "", AutoSize = false, TextAlign = ContentAlignment.MiddleLeft,
-                Font = new Font("Segoe UI", 7f)
+                ForeColor = Color.FromArgb(85, 85, 85),
+                Font = new Font("Segoe UI", 8f)
             };
             panel.Controls.Add(bar);
             panel.Controls.Add(lbl);
             panel.Tag = new ProgressCardInfo { Bar = bar, Label = lbl };
             parent.Controls.Add(panel);
             return panel;
+        }
+
+        /// <summary>Keeps every transfer card as wide as its host panel (minus scrollbar).</summary>
+        private static void SyncCardWidths(FlowLayoutPanel parent)
+        {
+            int w = parent.ClientSize.Width - (parent.VerticalScroll.Visible
+                ? SystemInformation.VerticalScrollBarWidth + 8
+                : 8);
+            if (w < 40) w = 40;
+            for (int i = 0; i < parent.Controls.Count; i++)
+                parent.Controls[i].Width = w;
         }
 
         private Panel GetOrCreateUdtCard(IPEndPoint ep)
@@ -1336,6 +1477,8 @@ namespace TrFileTransfer
             AppendLogFile(msg);
         }
 
+        private static DateTime _lastLogSweep = DateTime.MinValue;
+
         /// <summary>Appends a log line to the daily log file under %AppData%\TrFileTransfer\logs.</summary>
         private static void AppendLogFile(string msg)
         {
@@ -1347,6 +1490,31 @@ namespace TrFileTransfer
                 Directory.CreateDirectory(dir);
                 string path = Path.Combine(dir, DateTime.Now.ToString("yyyy-MM-dd") + ".txt");
                 File.AppendAllText(path, "[" + DateTime.Now.ToString("HH:mm:ss") + "] " + msg + Environment.NewLine);
+                if (DateTime.Now.Date != _lastLogSweep)
+                {
+                    _lastLogSweep = DateTime.Now.Date;
+                    SweepOldLogs(dir);
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>Deletes daily log files older than 30 days (runs at most once per day).</summary>
+        private static void SweepOldLogs(string dir)
+        {
+            try
+            {
+                DateTime cutoff = DateTime.Now.Date.AddDays(-30);
+                string[] files = Directory.GetFiles(dir, "*.txt");
+                for (int i = 0; i < files.Length; i++)
+                {
+                    try
+                    {
+                        if (File.GetLastWriteTime(files[i]) < cutoff)
+                            File.Delete(files[i]);
+                    }
+                    catch { }
+                }
             }
             catch { }
         }
@@ -1444,7 +1612,7 @@ namespace TrFileTransfer
                 {
                     var client = _monitorSrcPort > 0
                         ? new TransferClient(ip, port, filePath, _monitorSrcPort, 4194304, _monitorSpeedBytesPerSec)
-                        : new TransferClient(ip, port, filePath, 4194304, _monitorSpeedBytesPerSec);
+                        : new TransferClient(ip, port, filePath, 0, 4194304, _monitorSpeedBytesPerSec);
                     client.OnLog += msg => this.Invoke((Action)(() => AddLog(msg)));
                     client.OnProgress += p => this.Invoke((Action)(() => UpdateCardProgress(card, p)));
                     client.OnError += msg => this.Invoke((Action)(() => AddLog(L.MonitorFileSendFailed(fileName, msg))));
@@ -1456,7 +1624,7 @@ namespace TrFileTransfer
                 {
                     var clientUdt = _monitorSrcPort > 0
                         ? new TransferUdtClient(ip, port, filePath, _monitorSrcPort, 4194304, _monitorSpeedBytesPerSec)
-                        : new TransferUdtClient(ip, port, filePath, 4194304, _monitorSpeedBytesPerSec);
+                        : new TransferUdtClient(ip, port, filePath, 0, 4194304, _monitorSpeedBytesPerSec);
                     clientUdt.OnLog += msg => this.Invoke((Action)(() => AddLog(msg)));
                     clientUdt.OnProgress += p => this.Invoke((Action)(() => UpdateCardProgress(card, p)));
                     clientUdt.OnError += msg => this.Invoke((Action)(() => AddLog(L.MonitorFileSendFailed(fileName, msg))));
@@ -1481,6 +1649,7 @@ namespace TrFileTransfer
                 {
                     AddLog(L.MonitorFileSent(fileName));
                     _lblStatusC.Text = L.MonitorWaiting;
+                    RememberDevice(ip, port, !_rbClientTcp.Checked);
                 }));
             }
         }
@@ -1549,6 +1718,7 @@ namespace TrFileTransfer
             if (!_trayExit && e.CloseReason == CloseReason.UserClosing)
             {
                 e.Cancel = true;
+                SaveConfig();
                 this.Hide();
                 Notify(L.AppTitle, L.TrayMinimized);
                 return;
@@ -1566,7 +1736,39 @@ namespace TrFileTransfer
                 _client.Cancel();
             if (_clientUdt != null)
                 _clientUdt.Cancel();
+            // Remove the tray icon before teardown, otherwise it lingers until hover
+            _notifyIcon.Visible = false;
+            _notifyIcon.Dispose();
             base.OnFormClosing(e);
+        }
+    }
+
+    /// <summary>Shared flat-style helpers so buttons look consistent across all forms.</summary>
+    internal static class UiStyle
+    {
+        /// <summary>Accent (primary action) button — Windows blue, white text.</summary>
+        public static void Primary(Button b)
+        {
+            b.FlatStyle = FlatStyle.Flat;
+            b.BackColor = Color.FromArgb(0, 120, 215);
+            b.ForeColor = Color.White;
+            b.FlatAppearance.BorderSize = 0;
+            b.FlatAppearance.MouseOverBackColor = Color.FromArgb(28, 110, 190);
+            b.FlatAppearance.MouseDownBackColor = Color.FromArgb(0, 90, 158);
+            b.Cursor = Cursors.Hand;
+        }
+
+        /// <summary>Neutral button — white with a light border, darkens on hover.</summary>
+        public static void Secondary(Button b)
+        {
+            b.FlatStyle = FlatStyle.Flat;
+            b.BackColor = Color.White;
+            b.ForeColor = Color.FromArgb(31, 31, 31);
+            b.FlatAppearance.BorderColor = Color.FromArgb(204, 204, 204);
+            b.FlatAppearance.BorderSize = 1;
+            b.FlatAppearance.MouseOverBackColor = Color.FromArgb(240, 240, 240);
+            b.FlatAppearance.MouseDownBackColor = Color.FromArgb(225, 225, 225);
+            b.Cursor = Cursors.Hand;
         }
     }
 
@@ -1607,18 +1809,22 @@ namespace TrFileTransfer
             Controls.Add(_list);
 
             _btnContinue = new Button { Text = L.ResumeBtn, Location = new Point(12, 220), Width = 100 };
+            UiStyle.Primary(_btnContinue);
             _btnContinue.Click += BtnContinue_Click;
             Controls.Add(_btnContinue);
 
             _btnDelete = new Button { Text = L.ResumeDelete, Location = new Point(120, 220), Width = 100 };
+            UiStyle.Secondary(_btnDelete);
             _btnDelete.Click += BtnDelete_Click;
             Controls.Add(_btnDelete);
 
             _btnClearAll = new Button { Text = L.ResumeClearAll, Location = new Point(228, 220), Width = 100 };
+            UiStyle.Secondary(_btnClearAll);
             _btnClearAll.Click += BtnClearAll_Click;
             Controls.Add(_btnClearAll);
 
             _btnClose = new Button { Text = L.CancelBtn, Location = new Point(370, 220), Width = 100 };
+            UiStyle.Secondary(_btnClose);
             _btnClose.Click += (__, ___) => Close();
             Controls.Add(_btnClose);
         }
@@ -1725,22 +1931,27 @@ namespace TrFileTransfer
             Controls.Add(_list);
 
             _btnAdd = new Button { Text = L.QueueAdd, Location = new Point(12, 262), Width = 100 };
+            UiStyle.Secondary(_btnAdd);
             _btnAdd.Click += BtnAdd_Click;
             Controls.Add(_btnAdd);
 
             _btnDelete = new Button { Text = L.QueueDelete, Location = new Point(120, 262), Width = 100 };
+            UiStyle.Secondary(_btnDelete);
             _btnDelete.Click += BtnDelete_Click;
             Controls.Add(_btnDelete);
 
             _btnClear = new Button { Text = L.QueueClear, Location = new Point(228, 262), Width = 100 };
+            UiStyle.Secondary(_btnClear);
             _btnClear.Click += BtnClear_Click;
             Controls.Add(_btnClear);
 
             _btnStart = new Button { Text = L.QueueStart, Location = new Point(336, 262), Width = 100 };
+            UiStyle.Primary(_btnStart);
             _btnStart.Click += BtnStart_Click;
             Controls.Add(_btnStart);
 
             _btnClose = new Button { Text = L.CancelBtn, Location = new Point(444, 262), Width = 90 };
+            UiStyle.Secondary(_btnClose);
             _btnClose.Click += (__, ___) => Close();
             Controls.Add(_btnClose);
         }
@@ -1845,14 +2056,17 @@ namespace TrFileTransfer
             Controls.Add(_list);
 
             _btnRescan = new Button { Text = L.ScanRescan, Location = new Point(12, 222), Width = 100 };
+            UiStyle.Secondary(_btnRescan);
             _btnRescan.Click += async (s2, e2) => await ScanAsync();
             Controls.Add(_btnRescan);
 
             _btnUse = new Button { Text = L.ScanUse, Location = new Point(120, 222), Width = 100 };
+            UiStyle.Primary(_btnUse);
             _btnUse.Click += BtnUse_Click;
             Controls.Add(_btnUse);
 
             _btnClose = new Button { Text = L.CancelBtn, Location = new Point(228, 222), Width = 100 };
+            UiStyle.Secondary(_btnClose);
             _btnClose.Click += (__, ___) => Close();
             Controls.Add(_btnClose);
 
@@ -1873,19 +2087,33 @@ namespace TrFileTransfer
                 _list.Items.Clear();
                 _items.Clear();
 
-                // Known (remembered) devices first
+                // Merge live results into the known list by Ip+Port so each device
+                // appears exactly once; a matching known entry is shown with live data
+                bool[] merged = new bool[devices.Length];
                 if (_known.Count > 0)
                 {
                     _list.Items.Add(L.ScanKnownTitle);
                     _items.Add(new DeviceInfo { Ip = null }); // section header placeholder
                     for (int i = 0; i < _known.Count; i++)
                     {
-                        _items.Add(_known[i]);
-                        _list.Items.Add(FormatDevice(_known[i], false));
+                        DeviceInfo d = _known[i];
+                        bool online = false;
+                        for (int j = 0; j < devices.Length; j++)
+                        {
+                            if (!merged[j] && devices[j].Ip == d.Ip && devices[j].Port == d.Port)
+                            {
+                                d = devices[j];
+                                online = true;
+                                merged[j] = true;
+                                break;
+                            }
+                        }
+                        _items.Add(d);
+                        _list.Items.Add(FormatDevice(d, online));
                     }
                 }
 
-                // Then live scan results
+                // Then live scan results not already shown in the known section
                 _list.Items.Add(L.ScanOnlineTitle);
                 _items.Add(new DeviceInfo { Ip = null }); // section header placeholder
                 if (devices.Length == 0)
@@ -1897,6 +2125,7 @@ namespace TrFileTransfer
                 {
                     for (int i = 0; i < devices.Length; i++)
                     {
+                        if (merged[i]) continue;
                         _items.Add(devices[i]);
                         _list.Items.Add(FormatDevice(devices[i], true));
                     }
@@ -1967,10 +2196,12 @@ namespace TrFileTransfer
             Controls.Add(_list);
 
             _btnOpen = new Button { Text = L.RecentOpen, Location = new Point(12, 252), Width = 110 };
+            UiStyle.Secondary(_btnOpen);
             _btnOpen.Click += BtnOpen_Click;
             Controls.Add(_btnOpen);
 
             _btnClose = new Button { Text = L.CancelBtn, Location = new Point(130, 252), Width = 110 };
+            UiStyle.Secondary(_btnClose);
             _btnClose.Click += (__, ___) => Close();
             Controls.Add(_btnClose);
         }

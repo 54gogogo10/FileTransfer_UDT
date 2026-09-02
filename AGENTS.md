@@ -1,8 +1,8 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+This file provides guidance to AI coding agents (Codex / ZCode / Claude Code) when working with code in this repository.
 
-本文件为 Codex 在此仓库中工作时提供指引。
+本文件为 AI 编码代理（Codex / ZCode / Claude Code）在此仓库中工作时提供指引。
 
 ## 构建
 
@@ -34,16 +34,20 @@ cd TrFileTransfer\Tests && build.bat
 TrFileTransfer.Tests.exe
 ```
 
-测试套件包含单元测试（L10N、Config、Shared 工具方法）和集成测试（TCP 单文件、TCP 文件夹、UDT 单文件）。使用自定义轻量级 `TestRunner` + `Assert` 类，无外部测试框架依赖。
+测试套件包含单元测试（L10N、Config、Shared 工具方法、ServerResumeStore）和 24 项集成测试（TCP：单文件/文件夹/空文件/中文名/多客户端/连接拒绝/文件不存在/大文件×2/续传×4/限速；UDT：单文件/文件夹/空文件/限速/大文件×2/续传×3；另有双协议发现测试）。使用自定义轻量级 `TestRunner` + `Assert` 类，无外部测试框架依赖。
 
-集成测试每次从 `TcpListener` 获取空闲端口并绑定本地回环（127.0.0.1），使用临时目录。超时：TCP 30 秒，UDT 60 秒。退出码 0 表示全部通过，1 表示有失败。
+- `TestRunner.Run(name, action, retries)` 支持重试参数——UDT 握手偶发抖动，所有 UDT 集成测试传 `retries: 1`。
+- 集成测试每次经 `FindFreePort()` 获取空闲端口并绑定 127.0.0.1；该方法还会用 `UdpClient` 验证端口对 UDP 同样可用（UDT 在同端口绑 UDP，避开 Hyper-V/WSL 的 Windows 保留 UDP 端口段）。
+- 集成测试临时目录硬编码为 `D:\cc\tmp`（非系统 TEMP）。
+- 超时：TCP 30 秒，UDT 60 秒。退出码 0 表示全部通过，1 表示有失败。
+- `Tests/QuickTest.cs` 是独立的 UDT 冒烟脚本，不在测试 build.bat 的编译列表中。
 
 ## 架构
 
 十二个源文件编译为单个 WinForms exe：
 
 - **Program.cs** — 入口。`[STAThread]` Main 启动 `MainForm`。
-- **MainForm.cs** — GUI。服务器和客户端面板同时显示。协议选择（TCP/UDT）、服务器绑定地址下拉框。**并发控制**：`_numConcurrency`（1-8）。文件夹/监控模式复选框、**完整校验复选框**（续传时启用 0x03 全文件哈希）、**限速输入**（KB/s，0=不限，Config `SpeedLimit`）。动态进度卡片（左右两个 FlowLayoutPanel，TCP/UDT 独立字典按 IPEndPoint 区分，完成 3 秒后移除）。语言下拉框、日志上限 500 条、进度节流 100ms。`WireClientEvents`/`WireUdtClientEvents`/`WireConcurrentEvents` 辅助方法。**发送队列**（`QueueDialog` 串行批量执行，复用抽取的 `StartTransfer` 公共方法）。**设备发现**（"扫描"按钮 → `DiscoveryDialog`，服务器启动时 `DiscoveryServer` 在 UDP 端口广播响应）。**完成通知**（托盘 `NotifyIcon` BalloonTip + 提示音，Config `NotifyEnabled`/`NotifySound`）。**接收文件管理**（"打开目录"/"最近接收"按钮 + `OnFileReceived` 事件 + 按日期归档 Config `AutoArchive`）。`StartTransfer` 内部 try/catch 返回 bool，失败不再冒泡崩溃。
+- **MainForm.cs** — GUI。窗口可缩放（TableLayoutPanel 根布局：表头/服务器/客户端为固定行，进度区 SplitContainer 左右分栏与日志区平分剩余空间；进度卡片宽度经 `SyncCardWidths` 随面板自适应）。按钮统一走 `UiStyle.Primary/Secondary` 扁平样式（蓝色主操作 + 白底描边次操作），四个对话框（Queue/Discovery/Resume/Recent）同样套用。日志为深色控制台风格（Consolas 9f，#1E1E1E）。服务器和客户端面板同时显示。协议选择（TCP/UDT）、服务器绑定地址下拉框。**并发控制**：`_numConcurrency`（1-8）。文件夹/监控模式复选框、**完整校验复选框**（续传时启用 0x03 全文件哈希）、**限速输入**（KB/s，0=不限，Config `SpeedLimit`）。动态进度卡片（左右两个 FlowLayoutPanel，TCP/UDT 独立字典按 IPEndPoint 区分，完成 3 秒后移除）。语言下拉框、日志上限 500 条、进度节流 100ms。`WireClientEvents`/`WireUdtClientEvents`/`WireConcurrentEvents` 辅助方法。**发送队列**（`QueueDialog` 串行批量执行，复用抽取的 `StartTransfer` 公共方法）。**设备发现**（"扫描"按钮 → `DiscoveryDialog`，服务器启动时 `DiscoveryServer` 在 UDP 端口广播响应）。**完成通知**（托盘 `NotifyIcon` BalloonTip + 提示音，Config `NotifyEnabled`/`NotifySound`）。**接收文件管理**（"打开目录"/"最近接收"按钮 + `OnFileReceived` 事件 + 按日期归档 Config `AutoArchive`）。`StartTransfer` 内部 try/catch 返回 bool，失败不再冒泡崩溃。**拖放批量入队**（拖多个文件/文件夹时逐项入队并直接打开 `QueueDialog`，单个仍填充路径框；`CaptureQueuedTaskFor(path, isFolder)` 从 `CaptureQueuedTask` 抽取复用）。**日志持久化**（`AddLog` 的每条日志同时经 `AppendLogFile` 写入 `%AppData%\TrFileTransfer\logs\yyyy-MM-dd.txt`，失败静默；保留 30 天，每日首次写日志时清理过期文件）。**设备记忆**（传输成功后 `RememberDevice` 记入 Config `KnownDevices`——普通发送与监控模式均记录——格式 `Name|Ip|Port|flags`（分号分隔多条，flags 位1=TCP 位2=UDT），上限 10 条；`DiscoveryDialog` 将在线结果按 Ip+Port 合并进已知列表去重显示）。**托盘常驻**（最小化时 `Hide()`；用户关闭窗口=取消关闭+`SaveConfig`+隐藏+BalloonTip；仅托盘菜单"退出"设置 `_trayExit` 后真正退出，退出时释放 `NotifyIcon` 防止托盘图标残留）。
 - **TransferServer.cs** — 异步 TCP 服务器。`HandleClient` 读取 1 字节类型前缀，分发：0x00 单文件 / 0x01 文件夹 / 0x02 分块（`ChunkTracker` 聚合）/ **0x03 续传**（`HandleResumableCore`，支持**磁盘状态恢复**与**全文件哈希校验**）。`OnFileReceived(path, size)` 事件在四种完成路径触发。`NoDelay = true`，LongRunning 接受循环。
 - **TransferClient.cs** — 异步 TCP 客户端。`SendAsync()`/`SendFolderAsync()`/`SendChunkedAsync()`/`SendResumableAsync(sessionId, verifyHash)`（0x03，发送后读取最终 0x10 响应确认）。`SendFilePayload` 支持 `fileOffset` 与**限速**（`SpeedLimiter` 令牌桶）。支持绑定源端口。
 - **TransferUdt.cs** — UDT STREAM 传输。`UdtNative` 引用计数 + Cdecl P/Invoke；`UdtDll` 提取嵌入 DLL；`UdtIo` 封装异步 I/O（**错误描述在线程内捕获**，`LastError` 供诊断）。`TransferUdtServer`/`TransferUdtClient` 复用 TCP 线协议（含 0x03 续传、全文件校验、限速、`OnFileReceived`）。`udt_listen` backlog 32。
@@ -154,6 +158,8 @@ copy udt.dll libmcfgthread-2.dll TrFileTransfer\
 
 `udt.dll` 依赖 `libmcfgthread-2.dll`（MinGW MCF 线程运行时，约 42 KB）。两个 DLL 均通过 csc.exe `/resource` 嵌入 exe，首次运行时由 `UdtDll.EnsureExtracted()` 提取到 exe 目录。提取逻辑支持只读目录回退到 `%TEMP%` + `SetDllDirectory`，以及杀软锁重试（最多 3 次，间隔 200ms）。
 
+权威源码树是 `udt-sdk\udt4\src\`。根目录下未跟踪的 `udt-master\`（UDT4 原版副本）、`udt-build\`、`udt-build2\`（带外编译产物 .o/.dll）是工作副本/产物，勿在其内改动，也不要将其纳入提交。
+
 ### P/Invoke
 
 `UdtNative` 静态类声明了核心 UDT API（CallingConvention.Cdecl）：
@@ -189,6 +195,10 @@ Accept 循环：`udt_accept()` 返回客户端 socket → 添加到 `_clientSock
 ## 边界情况与异常处理
 
 - `ObjectDisposedException` 和 `InvalidOperationException` 在所有传输循环和外部 try-catch 块中静默捕获——`Stop()`/`Cancel()` 关闭套接字期间 I/O 正在执行时会出现这些异常。
+- `HandleResumableCore`（TCP 与 UDT）的 finally 块**只 Save 不 Delete**——`Stop()` 可能已落盘并清空字典，盲目 Delete 会丢失磁盘检查点；`ServerResumeStore.Delete` 仅在显式成功/失败路径（status 2、status 3、增量哈希失败）调用。落盘前先 `Flush()`，保证持久化的 ReceivedBytes 与磁盘实际数据一致。
+- TCP 服务器对 0 字节文件特殊处理：不读数据块、直接读后续 32 字节哈希（否则空文件会被误判为连接关闭）。
+- UDT 客户端 `SendFilePayload` 的所有分块（含最后一块）都必须经过 `_limiter.Throttle`——遗漏最后一块会导致 ≤4MB 的文件完全不限速。
+- **构造函数重载陷阱**：`TransferClient`/`TransferUdtClient` 的 5 参数签名是 `(ip, port, path, localPort, bufferSize)`，不是 `(bufferSize, speedLimit)`。UI 构造客户端一律使用 6 参数全签名 `(ip, port, path, localPort, 4194304, speedLimit)`（localPort=0 表示随机）——曾经把 4194304 误传成源端口、speedLimit(0) 误传成缓冲区大小，导致 FileStream 抛"要求正数"，UI 上所有普通发送失败。
 - 绑定失败（地址不在任何网卡上）在 `TransferServer.Start()` 和 `TransferUdtServer.Start()` 中捕获——触发 `OnError` + `OnStopped`，UI 重新启用控件。
 - 传输过程中语言切换被禁用。
 - `TransferUdtServer.Stop()` 调用 `udt_close()` 以中断阻塞中的 `udt_accept()`。
@@ -216,6 +226,11 @@ UDT STREAM 模式通过 `udt_setsockopt` 设置 `UDT_RCVTIMEO` 和 `UDT_SNDTIMEO
 - **`WaitForFileReady`**：每 500ms 轮询 `FileInfo.Length`。连续 2 次大小不变时返回 `true`。每 30 秒记录一条日志。2 分钟未稳定则返回 `false`——文件移至队列末尾（防止卡住的文件阻塞其他文件）。
 - **事件绑定分离**：监控模式使用自己的事件处理器更新日志和进度条，但不调用 `ResetClientUI`。`TaskCompletionSource<bool>` 跟踪每个文件的成功/失败——`OnTransferComplete` 设为 true，`OnStopped` 设为 false（仅首次调用生效）。
 - **停止**：监控中点击取消按钮调用 `StopMonitoring()`，取消令牌、释放 FileSystemWatcher、重置 UI。
+
+## 文档
+
+- `WIRE-PROTOCOL.md` — 线协议规范（各类型详细字节布局）。改动 0x00–0x03 协议时先读它，并同步更新本文件的"TCP 线协议"章节。
+- `docs/superpowers/plans/` 与 `docs/superpowers/specs/` — 主要功能的实施计划与设计文档（并发传输、断点续传、2026-08 增强批次）。改动对应功能前建议先读对应设计文档。
 
 ## 运行时要求
 

@@ -311,6 +311,12 @@ namespace TrFileTransfer
                 ? string.Format("[拖放] 已将 {0} 个项目加入发送队列。", count)
                 : string.Format("[Drop] Enqueued {0} items to the send queue.", count);
         }
+        public static string DragDropSkipped(object count)
+        {
+            return IsChinese
+                ? string.Format("[拖放] 已跳过 {0} 个项目：服务器地址或端口未配置。", count)
+                : string.Format("[Drop] Skipped {0} item(s): server address or port not configured.", count);
+        }
         public static string NotifySendDone { get { return IsChinese ? "发送完成" : "Send complete"; } }
         public static string NotifyReceiveDone { get { return IsChinese ? "收到文件" : "File received"; } }
         public static string OpenSaveDir { get { return IsChinese ? "打开目录" : "Open Folder"; } }
