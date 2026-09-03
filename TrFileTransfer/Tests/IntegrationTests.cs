@@ -53,6 +53,9 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_TCP_ResumeFullHashCorrupt", TcpResumeFullHashCorrupt);
             runner.Run("Integration_TCP_RateLimit", TcpRateLimit);
             runner.Run("Integration_Discovery", DiscoveryTest);
+            runner.Run("Integration_Factory_TCP", FactoryTcp);
+            runner.Run("Integration_TCP_BindInUse_Typed", TcpBindInUseTyped);
+            runner.Run("Integration_Factory_UDT", FactoryUdt, 1);
             runner.Run("Integration_UDT_ResumeSingleFile", UdtResumeSingleFile, 1); // UDT flaky handshake retry
             runner.Run("Integration_UDT_ResumeAcrossRestart", UdtResumeAcrossRestart, 1);
             runner.Run("Integration_UDT_ResumeFullHashCorrupt", UdtResumeFullHashCorrupt, 1);
@@ -1885,6 +1888,163 @@ namespace TrFileTransfer.Tests
                 if (server != null) { try { server.Stop(); } catch { } }
                 try { Directory.Delete(sendDir, true); } catch { }
                 try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        // ---- ClientFactory + bind-failure regression tests ----
+        // The UI constructs clients through ClientFactory; these tests exercise the
+        // exact same shape so a constructor-argument mistake fails the suite again.
+
+        private static void FactoryTcp()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_fc_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_fc_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+
+            TransferServer server = null;
+            try
+            {
+                var testFile = Path.Combine(sendDir, "factory_tcp.bin");
+                var rng = new Random(7);
+                var content = new byte[1024 * 1024];
+                rng.NextBytes(content);
+                File.WriteAllBytes(testFile, content);
+
+                var serverStarted = new ManualResetEvent(false);
+                var serverDone = new ManualResetEvent(false);
+                bool serverOk = false;
+                string serverError = null;
+
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => serverStarted.Set();
+                server.OnTransferComplete += () => { serverOk = true; serverDone.Set(); };
+                server.OnError += msg => { serverError = msg; serverDone.Set(); };
+                server.Start();
+                if (!serverStarted.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+
+                // srcPort=0 + non-zero speedLimit was the shape that once regressed
+                var client = ClientFactory.CreateTcp("127.0.0.1", port, testFile, 0, 1024 * 1024);
+                var clientDone = new ManualResetEvent(false);
+                bool clientOk = false;
+                client.OnTransferComplete += () => { clientOk = true; clientDone.Set(); };
+                client.OnError += msg => clientDone.Set();
+
+                var sendTask = client.SendAsync();
+                if (!serverDone.WaitOne(30000))
+                    throw new Exception("Server did not complete within 30s");
+                if (!serverOk)
+                    throw new Exception("Server error: " + (serverError ?? "unknown"));
+                sendTask.Wait(30000);
+                if (!clientOk)
+                    throw new Exception("Client transfer failed");
+
+                Thread.Sleep(300);
+                var receivedFile = Path.Combine(recvDir, "factory_tcp.bin");
+                Assert.True(File.Exists(receivedFile), "received file exists");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(receivedFile)), "content match");
+            }
+            finally
+            {
+                try { if (server != null) server.Stop(); } catch { }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        private static void FactoryUdt()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_fu_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_fu_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+
+            TransferUdtServer server = null;
+            try
+            {
+                var testFile = Path.Combine(sendDir, "factory_udt.bin");
+                var rng = new Random(8);
+                var content = new byte[1024 * 1024];
+                rng.NextBytes(content);
+                File.WriteAllBytes(testFile, content);
+
+                var serverStarted = new ManualResetEvent(false);
+                var serverDone = new ManualResetEvent(false);
+                bool serverOk = false;
+                string serverError = null;
+
+                server = new TransferUdtServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => serverStarted.Set();
+                server.OnTransferComplete += () => { serverOk = true; serverDone.Set(); };
+                server.OnError += msg => { serverError = msg; serverDone.Set(); };
+                server.Start();
+                if (!serverStarted.WaitOne(15000))
+                    throw new Exception("UDT server did not start within 15s");
+
+                var client = ClientFactory.CreateUdt("127.0.0.1", port, testFile, 0, 1024 * 1024);
+                var clientDone = new ManualResetEvent(false);
+                bool clientOk = false;
+                client.OnTransferComplete += () => { clientOk = true; clientDone.Set(); };
+                client.OnError += msg => clientDone.Set();
+
+                var sendTask = client.SendAsync();
+                if (!serverDone.WaitOne(60000))
+                    throw new Exception("UDT server did not complete within 60s");
+                if (!serverOk)
+                    throw new Exception("UDT server error: " + (serverError ?? "unknown"));
+                sendTask.Wait(60000);
+                if (!clientOk)
+                    throw new Exception("UDT client transfer failed");
+
+                Thread.Sleep(300);
+                var receivedFile = Path.Combine(recvDir, "factory_udt.bin");
+                Assert.True(File.Exists(receivedFile), "received file exists");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(receivedFile)), "content match");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        private static void TcpBindInUseTyped()
+        {
+            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_bi_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            Directory.CreateDirectory(sendDir);
+            try
+            {
+                var testFile = Path.Combine(sendDir, "bind.bin");
+                File.WriteAllBytes(testFile, new byte[1024]);
+
+                // Bind the same wildcard address the client will use, exclusively,
+                // so the client's bind is guaranteed to conflict on this port
+                var probe = new TcpListener(System.Net.IPAddress.Any, 0);
+                probe.ExclusiveAddressUse = true;
+                probe.Start();
+                int occupiedPort = ((System.Net.IPEndPoint)probe.LocalEndpoint).Port;
+                try
+                {
+                    var client = new TransferClient("127.0.0.1", 1, testFile, occupiedPort, 65536, 0);
+                    Exception caught = null;
+                    try { client.SendAsync().Wait(15000); }
+                    catch (AggregateException ag) { caught = ag.InnerException; }
+                    Assert.True(caught is PortBindException,
+                        "expected PortBindException but got: " +
+                        (caught == null ? "<no error>" : caught.GetType().Name + ": " + caught.Message));
+                }
+                finally
+                {
+                    probe.Stop();
+                }
+            }
+            finally
+            {
+                try { Directory.Delete(sendDir, true); } catch { }
             }
         }
     }

@@ -136,7 +136,7 @@ namespace TrFileTransfer
 
         private async Task SendFileInternal(CancellationToken ct)
         {
-            using (var client = new TcpClient())
+            using (var client = CreateClient())
             {
                 client.NoDelay = true;
                 client.SendBufferSize = _bufferSize;
@@ -176,7 +176,7 @@ namespace TrFileTransfer
 
         private async Task SendFolderInternal(string folderPath, CancellationToken ct)
         {
-            using (var client = new TcpClient())
+            using (var client = CreateClient())
             {
                 client.NoDelay = true;
                 client.SendBufferSize = _bufferSize;
@@ -269,11 +269,24 @@ namespace TrFileTransfer
             }
         }
 
+        /// <summary>Creates the client socket; a busy source port raises PortBindException (no bytes sent yet).</summary>
+        private TcpClient CreateClient()
+        {
+            if (_localPort <= 0) return new TcpClient();
+            try
+            {
+                return new TcpClient(new IPEndPoint(IPAddress.Any, _localPort));
+            }
+            catch (SocketException ex)
+            {
+                throw new PortBindException(
+                    "Bind local port " + _localPort + " failed: " + ex.Message, ex, _localPort);
+            }
+        }
+
         private async Task SendChunkedInternal(long offset, long chunkSize, long totalSize, CancellationToken ct)
         {
-            using (var client = _localPort > 0
-                ? new TcpClient(new IPEndPoint(IPAddress.Any, _localPort))
-                : new TcpClient())
+            using (var client = CreateClient())
             {
                 client.NoDelay = true;
                 client.SendBufferSize = _bufferSize;
@@ -359,9 +372,7 @@ namespace TrFileTransfer
                 newState.Save();
             }
 
-            using (var client = _localPort > 0
-                ? new TcpClient(new IPEndPoint(IPAddress.Any, _localPort))
-                : new TcpClient())
+            using (var client = CreateClient())
             {
                 client.NoDelay = true;
                 client.SendBufferSize = _bufferSize;

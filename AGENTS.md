@@ -55,7 +55,7 @@ TrFileTransfer.Tests.exe
 - **Config.cs** — 键值配置持久化。`Get`/`GetInt`/`GetBool`/`Set`/`SetInt`/`SetBool`。启动时加载，关闭时保存。
 - **Shared.cs** — `TransferProgress`/`FileEntry` 结构体。`ChunkTracker`（分块重组）。`SpeedLimiter`（令牌桶限速）。`Utils` 静态辅助（`FormatSize`、`ConstantTimeEquals`、`LogTo`、`SanitizeRelativePath`、`GetUniqueSavePath`、`FindFreePort`、`EmptyBytes`）。
 - **ResumeState.cs** — 客户端续传状态持久化（含 `SourceMTime` 源文件变化检测）。
-- **ServerResumeStore.cs** — 服务器续传状态落盘（`%AppData%\TrFileTransfer\server-resume`），服务器重启后按磁盘偏移恢复。
+- **ServerResumeStore.cs** — 服务器续传状态落盘（`%AppData%\TrFileTransfer\server-resume`），服务器重启后按磁盘偏移恢复；`CleanupStale(7)` 在 TCP/UDT 服务器 Start 时调用，清理 7 天以上客户端未返回的孤儿会话文件。
 - **DeviceDiscovery.cs** — UDP 设备发现：探测 `0xD1` → 响应 `0xD2`（名称/端口/协议位图），默认端口 45000（Config `DiscoveryPort`）。
 - **L10N.cs** — 本地化字符串。静态 `L` 类根据 `L.IsChinese` 返回英文或中文文本。命名规则见下方"本地化约定"。
 - **Tests/TestProgram.cs** — 测试入口。`TestProgram.Main` 先运行单元测试再运行集成测试，退出码反映结果。同时包含 `UnitTests` 类、`Assert` 辅助类（`Equal/True/False/NotNull/Throws`）、`TestRunner.Run(name, action)` 追踪通过/失败计数。
@@ -198,7 +198,8 @@ Accept 循环：`udt_accept()` 返回客户端 socket → 添加到 `_clientSock
 - `HandleResumableCore`（TCP 与 UDT）的 finally 块**只 Save 不 Delete**——`Stop()` 可能已落盘并清空字典，盲目 Delete 会丢失磁盘检查点；`ServerResumeStore.Delete` 仅在显式成功/失败路径（status 2、status 3、增量哈希失败）调用。落盘前先 `Flush()`，保证持久化的 ReceivedBytes 与磁盘实际数据一致。
 - TCP 服务器对 0 字节文件特殊处理：不读数据块、直接读后续 32 字节哈希（否则空文件会被误判为连接关闭）。
 - UDT 客户端 `SendFilePayload` 的所有分块（含最后一块）都必须经过 `_limiter.Throttle`——遗漏最后一块会导致 ≤4MB 的文件完全不限速。
-- **构造函数重载陷阱**：`TransferClient`/`TransferUdtClient` 的 5 参数签名是 `(ip, port, path, localPort, bufferSize)`，不是 `(bufferSize, speedLimit)`。UI 构造客户端一律使用 6 参数全签名 `(ip, port, path, localPort, 4194304, speedLimit)`（localPort=0 表示随机）——曾经把 4194304 误传成源端口、speedLimit(0) 误传成缓冲区大小，导致 FileStream 抛"要求正数"，UI 上所有普通发送失败。
+- **构造函数重载陷阱**：`TransferClient`/`TransferUdtClient` 的 5 参数签名是 `(ip, port, path, localPort, bufferSize)`，不是 `(bufferSize, speedLimit)`。UI 一律通过 `ClientFactory.CreateTcp/CreateUdt(ip, port, path, srcPort, speedLimit)` 构造（内部走 6 参数全签名，localPort=0 表示随机，缓冲区恒为 4MB）——曾经把 4194304 误传成源端口、speedLimit(0) 误传成缓冲区大小，导致 FileStream 抛"要求正数"，UI 上所有普通发送失败。集成测试 `Integration_Factory_TCP/UDT` 以相同形状构造客户端做真实传输，防止该形状再次回归。
+- **源端口绑定失败**：客户端绑定 `localPort` 失败时抛 `PortBindException`（Shared.cs，绑定发生在发送任何字节之前，可安全重试）；`ConcurrentTransfer` 捕获后经 `Utils.FindFreePort` 换口重试最多 3 次——并行分块绑定连续端口时可能与系统临时端口竞争（此前 TCP_LargeConcur 偶发 ADDRINUSE 即此原因）。注意 TCP 客户端的 0x00/0x01 路径（SendFileInternal/SendFolderInternal）此前用裸 `new TcpClient()` 未绑定 localPort（UI"源端口"选项对普通发送无效），已统一走 `CreateClient()` 修复；UDT 侧所有路径本就经 `UdtConnect` 绑定。
 - 绑定失败（地址不在任何网卡上）在 `TransferServer.Start()` 和 `TransferUdtServer.Start()` 中捕获——触发 `OnError` + `OnStopped`，UI 重新启用控件。
 - 传输过程中语言切换被禁用。
 - `TransferUdtServer.Stop()` 调用 `udt_close()` 以中断阻塞中的 `udt_accept()`。

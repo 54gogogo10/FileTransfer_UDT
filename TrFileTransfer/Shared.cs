@@ -130,6 +130,40 @@ namespace TrFileTransfer
             }
         }
 
+        /// <summary>
+        /// Thrown when a client cannot bind its requested local source port. Raised
+        /// before any data is sent, so callers may safely retry with another port.
+        /// </summary>
+        public class PortBindException : IOException
+        {
+            public int Port { get; private set; }
+
+            public PortBindException(string message, Exception inner, int port)
+                : base(message, inner)
+            {
+                Port = port;
+            }
+        }
+
+        /// <summary>
+        /// Single construction point for transfer clients coming from the UI, so the
+        /// constructor-argument shape is covered by the integration tests too.
+        /// </summary>
+        public static class ClientFactory
+        {
+            public const int ClientBufferSize = 4194304;
+
+            public static TransferClient CreateTcp(string serverIp, int port, string filePath, int srcPort, int speedLimit)
+            {
+                return new TransferClient(serverIp, port, filePath, srcPort, ClientBufferSize, speedLimit);
+            }
+
+            public static TransferUdtClient CreateUdt(string serverIp, int port, string filePath, int srcPort, int speedLimit)
+            {
+                return new TransferUdtClient(serverIp, port, filePath, srcPort, ClientBufferSize, speedLimit);
+            }
+        }
+
         /// <summary>General-purpose utility helpers.</summary>
     public static class Utils
     {

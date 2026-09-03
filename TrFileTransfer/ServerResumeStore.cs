@@ -80,5 +80,26 @@ namespace TrFileTransfer
             string path = GetPath(sessionId);
             try { File.Delete(path); } catch { }
         }
+
+        /// <summary>Deletes orphaned session files older than the given age (clients that never came back).</summary>
+        public static void CleanupStale(int days)
+        {
+            try
+            {
+                if (!Directory.Exists(Dir)) return;
+                DateTime cutoff = DateTime.Now.AddDays(-days);
+                string[] files = Directory.GetFiles(Dir, "*.json");
+                for (int i = 0; i < files.Length; i++)
+                {
+                    try
+                    {
+                        if (File.GetLastWriteTime(files[i]) < cutoff)
+                            File.Delete(files[i]);
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        }
     }
 }

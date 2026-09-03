@@ -303,6 +303,27 @@ namespace TrFileTransfer.Tests
                     ServerResumeStore.Delete(sid);
                 }
             });
+
+            runner.Run("ServerResumeStore_CleanupStale", () =>
+            {
+                var oldSid = Guid.NewGuid();
+                var freshSid = Guid.NewGuid();
+                ServerResumeStore.Save(new ResumeState { SessionId = oldSid, TotalSize = 1, SavePath = @"D:\old.bin" });
+                ServerResumeStore.Save(new ResumeState { SessionId = freshSid, TotalSize = 1, SavePath = @"D:\fresh.bin" });
+                try
+                {
+                    File.SetLastWriteTime(ServerResumeStore.GetPath(oldSid), DateTime.Now.AddDays(-10));
+                    File.SetLastWriteTime(ServerResumeStore.GetPath(freshSid), DateTime.Now.AddDays(-1));
+                    ServerResumeStore.CleanupStale(7);
+                    Assert.False(File.Exists(ServerResumeStore.GetPath(oldSid)), "stale session removed");
+                    Assert.True(File.Exists(ServerResumeStore.GetPath(freshSid)), "fresh session kept");
+                }
+                finally
+                {
+                    ServerResumeStore.Delete(oldSid);
+                    ServerResumeStore.Delete(freshSid);
+                }
+            });
         }
 
         private static void RunL10N(TestRunner runner)

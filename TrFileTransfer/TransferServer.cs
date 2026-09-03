@@ -67,6 +67,7 @@ namespace TrFileTransfer
         public void Start()
         {
             _cts = new CancellationTokenSource();
+            ServerResumeStore.CleanupStale(7); // drop orphaned resume sessions from clients that never returned
             IPAddress bindIp;
             if (!IPAddress.TryParse(_bindAddress, out bindIp))
                 bindIp = IPAddress.Any;

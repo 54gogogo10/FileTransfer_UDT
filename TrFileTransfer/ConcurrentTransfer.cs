@@ -168,16 +168,32 @@ namespace TrFileTransfer
         {
             try
             {
-                int perConn = PerConnectionLimit();
-                if (_isUdt)
+                for (int attempt = 1; ; attempt++)
                 {
-                    var client = new TransferUdtClient(_serverIp, _port, _filePath, localPort, 4194304, perConn);
-                    await client.SendChunkedAsync(offset, size, totalSize);
-                }
-                else
-                {
-                    var client = new TransferClient(_serverIp, _port, _filePath, localPort, 4194304, perConn);
-                    await client.SendChunkedAsync(offset, size, totalSize);
+                    try
+                    {
+                        int perConn = PerConnectionLimit();
+                        if (_isUdt)
+                        {
+                            var client = new TransferUdtClient(_serverIp, _port, _filePath, localPort, 4194304, perConn);
+                            await client.SendChunkedAsync(offset, size, totalSize);
+                        }
+                        else
+                        {
+                            var client = new TransferClient(_serverIp, _port, _filePath, localPort, 4194304, perConn);
+                            await client.SendChunkedAsync(offset, size, totalSize);
+                        }
+                        break;
+                    }
+                    catch (PortBindException ex)
+                    {
+                        // A bind failure happens before any byte is sent — safe to retry on another port
+                        if (attempt >= 3) throw;
+                        localPort = NextBindRetryPort(ex);
+                        if (localPort == 0) throw;
+                        Log(string.Format("Bind port {0} busy (attempt {1}/3), retrying chunk offset={2} on port {3}",
+                            ex.Port, attempt, offset, localPort));
+                    }
                 }
 
                 // Lock-free accumulation: add chunk size atomically, cap at _totalBytes
@@ -197,17 +213,38 @@ namespace TrFileTransfer
 
         private async Task SendFileAsync(string filePath, int localPort)
         {
-            int perConn = PerConnectionLimit();
-            if (_isUdt)
+            for (int attempt = 1; ; attempt++)
             {
-                var client = new TransferUdtClient(_serverIp, _port, filePath, localPort, 4194304, perConn);
-                await client.SendAsync();
+                try
+                {
+                    int perConn = PerConnectionLimit();
+                    if (_isUdt)
+                    {
+                        var client = new TransferUdtClient(_serverIp, _port, filePath, localPort, 4194304, perConn);
+                        await client.SendAsync();
+                    }
+                    else
+                    {
+                        var client = new TransferClient(_serverIp, _port, filePath, localPort, 4194304, perConn);
+                        await client.SendAsync();
+                    }
+                    return;
+                }
+                catch (PortBindException ex)
+                {
+                    if (attempt >= 3) throw;
+                    localPort = NextBindRetryPort(ex);
+                    if (localPort == 0) throw;
+                    Log(string.Format("Bind port {0} busy (attempt {1}/3), retrying {2} on port {3}",
+                        ex.Port, attempt, Path.GetFileName(filePath), localPort));
+                }
             }
-            else
-            {
-                var client = new TransferClient(_serverIp, _port, filePath, localPort, 4194304, perConn);
-                await client.SendAsync();
-            }
+        }
+
+        /// <summary>Picks a replacement source port after a bind race (scan upward from the failed one).</summary>
+        private int NextBindRetryPort(PortBindException ex)
+        {
+            return Utils.FindFreePort(ex.Port + 1, _isUdt);
         }
 
         private int FindLocalPort(int index)

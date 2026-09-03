@@ -1200,9 +1200,7 @@ namespace TrFileTransfer
                 }
                 else if (isTcp)
                 {
-                    _client = srcPort > 0
-                        ? new TransferClient(ip, port, path, srcPort, 4194304, speedLimit)
-                        : new TransferClient(ip, port, path, 0, 4194304, speedLimit);
+                    _client = ClientFactory.CreateTcp(ip, port, path, srcPort, speedLimit);
                     WireClientEvents(_client);
                     if (isFolder)
                         await _client.SendFolderAsync(path);
@@ -1216,9 +1214,7 @@ namespace TrFileTransfer
                 }
                 else
                 {
-                    _clientUdt = srcPort > 0
-                        ? new TransferUdtClient(ip, port, path, srcPort, 4194304, speedLimit)
-                        : new TransferUdtClient(ip, port, path, 0, 4194304, speedLimit);
+                    _clientUdt = ClientFactory.CreateUdt(ip, port, path, srcPort, speedLimit);
                     WireUdtClientEvents(_clientUdt);
                     if (isFolder)
                         await _clientUdt.SendFolderAsync(path);
@@ -1610,9 +1606,7 @@ namespace TrFileTransfer
                 var card = (Panel)this.Invoke((Func<Panel>)(() => CreateTransferCard(_progressPanelC)));
                 if (_rbClientTcp.Checked)
                 {
-                    var client = _monitorSrcPort > 0
-                        ? new TransferClient(ip, port, filePath, _monitorSrcPort, 4194304, _monitorSpeedBytesPerSec)
-                        : new TransferClient(ip, port, filePath, 0, 4194304, _monitorSpeedBytesPerSec);
+                    var client = ClientFactory.CreateTcp(ip, port, filePath, _monitorSrcPort, _monitorSpeedBytesPerSec);
                     client.OnLog += msg => this.Invoke((Action)(() => AddLog(msg)));
                     client.OnProgress += p => this.Invoke((Action)(() => UpdateCardProgress(card, p)));
                     client.OnError += msg => this.Invoke((Action)(() => AddLog(L.MonitorFileSendFailed(fileName, msg))));
@@ -1622,9 +1616,7 @@ namespace TrFileTransfer
                 }
                 else
                 {
-                    var clientUdt = _monitorSrcPort > 0
-                        ? new TransferUdtClient(ip, port, filePath, _monitorSrcPort, 4194304, _monitorSpeedBytesPerSec)
-                        : new TransferUdtClient(ip, port, filePath, 0, 4194304, _monitorSpeedBytesPerSec);
+                    var clientUdt = ClientFactory.CreateUdt(ip, port, filePath, _monitorSrcPort, _monitorSpeedBytesPerSec);
                     clientUdt.OnLog += msg => this.Invoke((Action)(() => AddLog(msg)));
                     clientUdt.OnProgress += p => this.Invoke((Action)(() => UpdateCardProgress(card, p)));
                     clientUdt.OnError += msg => this.Invoke((Action)(() => AddLog(L.MonitorFileSendFailed(fileName, msg))));

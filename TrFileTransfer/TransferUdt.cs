@@ -273,6 +273,7 @@ namespace TrFileTransfer
         public void Start()
         {
             _cts = new CancellationTokenSource();
+            ServerResumeStore.CleanupStale(7); // drop orphaned resume sessions from clients that never returned
             UdtDll.EnsureExtracted();
             if (!UdtNative.UdtStartup())
             {
@@ -1235,7 +1236,8 @@ namespace TrFileTransfer
             {
                 var localAddr = UdtNative.BuildSockaddr("0.0.0.0", _localPort);
                 if (UdtNative.udt_bind(_socket, ref localAddr, UdtNative.SockAddrSize) == UdtNative.ERROR)
-                    throw new Exception("UDT bind to port " + _localPort + " failed: " + UdtNative.GetErrorDesc());
+                    throw new PortBindException(
+                        "UDT bind to port " + _localPort + " failed: " + UdtNative.GetErrorDesc(), null, _localPort);
             }
 
             Log(L.UdtC_Connecting(_serverIp, _port));
