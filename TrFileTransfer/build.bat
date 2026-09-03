@@ -46,6 +46,7 @@ echo.
     Config.cs ^
     Shared.cs ^
     L10N.cs ^
+    WireProtocol.cs ^
     TransferServer.cs ^
     ResumeState.cs ^
     ServerResumeStore.cs ^

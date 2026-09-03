@@ -25,6 +25,7 @@ echo.
     ..\Config.cs ^
     ..\Shared.cs ^
     ..\L10N.cs ^
+    ..\WireProtocol.cs ^
     ..\ConcurrentTransfer.cs ^
     ..\TransferServer.cs ^
     ..\TransferUdt.cs ^

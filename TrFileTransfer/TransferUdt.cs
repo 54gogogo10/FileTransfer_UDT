@@ -1,15 +1,20 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
-using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace TrFileTransfer
 {
+    /// <summary>
+    /// UDT transport. The 0x00-0x03 wire protocol lives in ServerWire / ClientWire
+    /// (shared with TCP); this file holds only the UDT-specific pieces: native
+    /// interop, DLL extraction, socket lifecycle, and the UDT accept/ACK semantics.
+    /// </summary>
     #region UDT Native Interop
 
     internal static class UdtNative
@@ -216,7 +221,7 @@ namespace TrFileTransfer
 
     #region TransferUdtServer
 
-    /// <summary>UDT STREAM file/folder receiver with SHA256 integrity verification.</summary>
+    /// <summary>UDT STREAM file/folder receiver. Protocol handling is shared (ServerWire).</summary>
     public class TransferUdtServer
     {
         private volatile int _socket;
@@ -227,12 +232,8 @@ namespace TrFileTransfer
         private volatile bool _isRunning;
         private bool _startupOk;
         private int _activeClients;
-        private readonly System.Collections.Generic.List<int> _clientSockets
-            = new System.Collections.Generic.List<int>();
-        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, ChunkTracker> _chunkTrackers
-            = new System.Collections.Concurrent.ConcurrentDictionary<string, ChunkTracker>();
-        private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, ResumeState> _udtResumeStates
-            = new System.Collections.Concurrent.ConcurrentDictionary<Guid, ResumeState>();
+        private readonly List<int> _clientSockets = new List<int>();
+        private readonly ServerWireContext _wire = new ServerWireContext();
 
         /// <summary>Fired for every log message.</summary>
         public event Action<string> OnLog;
@@ -267,6 +268,24 @@ namespace TrFileTransfer
             _bindAddress = bindAddress;
             _port = port;
             _saveDirectory = saveDirectory;
+            _wire.SaveDirectory = saveDirectory;
+            _wire.Cb.Log = Log;
+            _wire.Cb.Progress = delegate(TransferProgress p)
+            {
+                var h = OnProgress; if (h != null) h(p);
+            };
+            _wire.Cb.Error = delegate(string msg)
+            {
+                var h = OnError; if (h != null) h(msg);
+            };
+            _wire.Cb.Complete = delegate
+            {
+                var h = OnTransferComplete; if (h != null) h();
+            };
+            _wire.Cb.FileReceived = delegate(string path, long size)
+            {
+                var h = OnFileReceived; if (h != null) h(path, size);
+            };
         }
 
         /// <summary>Starts listening for incoming connections. Fires OnStarted on success.</summary>
@@ -348,25 +367,8 @@ namespace TrFileTransfer
                 try { UdtNative.udt_close(_socket); } catch { }
                 _socket = -1;
             }
-            // Clean up incomplete chunk trackers
-            foreach (var kv in _chunkTrackers)
-            {
-                ChunkTracker removed;
-                _chunkTrackers.TryRemove(kv.Key, out removed);
-                try { kv.Value.Dispose(); } catch { }
-            }
-            // Persist incomplete resume states before releasing file handles
-            foreach (var kv in _udtResumeStates)
-            {
-                try
-                {
-                    if (kv.Value.WriteStream != null) kv.Value.WriteStream.Flush();
-                    ServerResumeStore.Save(kv.Value);
-                    if (kv.Value.WriteStream != null) { kv.Value.WriteStream.Dispose(); kv.Value.WriteStream = null; }
-                }
-                catch { }
-            }
-            _udtResumeStates.Clear();
+            // Persist incomplete resume sessions and dispose chunk trackers
+            _wire.Shutdown();
             // Close all active client sockets so HandleClient tasks unblock immediately
             lock (_clientSockets)
             {
@@ -438,42 +440,28 @@ namespace TrFileTransfer
                 var ch = OnClientProgress; if (ch != null) ch(clientEp, p);
             };
             OnProgress += clientProgress;
-            bool completed = false;
 
+            var ws = new UdtWireStream(clientSocket, true);
             try
             {
-                var typeBuf = new byte[1];
-                if (await UdtIo.UdtReadExactAsync(clientSocket, typeBuf, 0, 1, ct) == 0) return;
-                byte transferType = typeBuf[0];
+                WireOutcome outcome = await ServerWire.HandleClientAsync(ws, _wire, ct).ConfigureAwait(false);
 
-                if (transferType == 0x01)
-                    completed = await HandleFolderTransfer(clientSocket, ct);
-                else if (transferType == 0x02)
+                if (outcome.IsChunked)
                 {
-                    bool fileComplete = await HandleChunkedFile(clientSocket, ct);
-                    // Application-level ACK for this chunk
+                    // Application-level ACK for this chunk. Chunk connections always clean
+                    // up their progress card; assembled-file completion fires separately.
                     var ack2 = new byte[1] { 0x01 };
-                    await Task.Run(() => UdtNative.udt_send(clientSocket, ack2, 1, 0), ct);
-                    // Chunk connection done — always clean up progress card for this endpoint.
-                    // OnTransferComplete fires separately when file is fully assembled.
+                    await Task.Run(() => UdtNative.udt_send(clientSocket, ack2, 1, 0), ct).ConfigureAwait(false);
                     var ccHandler = OnClientTransferComplete;
                     if (ccHandler != null) ccHandler(clientEp);
-                    completed = false; // don't fire again below
                 }
-                else if (transferType == 0x03)
-                {
-                    completed = await HandleResumableFileUdt(clientSocket, ct);
-                }
-                else
-                    completed = await HandleFileTransfer(clientSocket, ct);
-
-                if (completed)
+                else if (outcome.Success)
                 {
                     var ccHandler = OnClientTransferComplete;
                     if (ccHandler != null) ccHandler(clientEp);
-                    // Application-level ACK only on verified success (not chunked — already sent above)
+                    // Application-level ACK only on verified success
                     var ack = new byte[1] { 0x01 };
-                    await Task.Run(() => UdtNative.udt_send(clientSocket, ack, 1, 0), ct);
+                    await Task.Run(() => UdtNative.udt_send(clientSocket, ack, 1, 0), ct).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException) { }
@@ -493,587 +481,9 @@ namespace TrFileTransfer
             {
                 OnProgress -= clientProgress;
                 lock (_clientSockets) { _clientSockets.Remove(clientSocket); }
-                try { UdtNative.udt_close(clientSocket); } catch { }
+                ws.Dispose(); // closes the native socket, unblocking pending I/O
                 System.Threading.Interlocked.Decrement(ref _activeClients);
             }
-        }
-
-        private async Task<bool> HandleFileTransfer(int clientSocket, CancellationToken ct)
-        {
-            var headerBuf = new byte[12];
-            if (await UdtIo.UdtReadExactAsync(clientSocket, headerBuf, 0, 12, ct) == 0) return false;
-
-            long fileSize = BitConverter.ToInt64(headerBuf, 0);
-            int nameLen = BitConverter.ToInt32(headerBuf, 8);
-
-            if (fileSize < 0 || nameLen <= 0 || nameLen > 4096)
-            {
-                Log(L.S_InvalidHeader(fileSize, nameLen));
-                return false;
-            }
-
-            var nameBuf = new byte[nameLen];
-            if (await UdtIo.UdtReadExactAsync(clientSocket, nameBuf, 0, nameLen, ct) == 0) return false;
-            string fileName = System.Text.Encoding.UTF8.GetString(nameBuf);
-
-            fileName = Path.GetFileName(fileName);
-            if (string.IsNullOrWhiteSpace(fileName))
-                fileName = L.S_ReceivedFile;
-
-            string savePath = Utils.GetUniqueSavePath(_saveDirectory, fileName);
-
-            Log(L.S_Receiving(fileName, Utils.FormatSize(fileSize)));
-
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            bool hashOk = await ReceiveFilePayload(clientSocket, savePath, fileSize, fileName, ct);
-            sw.Stop();
-
-            if (hashOk)
-            {
-                Log(L.S_TransferDone(fileName, Utils.FormatSize(fileSize),
-                    sw.Elapsed.TotalSeconds,
-                    Utils.FormatSize((long)(fileSize / Math.Max(sw.Elapsed.TotalSeconds, 0.001)))));
-                var completeHandler = OnTransferComplete;
-                if (completeHandler != null) completeHandler();
-                RaiseFileReceived(savePath, fileSize);
-                return true;
-            }
-            return false;
-        }
-
-        private void RaiseFileReceived(string path, long size)
-        {
-            var handler = OnFileReceived;
-            if (handler != null) handler(path, size);
-        }
-
-        private async Task<bool> HandleFolderTransfer(int clientSocket, CancellationToken ct)
-        {
-            var folderHeaderBuf = new byte[2];
-            if (await UdtIo.UdtReadExactAsync(clientSocket, folderHeaderBuf, 0, 2, ct) == 0) return false;
-            int folderNameLen = BitConverter.ToInt16(folderHeaderBuf, 0);
-            if (folderNameLen <= 0 || folderNameLen > 4096) return false;
-
-            var folderNameBuf = new byte[folderNameLen];
-            if (await UdtIo.UdtReadExactAsync(clientSocket, folderNameBuf, 0, folderNameLen, ct) == 0) return false;
-            string folderName = System.Text.Encoding.UTF8.GetString(folderNameBuf);
-            folderName = Path.GetFileName(folderName);
-            if (string.IsNullOrWhiteSpace(folderName))
-                folderName = "received_folder";
-
-            var fileCountBuf = new byte[4];
-            if (await UdtIo.UdtReadExactAsync(clientSocket, fileCountBuf, 0, 4, ct) == 0) return false;
-            int fileCount = BitConverter.ToInt32(fileCountBuf, 0);
-            if (fileCount <= 0) return false;
-
-            string folderSaveDir = Utils.GetUniqueSavePath(_saveDirectory, folderName);
-            Directory.CreateDirectory(folderSaveDir);
-
-            Log(L.S_ReceivingFolder(folderName, fileCount, "..."));
-
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            long totalSize = 0;
-            int filesReceived = 0;
-
-            var fileHeaderBuf = new byte[10];
-            for (int i = 0; i < fileCount && !ct.IsCancellationRequested; i++)
-            {
-                if (await UdtIo.UdtReadExactAsync(clientSocket, fileHeaderBuf, 0, 10, ct) == 0) return false;
-                long fileSize = BitConverter.ToInt64(fileHeaderBuf, 0);
-                int pathLen = BitConverter.ToInt16(fileHeaderBuf, 8);
-                if (fileSize < 0 || pathLen <= 0 || pathLen > 4096) return false;
-
-                var pathBuf = new byte[pathLen];
-                if (await UdtIo.UdtReadExactAsync(clientSocket, pathBuf, 0, pathLen, ct) == 0) return false;
-                string relativePath = System.Text.Encoding.UTF8.GetString(pathBuf);
-                relativePath = Utils.SanitizeRelativePath(relativePath);
-
-                string savePath = Path.Combine(folderSaveDir, relativePath);
-                string dir = Path.GetDirectoryName(savePath);
-                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                    Directory.CreateDirectory(dir);
-
-                bool hashOk = await ReceiveFilePayload(clientSocket, savePath, fileSize, relativePath, ct);
-                if (!hashOk) return false;
-                RaiseFileReceived(savePath, fileSize);
-
-                totalSize += fileSize;
-                filesReceived++;
-
-                var progressHandler = OnProgress;
-                if (progressHandler != null)
-                    progressHandler(new TransferProgress
-                    {
-                        BytesTransferred = filesReceived,
-                        TotalBytes = fileCount,
-                        SpeedBytesPerSecond = (totalSize > 0 ? totalSize : 0) / sw.Elapsed.TotalSeconds,
-                        Elapsed = sw.Elapsed,
-                        FileName = folderName
-                    });
-            }
-
-            sw.Stop();
-            Log(L.S_FolderTransferDone(folderName, fileCount, Utils.FormatSize(totalSize),
-                sw.Elapsed.TotalSeconds,
-                Utils.FormatSize((long)(totalSize / Math.Max(sw.Elapsed.TotalSeconds, 0.001)))));
-
-            var completeHandler = OnTransferComplete;
-            if (completeHandler != null) completeHandler();
-            return true;
-        }
-
-        private async Task<bool> HandleChunkedFile(int clientSocket, CancellationToken ct)
-        {
-            var chunkHeader = new byte[28];
-            if (await UdtIo.UdtReadExactAsync(clientSocket, chunkHeader, 0, 28, ct) == 0) return false;
-            long totalSize = BitConverter.ToInt64(chunkHeader, 0);
-            long chunkOffset = BitConverter.ToInt64(chunkHeader, 8);
-            long chunkSize = BitConverter.ToInt64(chunkHeader, 16);
-            int nameLen = BitConverter.ToInt32(chunkHeader, 24);
-            if (nameLen <= 0 || nameLen > 4096 || totalSize <= 0 || chunkOffset < 0 || chunkSize <= 0) return false;
-
-            var nameBuf = new byte[nameLen];
-            if (await UdtIo.UdtReadExactAsync(clientSocket, nameBuf, 0, nameLen, ct) == 0) return false;
-            string fileName = System.Text.Encoding.UTF8.GetString(nameBuf);
-            fileName = Path.GetFileName(fileName);
-
-            // Stream chunk data through a fixed buffer — no giant array allocation
-            const int BufSize = 4194304; // 4 MB
-            var buf = new byte[BufSize];
-            var tracker = ChunkTracker.GetOrCreate(_chunkTrackers, fileName, totalSize, _saveDirectory);
-
-            bool isComplete = false;
-            using (var sha256 = SHA256.Create())
-            {
-                long remaining = chunkSize;
-                long writeOffset = chunkOffset;
-                while (remaining > 0 && !ct.IsCancellationRequested)
-                {
-                    int toRead = (int)Math.Min(remaining, (long)BufSize);
-                    if (await UdtIo.UdtReadExactAsync(clientSocket, buf, 0, toRead, ct) == 0) return false;
-                    sha256.TransformBlock(buf, 0, toRead, null, 0);
-                    isComplete = tracker.WriteChunk(writeOffset, buf, toRead);
-                    writeOffset += toRead;
-                    remaining -= toRead;
-                }
-                sha256.TransformFinalBlock(Utils.EmptyBytes, 0, 0);
-
-                var receivedHash = new byte[32];
-                if (await UdtIo.UdtReadExactAsync(clientSocket, receivedHash, 0, 32, ct) == 0) return false;
-                if (!Utils.ConstantTimeEquals(receivedHash, sha256.Hash))
-                {
-                    Log(L.S_HashFailed(fileName));
-                    return false;
-                }
-            }
-            Log("Chunk: " + fileName + " offset=" + chunkOffset + " size=" + chunkSize);
-
-            // Report aggregate progress across all chunks
-            var progressHandler = OnProgress;
-            if (progressHandler != null)
-            {
-                long saved = tracker.BytesReceived;
-                progressHandler(new TransferProgress
-                {
-                    BytesTransferred = saved,
-                    TotalBytes = totalSize,
-                    SpeedBytesPerSecond = 0,
-                    Elapsed = TimeSpan.Zero,
-                    FileName = fileName
-                });
-            }
-
-            if (isComplete)
-            {
-                ChunkTracker removed;
-                _chunkTrackers.TryRemove(fileName, out removed);
-                if (tracker != null) tracker.Dispose();
-                Log(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0, ""));
-                var completeHandler = OnTransferComplete;
-                if (completeHandler != null) completeHandler();
-                if (tracker != null) RaiseFileReceived(tracker.SavePath, totalSize);
-                return true;
-            }
-            return false;
-        }
-
-        private async Task<bool> HandleResumableFileUdt(int clientSocket, CancellationToken ct)
-        {
-            // Read header: sessionId(16) + totalSize(8) + clientOffset(8) + nameLen(4) = 36
-            var headerBuf = new byte[36];
-            if (await UdtIo.UdtReadExactAsync(clientSocket, headerBuf, 0, 36, ct) == 0)
-                return false;
-
-            var sidBytes = new byte[16];
-            Buffer.BlockCopy(headerBuf, 0, sidBytes, 0, 16);
-            var sessionId = new Guid(sidBytes);
-            long totalSize = BitConverter.ToInt64(headerBuf, 16);
-            long clientOffset = BitConverter.ToInt64(headerBuf, 24);
-            int nameLen = BitConverter.ToInt32(headerBuf, 32);
-
-            if (totalSize <= 0 || clientOffset < 0 || clientOffset > totalSize || nameLen <= 0 || nameLen > 4096)
-            {
-                Log(L.S_InvalidHeader(totalSize, nameLen));
-                return false;
-            }
-
-            var nameBuf = new byte[nameLen];
-            await UdtIo.UdtReadExactAsync(clientSocket, nameBuf, 0, nameLen, ct);
-            string fileName = System.Text.Encoding.UTF8.GetString(nameBuf);
-            fileName = Path.GetFileName(fileName);
-
-            // Optional full-file hash verification extension: [verifyFlag(1) + fullHash(32)]
-            var flagBuf = new byte[1];
-            await UdtIo.UdtReadExactAsync(clientSocket, flagBuf, 0, 1, ct);
-            byte[] expectedFullHash = null;
-            if (flagBuf[0] == 1)
-            {
-                expectedFullHash = new byte[32];
-                await UdtIo.UdtReadExactAsync(clientSocket, expectedFullHash, 0, 32, ct);
-            }
-
-            // Session is ours from here: persist incomplete state on the way out
-            // (connection drop / server restart) and clear it once complete/discarded.
-            try
-            {
-                return await HandleResumableCoreUdt(clientSocket, ct, sessionId, totalSize, clientOffset, fileName, expectedFullHash).ConfigureAwait(false);
-            }
-            finally
-            {
-                // Save only — never Delete here: Stop() may have already saved and
-                // cleared the dict, and blindly deleting would lose the checkpoint.
-                ResumeState st;
-                if (_udtResumeStates.TryGetValue(sessionId, out st))
-                {
-                    // Flush so the persisted ReceivedBytes always matches what is on disk
-                    try { if (st.WriteStream != null) st.WriteStream.Flush(); } catch { }
-                    ServerResumeStore.Save(st);
-                }
-            }
-        }
-
-        private async Task<bool> HandleResumableCoreUdt(int clientSocket, CancellationToken ct,
-            Guid sessionId, long totalSize, long clientOffset, string fileName, byte[] expectedFullHash)
-        {
-            ResumeState state;
-            byte status;
-            long resumeFrom;
-            bool isNew;
-
-            if (!_udtResumeStates.TryGetValue(sessionId, out state))
-            {
-                // No in-memory state: try to recover from a previous server run.
-                var disk = ServerResumeStore.Load(sessionId);
-                if (disk != null && disk.TotalSize == totalSize
-                    && !string.IsNullOrEmpty(disk.SavePath) && File.Exists(disk.SavePath)
-                    && disk.ReceivedBytes >= 0 && disk.ReceivedBytes < totalSize)
-                {
-                    var fi = new FileInfo(disk.SavePath);
-                    if (fi.Length == totalSize)
-                    {
-                        try
-                        {
-                            disk.WriteStream = new FileStream(disk.SavePath, FileMode.Open, FileAccess.Write,
-                                FileShare.None, 4096, FileOptions.RandomAccess);
-                            disk.WriteStream.Seek(disk.ReceivedBytes, SeekOrigin.Begin);
-                            if (_udtResumeStates.TryAdd(sessionId, disk))
-                            {
-                                state = disk;
-                                isNew = false;
-                                resumeFrom = disk.ReceivedBytes;
-                                status = 1;
-                                Log(string.Format("Resume: restored server state for session {0} at offset {1}",
-                                    sessionId.ToString("N"), disk.ReceivedBytes));
-                                goto HaveState;
-                            }
-                            disk.WriteStream.Dispose();
-                        }
-                        catch (IOException)
-                        {
-                            try { disk.WriteStream.Dispose(); } catch { }
-                        }
-                        ServerResumeStore.Delete(sessionId);
-                    }
-                    else
-                    {
-                        ServerResumeStore.Delete(sessionId);
-                    }
-                }
-                else if (disk != null)
-                {
-                    ServerResumeStore.Delete(sessionId);
-                }
-
-                isNew = true;
-                state = new ResumeState
-                {
-                    SessionId = sessionId, TotalSize = totalSize,
-                    FileName = fileName, ReceivedBytes = 0
-                };
-                state.SavePath = Utils.GetUniqueSavePath(_saveDirectory, fileName);
-                state.WriteStream = new FileStream(state.SavePath, FileMode.Create, FileAccess.Write,
-                    FileShare.None, 4096, FileOptions.RandomAccess);
-                state.WriteStream.SetLength(totalSize);
-                _udtResumeStates[sessionId] = state;
-                status = 0;
-                resumeFrom = 0;
-                if (clientOffset > 0)
-                {
-                    Log(string.Format("Resume: no server state for session {0}, restarting from 0 (client claimed {1})",
-                        sessionId.ToString("N"), clientOffset));
-                }
-            }
-            else
-            {
-                isNew = false;
-                if (state.TotalSize != totalSize)
-                {
-                    Log(string.Format("Resume size mismatch: session={0} expect={1} got={2}",
-                        sessionId.ToString("N"), state.TotalSize, totalSize));
-                    return false;
-                }
-                if (state.ReceivedBytes >= totalSize)
-                {
-                    // Already complete — send status=2
-                    var doneResp = new byte[10];
-                    doneResp[0] = 0x10;
-                    Buffer.BlockCopy(BitConverter.GetBytes(totalSize), 0, doneResp, 1, 8);
-                    doneResp[9] = 2;
-                    await Task.Run(() => UdtNative.udt_send(clientSocket, doneResp, 10, 0), ct);
-                    return true;
-                }
-                status = 1;
-                resumeFrom = state.ReceivedBytes;
-            }
-
-        HaveState:
-
-            // When the server has no state for this session (e.g. server restarted),
-            // the client's offset claim is NOT trusted — restart from 0 so a fresh
-            // pre-allocated file is never zero-padded behind a stale client offset.
-            long actualStart = isNew ? 0 : Math.Max(clientOffset, resumeFrom);
-            var resp = new byte[10];
-            resp[0] = 0x10;
-            Buffer.BlockCopy(BitConverter.GetBytes(actualStart), 0, resp, 1, 8);
-            resp[9] = status;
-            await Task.Run(() => UdtNative.udt_send(clientSocket, resp, 10, 0), ct);
-
-            Log(string.Format("Resume: {0} offset={1} remaining={2} status={3}",
-                fileName, actualStart, Utils.FormatSize(totalSize - actualStart), status));
-
-            // Receive remaining data + SHA256
-            long remaining = totalSize - actualStart;
-            state.WriteStream.Seek(actualStart, SeekOrigin.Begin);
-            using (var sha256 = System.Security.Cryptography.SHA256.Create())
-            {
-                var buf = new byte[4194304]; // 4 MB
-                long bytesRead = 0;
-                var progressTimer = System.Diagnostics.Stopwatch.StartNew();
-                var elapsedSw = System.Diagnostics.Stopwatch.StartNew();
-                while (bytesRead < remaining)
-                {
-                    int toRead = (int)Math.Min(remaining - bytesRead, (long)buf.Length);
-                    int read = await Task.Run(() => UdtNative.udt_recv(clientSocket, buf, toRead, 0), ct);
-                    if (read == UdtNative.ERROR) return false;
-                    if (read == 0) return false;
-                    sha256.TransformBlock(buf, 0, read, null, 0);
-                    state.WriteStream.Write(buf, 0, read);
-                    bytesRead += read;
-                    state.ReceivedBytes = actualStart + bytesRead;
-
-                    if (progressTimer.ElapsedMilliseconds >= 100)
-                    {
-                        progressTimer.Restart();
-                        var progressHandler = OnProgress;
-                        if (progressHandler != null)
-                        {
-                            progressHandler(new TransferProgress
-                            {
-                                BytesTransferred = state.ReceivedBytes,
-                                TotalBytes = totalSize,
-                                SpeedBytesPerSecond = state.ReceivedBytes / Math.Max(elapsedSw.Elapsed.TotalSeconds, 0.001),
-                                Elapsed = elapsedSw.Elapsed,
-                                FileName = fileName
-                            });
-                        }
-                    }
-                }
-                sha256.TransformFinalBlock(buf, 0, 0);
-                var computedHash = sha256.Hash;
-                var receivedHash = new byte[32];
-                await UdtIo.UdtReadExactAsync(clientSocket, receivedHash, 0, 32, ct);
-
-                if (Utils.ConstantTimeEquals(computedHash, receivedHash))
-                {
-                    // Close the write stream so the file can be re-read for full verification
-                    state.WriteStream.Dispose();
-                    state.WriteStream = null;
-
-                    if (expectedFullHash == null || await VerifyFullHashFileUdt(state.SavePath, expectedFullHash, ct).ConfigureAwait(false))
-                    {
-                        ResumeState removed;
-                        _udtResumeStates.TryRemove(sessionId, out removed);
-                        ServerResumeStore.Delete(sessionId);
-                        Log(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
-                        RaiseFileReceived(state.SavePath, totalSize);
-                        var okResp = new byte[10];
-                        okResp[0] = 0x10;
-                        Buffer.BlockCopy(BitConverter.GetBytes(totalSize), 0, okResp, 1, 8);
-                        okResp[9] = 2;
-                        await Task.Run(() => UdtNative.udt_send(clientSocket, okResp, 10, 0), ct);
-                        return true;
-                    }
-
-                    // Full-file hash mismatch — discard the mixed file and tell the client to retry
-                    ResumeState removedFh;
-                    _udtResumeStates.TryRemove(sessionId, out removedFh);
-                    ServerResumeStore.Delete(sessionId);
-                    try { File.Delete(state.SavePath); } catch { }
-                    Log(L.S_FullHashFailed(fileName));
-                    var errFh = OnError;
-                    if (errFh != null) errFh(L.S_FullHashFailed(fileName));
-                    var badResp = new byte[10];
-                    badResp[0] = 0x10;
-                    Buffer.BlockCopy(BitConverter.GetBytes(totalSize), 0, badResp, 1, 8);
-                    badResp[9] = 3;
-                    await Task.Run(() => UdtNative.udt_send(clientSocket, badResp, 10, 0), ct);
-                    return false;
-                }
-
-                // Hash mismatch — discard server state so a retry starts a fresh file
-                // instead of answering status=2 ("already complete") on a corrupt file.
-                try { state.WriteStream.Dispose(); } catch { }
-                state.WriteStream = null;
-                ResumeState removed2;
-                _udtResumeStates.TryRemove(sessionId, out removed2);
-                ServerResumeStore.Delete(sessionId);
-                Log(L.S_HashFailed(fileName));
-                var errHandler = OnError;
-                if (errHandler != null) errHandler(L.S_HashFailed(fileName));
-            }
-            return false;
-        }
-
-        private static async Task<bool> VerifyFullHashFileUdt(string savePath, byte[] expected, CancellationToken ct)
-        {
-            try
-            {
-                using (var fs = new FileStream(savePath, FileMode.Open, FileAccess.Read,
-                    FileShare.Read, 4194304, FileOptions.SequentialScan))
-                using (var sha = System.Security.Cryptography.SHA256.Create())
-                {
-                    var buf = new byte[4194304];
-                    int read;
-                    while ((read = await fs.ReadAsync(buf, 0, buf.Length, ct).ConfigureAwait(false)) > 0)
-                        sha.TransformBlock(buf, 0, read, null, 0);
-                    sha.TransformFinalBlock(Utils.EmptyBytes, 0, 0);
-                    return Utils.ConstantTimeEquals(expected, sha.Hash);
-                }
-            }
-            catch (IOException) { return false; }
-            catch (UnauthorizedAccessException) { return false; }
-        }
-
-        private async Task<bool> ReceiveFilePayload(int clientSocket, string savePath, long fileSize,
-            string displayName, CancellationToken ct)
-        {
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            long bytesRead = 0;
-            const int BufferSize = 4194304; // 4 MB
-            var bufA = new byte[BufferSize];
-            var bufB = new byte[BufferSize];
-            var progressTimer = System.Diagnostics.Stopwatch.StartNew();
-
-            using (var sha256 = SHA256.Create())
-            using (var fileStream = new FileStream(savePath, FileMode.Create, FileAccess.Write,
-                FileShare.None, 65536, FileOptions.SequentialScan))
-            {
-                if (fileSize == 0)
-                {
-                    // Zero-byte file: no data to read, skip directly to hash verification
-                    sha256.TransformFinalBlock(Utils.EmptyBytes, 0, 0);
-                }
-                else
-                {
-                long remaining = fileSize;
-                int toRead = (int)Math.Min(remaining, (long)bufA.Length);
-                int read = await UdtIo.UdtReadAsync(clientSocket, bufA, 0, toRead, ct);
-                if (read <= 0)
-                    throw new IOException(L.S_ConnClosedPrematurely);
-
-                remaining -= read;
-                var cur = bufA;
-                var nxt = bufB;
-
-                while (remaining > 0 && !ct.IsCancellationRequested)
-                {
-                    int nextToRead = (int)Math.Min(remaining, (long)nxt.Length);
-                    var nextReadTask = UdtIo.UdtReadAsync(clientSocket, nxt, 0, nextToRead, ct);
-
-                    sha256.TransformBlock(cur, 0, read, null, 0);
-                    await fileStream.WriteAsync(cur, 0, read, ct);
-                    bytesRead += read;
-
-                    read = await nextReadTask;
-                    if (read <= 0)
-                        throw new IOException(L.S_ConnClosedPrematurely);
-                    remaining -= read;
-
-                    var tmp = cur; cur = nxt; nxt = tmp;
-
-                    if (progressTimer.ElapsedMilliseconds >= 100 || remaining == 0)
-                    {
-                        progressTimer.Restart();
-                        var progressHandler = OnProgress;
-                        if (progressHandler != null)
-                            progressHandler(new TransferProgress
-                            {
-                                BytesTransferred = bytesRead,
-                                TotalBytes = fileSize,
-                                SpeedBytesPerSecond = bytesRead / sw.Elapsed.TotalSeconds,
-                                Elapsed = sw.Elapsed,
-                                FileName = displayName
-                            });
-                    }
-                }
-
-                sha256.TransformBlock(cur, 0, read, null, 0);
-                await fileStream.WriteAsync(cur, 0, read, ct);
-                bytesRead += read;
-
-                if (progressTimer.ElapsedMilliseconds >= 100 || bytesRead == fileSize)
-                {
-                    progressTimer.Restart();
-                    var progressHandler = OnProgress;
-                    if (progressHandler != null)
-                        progressHandler(new TransferProgress
-                        {
-                            BytesTransferred = bytesRead,
-                            TotalBytes = fileSize,
-                            SpeedBytesPerSecond = bytesRead / sw.Elapsed.TotalSeconds,
-                            Elapsed = sw.Elapsed,
-                            FileName = displayName
-                        });
-                }
-
-                sha256.TransformFinalBlock(Utils.EmptyBytes, 0, 0);
-                }
-                await fileStream.FlushAsync(ct);
-
-                var receivedHash = new byte[32];
-                if (await UdtIo.UdtReadExactAsync(clientSocket, receivedHash, 0, 32, ct) == 0)
-                    return false;
-                var computedHash = sha256.Hash;
-
-                if (!Utils.ConstantTimeEquals(receivedHash, computedHash))
-                {
-                    Log(L.S_HashFailed(displayName));
-                    var errHandler = OnError;
-                    if (errHandler != null) errHandler(L.S_HashFailed(displayName));
-                    return false;
-                }
-            }
-            return true;
         }
 
         private void Log(string msg)
@@ -1086,7 +496,7 @@ namespace TrFileTransfer
 
     #region TransferUdtClient
 
-    /// <summary>UDT STREAM file/folder sender with SHA256 integrity verification.</summary>
+    /// <summary>UDT STREAM file/folder sender. Protocol handling is shared (ClientWire).</summary>
     public class TransferUdtClient
     {
         private int _socket;
@@ -1098,6 +508,7 @@ namespace TrFileTransfer
         private readonly int _localPort;
         private readonly SpeedLimiter _limiter;
         private volatile bool _isRunning;
+        private readonly WireCallbacks _cb = new WireCallbacks();
 
         /// <summary>Fired for every log message.</summary>
         public event Action<string> OnLog;
@@ -1121,7 +532,7 @@ namespace TrFileTransfer
         /// <param name="serverIp">Target server IPv4 address.</param>
         /// <param name="port">Target server port.</param>
         /// <param name="filePath">Path to the file or folder to send.</param>
-        /// <param name="bufferSize">I/O buffer size in bytes (default 1 MB).</param>
+        /// <param name="bufferSize">I/O buffer size in bytes (default 4 MB).</param>
         public TransferUdtClient(string serverIp, int port, string filePath, int bufferSize = 4194304)
             : this(serverIp, port, filePath, 0, bufferSize, 0)
         {
@@ -1142,6 +553,19 @@ namespace TrFileTransfer
             _bufferSize = bufferSize;
             _localPort = localPort;
             _limiter = new SpeedLimiter(maxBytesPerSec);
+            _cb.Log = Log;
+            _cb.Progress = delegate(TransferProgress p)
+            {
+                var h = OnProgress; if (h != null) h(p);
+            };
+            _cb.Error = delegate(string msg)
+            {
+                var h = OnError; if (h != null) h(msg);
+            };
+            _cb.Complete = delegate
+            {
+                var h = OnTransferComplete; if (h != null) h();
+            };
         }
 
         /// <summary>Sends the file specified in the constructor over UDT.</summary>
@@ -1255,348 +679,41 @@ namespace TrFileTransfer
             await UdtIo.WaitForConnectionReady(_socket, ct);
         }
 
-        private async Task SendChunkedInternal(long offset, long chunkSize, long totalSize, CancellationToken ct)
-        {
-            await UdtConnect(ct);
-            var fileInfo = new FileInfo(_filePath);
-            string fileName = fileInfo.Name;
-            byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(fileName);
-
-            // Chunk header: type(1) + totalSize(8) + offset(8) + chunkSize(8) + nameLen(4) + name
-            var header = new byte[1 + 8 + 8 + 8 + 4 + nameBytes.Length];
-            int pos = 0;
-            header[pos++] = 0x02; // chunked file
-            Buffer.BlockCopy(BitConverter.GetBytes(totalSize), 0, header, pos, 8); pos += 8;
-            Buffer.BlockCopy(BitConverter.GetBytes(offset), 0, header, pos, 8); pos += 8;
-            Buffer.BlockCopy(BitConverter.GetBytes(chunkSize), 0, header, pos, 8); pos += 8;
-            Buffer.BlockCopy(BitConverter.GetBytes(nameBytes.Length), 0, header, pos, 4); pos += 4;
-            Buffer.BlockCopy(nameBytes, 0, header, pos, nameBytes.Length);
-            await UdtIo.UdtWriteExactAsync(_socket, header, 0, header.Length, ct);
-
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            await SendFilePayload(_socket, _filePath, chunkSize, fileName, ct, offset);
-            sw.Stop();
-
-            Log(L.C_TransferDone(fileName + " chunk", Utils.FormatSize(chunkSize),
-                sw.Elapsed.TotalSeconds,
-                Utils.FormatSize((long)(chunkSize / Math.Max(sw.Elapsed.TotalSeconds, 0.001)))));
-        }
-
-        private async Task SendResumableUdtInternal(Guid sessionId, CancellationToken ct, bool verifyHash)
-        {
-            ResumeState.EnsureDir();
-            var fileInfo = new FileInfo(_filePath);
-            long fileSize = fileInfo.Length;
-            string fileName = fileInfo.Name;
-            long sentBytes = 0;
-            long sourceMTime;
-            try { sourceMTime = File.GetLastWriteTimeUtc(_filePath).Ticks; }
-            catch { sourceMTime = 0; }
-
-            // Full-file hash for verification (computed up front; only when requested)
-            byte[] fullHash = null;
-            if (verifyHash)
-            {
-                using (var fs = new FileStream(_filePath, FileMode.Open, FileAccess.Read,
-                    FileShare.Read, 4194304, FileOptions.SequentialScan))
-                using (var sha = System.Security.Cryptography.SHA256.Create())
-                    fullHash = sha.ComputeHash(fs);
-                Log(L.C_ComputingFullHash(fileName));
-            }
-
-            var existingState = ResumeState.Load(sessionId);
-            if (existingState != null && existingState.SourceMTime != 0 && existingState.SourceMTime != sourceMTime)
-            {
-                // Source file changed since the interrupted transfer — restart from scratch
-                Log(L.C_ResumeSourceChanged(fileName));
-                ResumeState.Delete(sessionId);
-                existingState = null;
-            }
-            if (existingState != null)
-            {
-                sentBytes = existingState.SentBytes;
-                Log(L.C_Resuming(fileName, sentBytes, Utils.FormatSize(sentBytes)));
-            }
-            else
-            {
-                var newState = new ResumeState
-                {
-                    SessionId = sessionId,
-                    TotalSize = fileSize,
-                    FileName = fileName,
-                    FilePath = _filePath,
-                    ServerIp = _serverIp,
-                    Port = _port,
-                    IsUdt = true,
-                    Created = DateTime.UtcNow,
-                    SentBytes = 0,
-                    SourceMTime = sourceMTime
-                };
-                newState.Save();
-            }
-
-            await UdtConnect(ct).ConfigureAwait(false);
-
-            // Build 0x03 header: type(1) + sessionId(16) + totalSize(8) + offset(8) + nameLen(4) + name
-            // + [verifyFlag(1)] + [fullHash(32)] when verifyHash is enabled. The flag byte is
-            // always present so the server can parse the stream unambiguously.
-            byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(fileName);
-            int extra = 1 + (verifyHash ? 32 : 0);
-            var header = new byte[1 + 16 + 8 + 8 + 4 + nameBytes.Length + extra];
-            int pos = 0;
-            header[pos++] = 0x03;
-            Buffer.BlockCopy(sessionId.ToByteArray(), 0, header, pos, 16); pos += 16;
-            Buffer.BlockCopy(BitConverter.GetBytes(fileSize), 0, header, pos, 8); pos += 8;
-            Buffer.BlockCopy(BitConverter.GetBytes(sentBytes), 0, header, pos, 8); pos += 8;
-            Buffer.BlockCopy(BitConverter.GetBytes(nameBytes.Length), 0, header, pos, 4); pos += 4;
-            Buffer.BlockCopy(nameBytes, 0, header, pos, nameBytes.Length); pos += nameBytes.Length;
-            header[pos++] = verifyHash ? (byte)1 : (byte)0;
-            if (verifyHash)
-                Buffer.BlockCopy(fullHash, 0, header, pos, 32);
-
-            await UdtIo.UdtWriteExactAsync(_socket, header, 0, header.Length, ct).ConfigureAwait(false);
-
-            // Read 0x10 server response (10 bytes)
-            var respBuf = new byte[10];
-            await UdtIo.UdtReadExactAsync(_socket, respBuf, 0, 10, ct).ConfigureAwait(false);
-
-            if (respBuf[0] != 0x10)
-                throw new InvalidDataException(string.Format("Unexpected resume response type: {0}", respBuf[0]));
-
-            byte respStatus = respBuf[9];
-            long serverOffset = BitConverter.ToInt64(respBuf, 1);
-
-            if (respStatus == 3)
-            {
-                // Full-file verification failed on the server — file was discarded.
-                // Keep the local resume state so the transfer can be retried.
-                Log(L.C_VerifyFailed(fileName));
-                var errHandler = OnError;
-                if (errHandler != null) errHandler(L.C_VerifyFailed(fileName));
-                return;
-            }
-
-            if (respStatus == 2)
-            {
-                Log(L.C_AlreadyReceived(fileName));
-                ResumeState.Delete(sessionId);
-                var completeHandler = OnTransferComplete;
-                if (completeHandler != null) completeHandler();
-                return;
-            }
-
-            long actualStart = Math.Max(sentBytes, serverOffset);
-            long remainingSize = fileSize - actualStart;
-            Log(L.C_ResumeNegotiated(actualStart, serverOffset, sentBytes));
-
-            await SendFilePayload(_socket, _filePath, remainingSize, fileName, ct, actualStart).ConfigureAwait(false);
-
-            // Read the final 0x10 response: status 2 = success, 3 = full-file
-            // verification failed (server discarded the file, keep local state).
-            var finalResp = new byte[10];
-            await UdtIo.UdtReadExactAsync(_socket, finalResp, 0, 10, ct).ConfigureAwait(false);
-            if (finalResp[0] != 0x10)
-                throw new InvalidDataException(string.Format("Unexpected resume response type: {0}", finalResp[0]));
-            if (finalResp[9] == 3)
-            {
-                Log(L.C_VerifyFailed(fileName));
-                var errHandler = OnError;
-                if (errHandler != null) errHandler(L.C_VerifyFailed(fileName));
-                return;
-            }
-
-            ResumeState.Delete(sessionId);
-            var ch = OnTransferComplete;
-            if (ch != null) ch();
-        }
-
         private async Task SendFileInternal(CancellationToken ct)
         {
             await UdtConnect(ct);
-            var fileInfo = new FileInfo(_filePath);
-            long fileSize = fileInfo.Length;
-            string fileName = fileInfo.Name;
-            byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(fileName);
-
-            var header = new byte[1 + 12 + nameBytes.Length];
-            header[0] = 0x00;
-            Buffer.BlockCopy(BitConverter.GetBytes(fileSize), 0, header, 1, 8);
-            Buffer.BlockCopy(BitConverter.GetBytes(nameBytes.Length), 0, header, 9, 4);
-            Buffer.BlockCopy(nameBytes, 0, header, 13, nameBytes.Length);
-            await UdtIo.UdtWriteExactAsync(_socket, header, 0, header.Length, ct);
-
-            Log(L.C_Sending(fileName, Utils.FormatSize(fileSize)));
-
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            await SendFilePayload(_socket, _filePath, fileSize, fileName, ct);
-            sw.Stop();
-
-            Log(L.C_TransferDone(fileName, Utils.FormatSize(fileSize),
-                sw.Elapsed.TotalSeconds,
-                Utils.FormatSize((long)(fileSize / Math.Max(sw.Elapsed.TotalSeconds, 0.001)))));
-
-            var completeHandler = OnTransferComplete;
-            if (completeHandler != null) completeHandler();
+            using (var ws = new UdtWireStream(_socket, false))
+            {
+                await ClientWire.SendSingleFileAsync(ws, _filePath, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
+            }
         }
 
         private async Task SendFolderInternal(string folderPath, CancellationToken ct)
         {
             await UdtConnect(ct);
-            string folderName = Path.GetFileName(folderPath);
-            if (string.IsNullOrWhiteSpace(folderName))
-                folderName = "folder";
-            byte[] folderNameBytes = System.Text.Encoding.UTF8.GetBytes(folderName);
-
-            var files = Directory.GetFiles(folderPath, "*", SearchOption.AllDirectories);
-            if (files.Length == 0)
+            using (var ws = new UdtWireStream(_socket, false))
             {
-                Log(L.S_ZeroFiles);
-                var errHandler = OnError;
-                if (errHandler != null) errHandler(L.S_ZeroFiles);
-                return;
+                await ClientWire.SendFolderAsync(ws, folderPath, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
-
-            var fileEntries = new FileEntry[files.Length];
-            long totalSize = 0;
-            for (int i = 0; i < files.Length; i++)
-            {
-                var fi = new FileInfo(files[i]);
-                long size = fi.Length;
-                fileEntries[i] = new FileEntry
-                {
-                    Path = files[i],
-                    Size = size,
-                    RelativePath = files[i].Substring(folderPath.Length).TrimStart('\\', '/')
-                };
-                totalSize += size;
-            }
-
-            Log(L.C_SendingFolder(folderName, files.Length, Utils.FormatSize(totalSize)));
-
-            var header = new byte[1 + 2 + folderNameBytes.Length + 4];
-            int pos = 0;
-            header[pos++] = 0x01;
-            Buffer.BlockCopy(BitConverter.GetBytes((short)folderNameBytes.Length), 0, header, pos, 2); pos += 2;
-            Buffer.BlockCopy(folderNameBytes, 0, header, pos, folderNameBytes.Length); pos += folderNameBytes.Length;
-            Buffer.BlockCopy(BitConverter.GetBytes(files.Length), 0, header, pos, 4);
-            await UdtIo.UdtWriteExactAsync(_socket, header, 0, header.Length, ct);
-
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            long totalSent = 0;
-
-            foreach (var entry in fileEntries)
-            {
-                if (ct.IsCancellationRequested) break;
-
-                byte[] relPathBytes = System.Text.Encoding.UTF8.GetBytes(entry.RelativePath);
-                var fileHeader = new byte[8 + 2 + relPathBytes.Length];
-                Buffer.BlockCopy(BitConverter.GetBytes(entry.Size), 0, fileHeader, 0, 8);
-                Buffer.BlockCopy(BitConverter.GetBytes((short)relPathBytes.Length), 0, fileHeader, 8, 2);
-                Buffer.BlockCopy(relPathBytes, 0, fileHeader, 10, relPathBytes.Length);
-                await UdtIo.UdtWriteExactAsync(_socket, fileHeader, 0, fileHeader.Length, ct);
-
-                await SendFilePayload(_socket, entry.Path, entry.Size, entry.RelativePath, ct);
-                totalSent += entry.Size;
-
-                var progressHandler = OnProgress;
-                if (progressHandler != null)
-                    progressHandler(new TransferProgress
-                    {
-                        BytesTransferred = totalSent,
-                        TotalBytes = totalSize,
-                        SpeedBytesPerSecond = totalSent / sw.Elapsed.TotalSeconds,
-                        Elapsed = sw.Elapsed,
-                        FileName = folderName
-                    });
-            }
-
-            sw.Stop();
-            Log(L.C_FolderTransferDone(folderName, files.Length, Utils.FormatSize(totalSize),
-                sw.Elapsed.TotalSeconds,
-                Utils.FormatSize((long)(totalSize / Math.Max(sw.Elapsed.TotalSeconds, 0.001)))));
-
-            var completeHandler = OnTransferComplete;
-            if (completeHandler != null) completeHandler();
         }
 
-        private async Task SendFilePayload(int clientSocket, string filePath, long fileSize,
-            string displayName, CancellationToken ct, long fileOffset = 0)
+        private async Task SendChunkedInternal(long offset, long chunkSize, long totalSize, CancellationToken ct)
         {
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            long bytesSent = 0;
-            var bufA = new byte[_bufferSize];
-            var bufB = new byte[_bufferSize];
-            var progressTimer = System.Diagnostics.Stopwatch.StartNew();
-
-            using (var sha256 = SHA256.Create())
-            using (var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read,
-                FileShare.Read, 65536, FileOptions.SequentialScan))
+            await UdtConnect(ct);
+            using (var ws = new UdtWireStream(_socket, false))
             {
-                if (fileOffset > 0)
-                    fileStream.Seek(fileOffset, SeekOrigin.Begin);
+                await ClientWire.SendChunkAsync(ws, _filePath, offset, chunkSize, totalSize,
+                    _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
+            }
+        }
 
-                long remaining = fileSize;
-                if (remaining == 0)
-                {
-                    sha256.TransformFinalBlock(Utils.EmptyBytes, 0, 0);
-                    await UdtIo.UdtWriteExactAsync(clientSocket, sha256.Hash, 0, 32, ct);
-                    return;
-                }
-
-                int toRead = (int)Math.Min(remaining, (long)bufA.Length);
-                int read = await fileStream.ReadAsync(bufA, 0, toRead, ct);
-                if (read <= 0)
-                {
-                    sha256.TransformFinalBlock(Utils.EmptyBytes, 0, 0);
-                    await UdtIo.UdtWriteExactAsync(clientSocket, sha256.Hash, 0, 32, ct);
-                    return;
-                }
-                remaining -= read;
-
-                var cur = bufA;
-                var nxt = bufB;
-
-                while (remaining > 0 && !ct.IsCancellationRequested)
-                {
-                    int nextToRead = (int)Math.Min(remaining, (long)nxt.Length);
-                    var nextReadTask = fileStream.ReadAsync(nxt, 0, nextToRead, ct);
-
-                    sha256.TransformBlock(cur, 0, read, null, 0);
-                    await UdtIo.UdtWriteExactAsync(clientSocket, cur, 0, read, ct);
-                    bytesSent += read;
-                    _limiter.Throttle(read);
-
-                    read = await nextReadTask;
-                    if (read <= 0) break;
-                    remaining -= read;
-
-                    var tmp = cur; cur = nxt; nxt = tmp;
-
-                    if (progressTimer.ElapsedMilliseconds >= 100 || remaining == 0)
-                    {
-                        progressTimer.Restart();
-                        var handler = OnProgress;
-                        if (handler != null)
-                            handler(new TransferProgress
-                            {
-                                BytesTransferred = bytesSent,
-                                TotalBytes = fileSize,
-                                SpeedBytesPerSecond = bytesSent / sw.Elapsed.TotalSeconds,
-                                Elapsed = sw.Elapsed,
-                                FileName = displayName
-                            });
-                    }
-                }
-
-                if (read > 0)
-                {
-                    sha256.TransformBlock(cur, 0, read, null, 0);
-                    await UdtIo.UdtWriteExactAsync(clientSocket, cur, 0, read, ct);
-                    bytesSent += read;
-                    _limiter.Throttle(read);
-                }
-                sha256.TransformFinalBlock(Utils.EmptyBytes, 0, 0);
-                await UdtIo.UdtWriteExactAsync(clientSocket, sha256.Hash, 0, 32, ct);
+        private async Task SendResumableUdtInternal(Guid sessionId, CancellationToken ct, bool verifyHash)
+        {
+            await UdtConnect(ct);
+            using (var ws = new UdtWireStream(_socket, false))
+            {
+                await ClientWire.SendResumableAsync(ws, _filePath, sessionId, verifyHash,
+                    _serverIp, _port, true, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
         }
 
