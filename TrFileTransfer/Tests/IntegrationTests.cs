@@ -36,6 +36,13 @@ namespace TrFileTransfer.Tests
             return 0;
         }
 
+        private static string TempBase()
+        {
+            // Historical scratch root when present; %TEMP% keeps the suite portable (e.g. CI)
+            if (Directory.Exists(@"D:\cc")) return @"D:\cc\tmp";
+            return Path.GetTempPath();
+        }
+
         public static void RunAll(TestRunner runner)
         {
             runner.Run("Integration_TCP_SingleFile", TcpSingleFile);
@@ -70,8 +77,8 @@ namespace TrFileTransfer.Tests
         private static void TcpSingleFile()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_it_send_" + Guid.NewGuid().ToString("N"));
-            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_it_recv_" + Guid.NewGuid().ToString("N"));
+            string sendDir = Path.Combine(TempBase(), "tr_it_send_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_it_recv_" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -136,8 +143,8 @@ namespace TrFileTransfer.Tests
         private static void TcpFolder()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_it_fsend_" + Guid.NewGuid().ToString("N"));
-            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_it_frecv_" + Guid.NewGuid().ToString("N"));
+            string sendDir = Path.Combine(TempBase(), "tr_it_fsend_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_it_frecv_" + Guid.NewGuid().ToString("N"));
             string folderPath = Path.Combine(sendDir, "myFolder");
             Directory.CreateDirectory(folderPath);
 
@@ -206,8 +213,8 @@ namespace TrFileTransfer.Tests
         private static void UdtSingleFile()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_it_udt_s_" + Guid.NewGuid().ToString("N"));
-            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_it_udt_r_" + Guid.NewGuid().ToString("N"));
+            string sendDir = Path.Combine(TempBase(), "tr_it_udt_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_it_udt_r_" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -274,8 +281,8 @@ namespace TrFileTransfer.Tests
             long fileSizeMB, int timeoutSec)
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", prefix + "_s_" + Guid.NewGuid().ToString("N"));
-            string recvDir = Path.Combine(@"D:\cc\tmp", prefix + "_r_" + Guid.NewGuid().ToString("N"));
+            string sendDir = Path.Combine(TempBase(), prefix + "_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), prefix + "_r_" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -423,8 +430,8 @@ namespace TrFileTransfer.Tests
         private static void TcpResumeSingleFile()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_rs_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
-            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_rs_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string sendDir = Path.Combine(TempBase(), "tr_rs_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(TempBase(), "tr_rs_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -512,8 +519,8 @@ namespace TrFileTransfer.Tests
         private static void TcpResumeInterrupted()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_ri_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
-            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_ri_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string sendDir = Path.Combine(TempBase(), "tr_ri_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(TempBase(), "tr_ri_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -664,8 +671,8 @@ namespace TrFileTransfer.Tests
         private static void TcpResumeAcrossRestart()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_rr_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
-            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_rr_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string sendDir = Path.Combine(TempBase(), "tr_rr_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(TempBase(), "tr_rr_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -825,8 +832,8 @@ namespace TrFileTransfer.Tests
         private static void TcpResumeFullHashCorrupt()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_fh_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
-            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_fh_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string sendDir = Path.Combine(TempBase(), "tr_fh_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(TempBase(), "tr_fh_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -961,8 +968,8 @@ namespace TrFileTransfer.Tests
         private static void TcpRateLimit()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_rl_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
-            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_rl_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string sendDir = Path.Combine(TempBase(), "tr_rl_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(TempBase(), "tr_rl_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -971,7 +978,7 @@ namespace TrFileTransfer.Tests
             {
                 var testFile = Path.Combine(sendDir, "rate_test.bin");
                 var rng = new Random(42);
-                var content = new byte[1024 * 1024 * 8]; // 8 MB
+                var content = new byte[1024 * 1024 * 6]; // 6 MB
                 rng.NextBytes(content);
                 File.WriteAllBytes(testFile, content);
 
@@ -1008,10 +1015,10 @@ namespace TrFileTransfer.Tests
                     throw new Exception("Client transfer failed");
                 sw.Stop();
 
-                // 8 MB at 512 KB/s = 16 s nominal; allow generous slack (limit applies
+                // 6 MB at 512 KB/s = 12 s nominal; allow generous slack (limit applies
                 // per send-chunk so the total is always at or above the limit)
-                Assert.True(sw.Elapsed.TotalSeconds >= 10.0,
-                    "rate-limited transfer took " + sw.Elapsed.TotalSeconds.ToString("F1") + "s (expected >= 10s)");
+                Assert.True(sw.Elapsed.TotalSeconds >= 8.0,
+                    "rate-limited transfer took " + sw.Elapsed.TotalSeconds.ToString("F1") + "s (expected >= 8s)");
 
                 Thread.Sleep(300);
                 var receivedFile = Path.Combine(recvDir, "rate_test.bin");
@@ -1062,8 +1069,8 @@ namespace TrFileTransfer.Tests
         private static void UdtResumeAcrossRestart()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_urr_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
-            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_urr_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string sendDir = Path.Combine(TempBase(), "tr_urr_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(TempBase(), "tr_urr_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -1220,8 +1227,8 @@ namespace TrFileTransfer.Tests
         private static void UdtResumeFullHashCorrupt()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_ufh_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
-            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_ufh_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string sendDir = Path.Combine(TempBase(), "tr_ufh_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(TempBase(), "tr_ufh_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -1370,8 +1377,8 @@ namespace TrFileTransfer.Tests
         private static void UdtFolder()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_uf_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
-            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_uf_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string sendDir = Path.Combine(TempBase(), "tr_uf_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(TempBase(), "tr_uf_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             string folderPath = Path.Combine(sendDir, "udtFolder");
             Directory.CreateDirectory(Path.Combine(folderPath, "sub"));
 
@@ -1439,8 +1446,8 @@ namespace TrFileTransfer.Tests
         private static void TcpEmptyFile()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_te_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
-            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_te_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string sendDir = Path.Combine(TempBase(), "tr_te_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(TempBase(), "tr_te_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -1499,8 +1506,8 @@ namespace TrFileTransfer.Tests
         private static void UdtEmptyFile()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_ue_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
-            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_ue_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string sendDir = Path.Combine(TempBase(), "tr_ue_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(TempBase(), "tr_ue_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -1557,8 +1564,8 @@ namespace TrFileTransfer.Tests
         private static void TcpChineseName()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_cn_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
-            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_cn_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string sendDir = Path.Combine(TempBase(), "tr_cn_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(TempBase(), "tr_cn_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -1618,7 +1625,7 @@ namespace TrFileTransfer.Tests
         private static void TcpConnectRefused()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_cr_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string sendDir = Path.Combine(TempBase(), "tr_cr_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(sendDir);
 
             try
@@ -1650,7 +1657,7 @@ namespace TrFileTransfer.Tests
         {
             int port = FindFreePort();
 
-            var client = new TransferClient("127.0.0.1", port, @"D:\cc\tmp\no_such_file_xyz.bin");
+            var client = new TransferClient("127.0.0.1", port, Path.Combine(TempBase(), "no_such_file_xyz.bin"));
             var clientDone = new ManualResetEvent(false);
             bool clientError = false;
             client.OnError += msg => { clientError = true; clientDone.Set(); };
@@ -1667,8 +1674,8 @@ namespace TrFileTransfer.Tests
         private static void TcpMultiClient()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_mc_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
-            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_mc_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string sendDir = Path.Combine(TempBase(), "tr_mc_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(TempBase(), "tr_mc_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -1738,8 +1745,8 @@ namespace TrFileTransfer.Tests
         private static void UdtRateLimit()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_ur_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
-            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_ur_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string sendDir = Path.Combine(TempBase(), "tr_ur_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(TempBase(), "tr_ur_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -1748,7 +1755,7 @@ namespace TrFileTransfer.Tests
             {
                 var testFile = Path.Combine(sendDir, "rate_udt.bin");
                 var rng = new Random(42);
-                var content = new byte[1024 * 1024 * 4]; // 4 MB at 256 KB/s ≈ 16 s
+                var content = new byte[1024 * 1024 * 3]; // 3 MB at 256 KB/s ≈ 12 s
                 rng.NextBytes(content);
                 File.WriteAllBytes(testFile, content);
 
@@ -1784,8 +1791,8 @@ namespace TrFileTransfer.Tests
                     throw new Exception("UDT client transfer failed");
                 sw.Stop();
 
-                Assert.True(sw.Elapsed.TotalSeconds >= 10.0,
-                    "rate-limited UDT transfer took " + sw.Elapsed.TotalSeconds.ToString("F1") + "s (expected >= 10s)");
+                Assert.True(sw.Elapsed.TotalSeconds >= 8.0,
+                    "rate-limited UDT transfer took " + sw.Elapsed.TotalSeconds.ToString("F1") + "s (expected >= 8s)");
 
                 Thread.Sleep(300);
                 var receivedFile = Path.Combine(recvDir, "rate_udt.bin");
@@ -1804,8 +1811,8 @@ namespace TrFileTransfer.Tests
         private static void UdtResumeSingleFile()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_ur_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
-            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_ur_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string sendDir = Path.Combine(TempBase(), "tr_ur_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(TempBase(), "tr_ur_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -1898,8 +1905,8 @@ namespace TrFileTransfer.Tests
         private static void FactoryTcp()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_fc_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
-            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_fc_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string sendDir = Path.Combine(TempBase(), "tr_fc_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(TempBase(), "tr_fc_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -1957,8 +1964,8 @@ namespace TrFileTransfer.Tests
         private static void FactoryUdt()
         {
             int port = FindFreePort();
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_fu_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
-            string recvDir = Path.Combine(@"D:\cc\tmp", "tr_fu_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string sendDir = Path.Combine(TempBase(), "tr_fu_s_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(TempBase(), "tr_fu_r_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(sendDir);
             Directory.CreateDirectory(recvDir);
 
@@ -2014,7 +2021,7 @@ namespace TrFileTransfer.Tests
 
         private static void TcpBindInUseTyped()
         {
-            string sendDir = Path.Combine(@"D:\cc\tmp", "tr_bi_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string sendDir = Path.Combine(TempBase(), "tr_bi_" + Guid.NewGuid().ToString("N").Substring(0, 8));
             Directory.CreateDirectory(sendDir);
             try
             {

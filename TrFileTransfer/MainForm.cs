@@ -102,6 +102,16 @@ namespace TrFileTransfer
         private System.Collections.Generic.List<string> _monitorQueue = new System.Collections.Generic.List<string>();
         private readonly object _monitorLock = new object();
 
+        /// <summary>Assembly version for display (major.minor.build).</summary>
+        private static string AppVersion
+        {
+            get
+            {
+                Version v = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
+                return v.Major + "." + v.Minor + "." + v.Build;
+            }
+        }
+
         /// <summary>Initializes the form, populates NIC list, and applies default language.</summary>
         public MainForm()
         {
@@ -110,6 +120,7 @@ namespace TrFileTransfer
             PopulateBindAddresses();
             ApplyLanguage();
             ApplyConfig();
+            AddLog(L.StartedVersion(AppVersion));
         }
 
         protected override void OnShown(EventArgs e)
@@ -320,6 +331,11 @@ namespace TrFileTransfer
                 this.Show();
                 this.WindowState = FormWindowState.Normal;
                 this.Activate();
+            });
+            _trayMenu.Items.Add(L.About, null, (s2, e2) =>
+            {
+                MessageBox.Show(this, L.AboutText(AppVersion), L.About,
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
             });
             _trayMenu.Items.Add(L.TrayExit, null, (s2, e2) =>
             {
@@ -1420,9 +1436,10 @@ namespace TrFileTransfer
             if (p.TotalBytes > 0)
                 info.Bar.Value = Math.Max(0, Math.Min(100, pct));
             string speed = Utils.FormatSize((long)p.SpeedBytesPerSecond) + "/s";
-            info.Label.Text = string.Format("{0} | {1} | {2}% | {3}/{4}",
+            info.Label.Text = string.Format("{0} | {1} | {2}% | {3}/{4} | {5} {6}",
                 p.FileName, speed, pct,
-                Utils.FormatSize(p.BytesTransferred), Utils.FormatSize(p.TotalBytes));
+                Utils.FormatSize(p.BytesTransferred), Utils.FormatSize(p.TotalBytes),
+                L.EtaShort, FormatEta(p));
         }
 
         private void UpdateCardComplete(Panel card)

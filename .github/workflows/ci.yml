@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build app (TrFileTransfer.exe)
+        shell: cmd
+        run: cd TrFileTransfer && build.bat
+
+      - name: Build tests
+        shell: cmd
+        run: cd TrFileTransfer\Tests && build.bat
+
+      - name: Run tests
+        shell: cmd
+        run: cd TrFileTransfer\Tests && TrFileTransfer.Tests.exe

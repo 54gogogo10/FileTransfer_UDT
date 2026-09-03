@@ -38,8 +38,9 @@ TrFileTransfer.Tests.exe
 
 - `TestRunner.Run(name, action, retries)` 支持重试参数——UDT 握手偶发抖动，所有 UDT 集成测试传 `retries: 1`。
 - 集成测试每次经 `FindFreePort()` 获取空闲端口并绑定 127.0.0.1；该方法还会用 `UdpClient` 验证端口对 UDP 同样可用（UDT 在同端口绑 UDP，避开 Hyper-V/WSL 的 Windows 保留 UDP 端口段）。
-- 集成测试临时目录硬编码为 `D:\cc\tmp`（非系统 TEMP）。
+- 集成测试临时目录经 `TempBase()` 选择：存在 `D:\cc` 时用 `D:\cc\tmp`，否则回退 `%TEMP%`（CI 兼容）。
 - 超时：TCP 30 秒，UDT 60 秒。退出码 0 表示全部通过，1 表示有失败。
+- CI：`.github/workflows/ci.yml` 在 windows-latest 上运行两个 build.bat + 测试套件（push 触发）。
 - `Tests/QuickTest.cs` 是独立的 UDT 冒烟脚本，不在测试 build.bat 的编译列表中。
 
 ## 架构

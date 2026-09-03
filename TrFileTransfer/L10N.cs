@@ -38,9 +38,6 @@ namespace TrFileTransfer
         public static string Cancelling { get { return IsChinese ? "正在取消..." : "Cancelling..."; } }
         public static string ConcurrencyLabel { get { return IsChinese ? "并发(1-8):" : "Concur(1-8):"; } }
         public static string SrcPortLabel { get { return IsChinese ? "源端口(0=随机):" : "SrcPort(0=Rnd):"; } }
-        public static string AboutBtn { get { return IsChinese ? "关于" : "About"; } }
-        public static string AboutTitle { get { return IsChinese ? "关于" : "About"; } }
-        public static string AboutText { get { return IsChinese ? "TrFileTransfer v1.0\r\n局域网文件传输工具\r\nSHA-256 完整性校验" : "TrFileTransfer v1.0\r\nLAN file transfer tool\r\nSHA-256 integrity verification"; } }
         public static string ExportLog { get { return IsChinese ? "导出日志" : "Export Log"; } }
         public static string ExportLogTitle { get { return IsChinese ? "导出日志" : "Export Log"; } }
         public static string ExportLogFailed { get { return IsChinese ? "导出失败: " : "Export failed: "; } }
@@ -316,6 +313,20 @@ namespace TrFileTransfer
             return IsChinese
                 ? string.Format("[拖放] 已跳过 {0} 个项目：服务器地址或端口未配置。", count)
                 : string.Format("[Drop] Skipped {0} item(s): server address or port not configured.", count);
+        }
+        public static string EtaShort { get { return IsChinese ? "剩余" : "ETA"; } }
+        public static string About { get { return IsChinese ? "关于" : "About"; } }
+        public static string AboutText(object version)
+        {
+            return IsChinese
+                ? string.Format("TrFileTransfer v{0}\n局域网文件传输工具（TCP / UDT）", version)
+                : string.Format("TrFileTransfer v{0}\nLAN file transfer tool (TCP / UDT)", version);
+        }
+        public static string StartedVersion(object version)
+        {
+            return IsChinese
+                ? string.Format("TrFileTransfer v{0} 已启动。", version)
+                : string.Format("TrFileTransfer v{0} started.", version);
         }
         public static string NotifySendDone { get { return IsChinese ? "发送完成" : "Send complete"; } }
         public static string NotifyReceiveDone { get { return IsChinese ? "收到文件" : "File received"; } }
