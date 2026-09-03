@@ -18,6 +18,12 @@ jobs:
         shell: cmd
         run: cd TrFileTransfer\Tests && build.bat
 
+      # The test exe does not embed the UDT DLLs; tests resolve them next to the exe
+      # (same layout as a local dev checkout, where Tests\ holds copied DLLs)
+      - name: Stage UDT DLLs for tests
+        shell: cmd
+        run: copy /Y TrFileTransfer\udt.dll TrFileTransfer\Tests\ && copy /Y TrFileTransfer\libmcfgthread-2.dll TrFileTransfer\Tests\
+
       - name: Run tests
         shell: cmd
         run: cd TrFileTransfer\Tests && TrFileTransfer.Tests.exe
