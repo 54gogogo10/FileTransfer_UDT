@@ -409,10 +409,13 @@ namespace TrFileTransfer
                     UdtNative.udt_setsockopt(clientSocket, 0, UdtNative.UDT_SNDBUF, ref bufSize, 4);
                     UdtNative.udt_setsockopt(clientSocket, 0, UdtNative.UDT_RCVBUF, ref bufSize, 4);
                     lock (_clientSockets) { _clientSockets.Add(clientSocket); }
-                    // sin_addr/sin_port are uint/ushort in network byte order.
-                    // Must cast to unsigned before NetworkToHostOrder to avoid sign extension.
+                    // sin_port needs a 16-bit NetworkToHostOrder byteswap. sin_addr must
+                    // NOT be swapped: the struct's uint already little-endian-reads the
+                    // network-order bytes into exactly the layout IPAddress(long) expects
+                    // on Windows (cf. IPAddress.Loopback == 0x0100007F) — swapping it
+                    // renders the address reversed (e.g. 1.0.0.127).
                     var clientEp = new IPEndPoint(
-                        new IPAddress((long)(uint)IPAddress.NetworkToHostOrder((int)addr.sin_addr)),
+                        new IPAddress((long)addr.sin_addr),
                         (int)(ushort)IPAddress.NetworkToHostOrder((short)addr.sin_port));
                     Log(L.S_ClientConnected(clientEp));
                     var _ = HandleClient(clientSocket, ct, clientEp);
@@ -615,7 +618,8 @@ namespace TrFileTransfer
             try
             {
                 UdtDll.EnsureExtracted();
-                UdtNative.UdtStartup();
+                if (!UdtNative.UdtStartup())
+                    throw new Exception("UDT library init failed");
                 await transferAction(_cts.Token).ConfigureAwait(false);
                 // Wait for server ACK before closing — confirms data was received
                 var ackBuf = new byte[1];
@@ -749,30 +753,37 @@ namespace TrFileTransfer
 
     internal static class UdtIo
     {
-        /// <summary>Last native UDT error description (set on the thread that called udt_recv/udt_send).</summary>
-        public static string LastError;
-
         public static async Task<int> UdtReadExactAsync(int socket, byte[] buffer, int offset, int count, CancellationToken ct)
         {
             int totalRead = 0;
             while (totalRead < count)
             {
-                int read = await UdtReadAsync(socket, buffer, offset + totalRead, count - totalRead, ct);
+                // The error description is captured inside the Task.Run lambda and read
+                // after the await — per call, instead of a static field that races
+                // between concurrent transfers and mislabels this connection.
+                var error = new string[1];
+                int read = await UdtReadCoreAsync(socket, buffer, offset + totalRead, count - totalRead, ct, error);
                 if (read <= 0)
-                    throw new IOException(L.S_ConnClosedUnexpectedly + (LastError != null ? " [" + LastError + "]" : ""));
+                    throw new IOException(L.S_ConnClosedUnexpectedly + (error[0] != null ? " [" + error[0] + "]" : ""));
                 totalRead += read;
             }
             return totalRead;
         }
 
-        public static async Task<int> UdtReadAsync(int socket, byte[] buffer, int offset, int count, CancellationToken ct)
+        public static Task<int> UdtReadAsync(int socket, byte[] buffer, int offset, int count, CancellationToken ct)
+        {
+            return UdtReadCoreAsync(socket, buffer, offset, count, ct, new string[1]);
+        }
+
+        private static async Task<int> UdtReadCoreAsync(int socket, byte[] buffer, int offset, int count,
+            CancellationToken ct, string[] error)
         {
             // Short reads: if offset != 0, need a temp buffer or slice
             byte[] target = offset == 0 ? buffer : new byte[count];
             int result = await Task.Run(() =>
             {
                 int r = UdtNative.udt_recv(socket, target, count, 0);
-                LastError = r <= 0 ? UdtNative.GetErrorDesc() : null;
+                if (r <= 0) error[0] = UdtNative.GetErrorDesc();
                 return r;
             }, ct);
             if (result > 0 && offset != 0)
@@ -796,17 +807,15 @@ namespace TrFileTransfer
                     sendBuf = new byte[remaining];
                     Buffer.BlockCopy(buffer, offset + totalSent, sendBuf, 0, remaining);
                 }
+                string error = null;
                 int sent = await Task.Run(() =>
                 {
                     int s = UdtNative.udt_send(socket, sendBuf, remaining, 0);
-                    LastError = s < 0 ? UdtNative.GetErrorDesc() : null;
+                    if (s < 0) error = UdtNative.GetErrorDesc();
                     return s;
                 }, ct);
                 if (sent < 0)
-                {
-                    string err = LastError ?? "unknown";
-                    throw new IOException("UDT send failed: " + err);
-                }
+                    throw new IOException("UDT send failed: " + (error ?? "unknown"));
                 totalSent += sent;
             }
         }

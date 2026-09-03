@@ -52,10 +52,10 @@ TrFileTransfer.Tests.exe
 - **WireProtocol.cs** — **共享线协议核心**（0x00–0x04 全部逻辑唯一实现）。`IWireStream` 统一精确读/写字节流（`TcpWireStream` 包 `NetworkStream`，`UdtWireStream` 包 UDT socket）；`ServerWire`（接收端：0x00/0x01/0x02/0x03/0x04 处理、`ReceiveFilePayload`、全文件校验、续传协商、文件夹续传扫描 `GetFolderSessionDir`）与 `ClientWire`（发送端：单文件/文件夹/分块/续传/文件夹续传、`SendFilePayload` 双缓冲+令牌桶限速）；`WireCallbacks` 把日志/进度/错误/完成事件回传给传输类；`ServerWireContext` 持有分块与续传状态（`Shutdown()` 统一落盘）。0x02 分块返回 `WireOutcome{Success, IsChunked}`，让 TCP（无条件触发 per-client 完成）与 UDT（成功才 ACK）各自保留 ACK 语义。
 - **TransferServer.cs** — TCP 传输薄封装：监听/接受循环/生命周期 + `ServerWireContext` 装配；协议处理全部委托 `ServerWire.HandleClientAsync`。`NoDelay = true`，LongRunning 接受循环。
 - **TransferClient.cs** — TCP 客户端薄封装：`CreateClient()`（源端口绑定，失败抛 `PortBindException`）+ `ConnectAsync()`；发送逻辑委托 `ClientWire`。公开 API：`SendAsync()`/`SendFolderAsync()`/`SendChunkedAsync()`/`SendResumableAsync(sessionId, verifyHash)`。
-- **TransferUdt.cs** — UDT 传输薄封装：`UdtNative` 引用计数 + Cdecl P/Invoke；`UdtDll` 提取嵌入 DLL；`UdtIo` 封装异步 I/O（**错误描述在线程内捕获**，`LastError` 供诊断）；`TransferUdtServer`/`TransferUdtClient` 仅保留 UDT 特有部分（accept 循环、连接握手 `WaitForConnectionReady`、成功后 1 字节应用层 ACK），协议处理委托 `ServerWire`/`ClientWire`。`udt_listen` backlog 32。
+- **TransferUdt.cs** — UDT 传输薄封装：`UdtNative` 引用计数 + Cdecl P/Invoke；`UdtDll` 提取嵌入 DLL；`UdtIo` 封装异步 I/O（**错误描述按调用在闭包内捕获**，随异常消息抛出——并发传输间无共享状态）；`TransferUdtServer`/`TransferUdtClient` 仅保留 UDT 特有部分（accept 循环、连接握手 `WaitForConnectionReady`、成功后 1 字节应用层 ACK），协议处理委托 `ServerWire`/`ClientWire`。`udt_listen` backlog 32。
 - **ConcurrentTransfer.cs** — 多连接并发传输编排器。单文件切分为 N 个等大分块并行发送（独立连接+端口）。文件夹用 `SemaphoreSlim` 控制并发度。
 - **Config.cs** — 键值配置持久化。`Get`/`GetInt`/`GetBool`/`Set`/`SetInt`/`SetBool`。启动时加载，关闭时保存。
-- **Shared.cs** — `TransferProgress`/`FileEntry` 结构体。`ChunkTracker`（分块重组）。`SpeedLimiter`（令牌桶限速）。`Utils` 静态辅助（`FormatSize`、`ConstantTimeEquals`、`LogTo`、`SanitizeRelativePath`、`GetUniqueSavePath`、`FindFreePort`、`EmptyBytes`）。
+- **Shared.cs** — `TransferProgress`/`FileEntry` 结构体。`ChunkTracker`（分块重组）。`SpeedLimiter`（令牌桶限速，`ThrottleAsync` 异步等待不阻塞线程池线程）。`Utils` 静态辅助（`FormatSize`、`ConstantTimeEquals`、`LogTo`、`SanitizeRelativePath`、`GetUniqueSavePath`、`FindFreePort`、`EmptyBytes`）。
 - **ResumeState.cs** — 客户端续传状态持久化（含 `SourceMTime` 源文件变化检测）。
 - **FolderResumeState.cs** — 客户端**文件夹续传会话**持久化（`%AppData%\TrFileTransfer\folder-resume`，同一键值格式）：SessionId/源文件夹/目标地址/进度。服务器侧进度不落盘——磁盘文件本身就是状态，续传时由服务器扫描推导。
 - **ServerResumeStore.cs** — 服务器续传状态落盘（`%AppData%\TrFileTransfer\server-resume`），服务器重启后按磁盘偏移恢复；`CleanupStale(7)` 在 TCP/UDT 服务器 Start 时调用，清理 7 天以上客户端未返回的孤儿会话文件。
@@ -187,7 +187,7 @@ Accept 循环：`udt_accept()` 返回客户端 socket → 添加到 `_clientSock
 
 `Stop()` 关闭监听 socket → 遍历 `_clientSockets` 关闭所有活跃客户端 socket（使 `HandleClient` 中的阻塞 I/O 立即中断）→ `Uninit()`（仅在 `_startupOk` 为 true 时调用 `UdtCleanup()`，防止 `Start()` 中途失败后的双重清理）。
 
-`AcceptLoop` 中 IPEndPoint 构造使用 `(uint)`/`(ushort)` 强制转换避免 `sin_addr`/`sin_port` 的符号扩展——客户端临时端口（≥49152）在从网络字节序转换时不会变为负数。
+`AcceptLoop` 中 IPEndPoint 构造：`sin_port` 需 `NetworkToHostOrder` 16 位字节交换（`(ushort)` 强转避免符号扩展，临时端口 ≥49152 不会变负数）；`sin_addr` **不做字节交换**——结构体字段小端读取网络字节序字节后恰好就是 `IPAddress(long)` 期望的布局（对照 `IPAddress.Loopback == 0x0100007F`），再交换会显示颠倒（如 1.0.0.127）。
 
 ### 客户端架构
 

@@ -106,7 +106,7 @@ namespace TrFileTransfer
                 ? string.Format("无法创建目录: {0}", path)
                 : string.Format("Cannot create directory: {0}", path);
         }
-        public static string S_ZeroFiles { get { return IsChinese ? "文件夹为空。" : "Folder is empty."; } }
+        public static string C_ZeroFiles { get { return IsChinese ? "文件夹为空。" : "Folder is empty."; } }
 
         // ---- Server log messages ----
         public static string S_BindFailed(string addr, string port, string err)

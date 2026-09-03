@@ -523,7 +523,8 @@ namespace TrFileTransfer
             long chunkSize = BitConverter.ToInt64(headerBuf, 16);
             int nameLen = BitConverter.ToInt32(headerBuf, 24);
 
-            if (totalSize <= 0 || chunkOffset < 0 || chunkSize <= 0 || nameLen <= 0 || nameLen > 4096)
+            if (totalSize <= 0 || chunkOffset < 0 || chunkSize <= 0 || chunkOffset > totalSize - chunkSize
+                || nameLen <= 0 || nameLen > 4096)
             {
                 ctx.Cb.RaiseLog(L.S_InvalidHeader(totalSize, nameLen));
                 return false;
@@ -688,8 +689,13 @@ namespace TrFileTransfer
                             else
                             {
                                 disk.WriteStream.Dispose();
-                                ctx.ResumeStates.TryGetValue(sessionId, out state);
-                                isNew = false;
+                                // isNew stays true when the winner vanished (completed and
+                                // cleaned up before we could read it) — fall through to a
+                                // fresh session below
+                                if (!ctx.ResumeStates.TryGetValue(sessionId, out state))
+                                    state = null;
+                                else
+                                    isNew = false;
                             }
                         }
                         catch (IOException)
@@ -751,6 +757,14 @@ namespace TrFileTransfer
             }
             else
             {
+                if (state == null)
+                {
+                    // Lost the add race and the winner already finished and cleaned up;
+                    // fail this attempt — the client's retry starts a clean session
+                    ctx.Cb.RaiseLog(string.Format("Resume: session {0} state disappeared mid-race",
+                        sessionId.ToString("N")));
+                    return false;
+                }
                 if (state.TotalSize != totalSize)
                 {
                     ctx.Cb.RaiseLog(string.Format("Resume size mismatch: session={0} expect={1} got={2}",
@@ -1033,8 +1047,8 @@ namespace TrFileTransfer
             var files = Directory.GetFiles(folderPath, "*", SearchOption.AllDirectories);
             if (files.Length == 0)
             {
-                cb.RaiseLog(L.S_ZeroFiles);
-                cb.RaiseError(L.S_ZeroFiles);
+                cb.RaiseLog(L.C_ZeroFiles);
+                cb.RaiseError(L.C_ZeroFiles);
                 return;
             }
 
@@ -1117,8 +1131,8 @@ namespace TrFileTransfer
             var files = Directory.GetFiles(folderPath, "*", SearchOption.AllDirectories);
             if (files.Length == 0)
             {
-                cb.RaiseLog(L.S_ZeroFiles);
-                cb.RaiseError(L.S_ZeroFiles);
+                cb.RaiseLog(L.C_ZeroFiles);
+                cb.RaiseError(L.C_ZeroFiles);
                 return;
             }
 
@@ -1435,7 +1449,7 @@ namespace TrFileTransfer
                     sha256.TransformBlock(cur, 0, read, null, 0);
                     await s.WriteExactAsync(cur, 0, read, ct).ConfigureAwait(false);
                     bytesSent += read;
-                    limiter.Throttle(read);
+                    await limiter.ThrottleAsync(read, ct).ConfigureAwait(false);
 
                     if (nextReadTask == null)
                     {

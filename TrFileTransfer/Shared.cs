@@ -113,8 +113,10 @@ namespace TrFileTransfer
                 _maxBytesPerSec = maxBytesPerSec;
             }
 
-            /// <summary>Records a chunk of bytes sent and sleeps as needed to stay within the limit.</summary>
-            public void Throttle(int bytes)
+            /// <summary>Records a chunk of bytes sent and delays as needed to stay within
+            /// the limit. Asynchronous so throttled sends never block a thread-pool thread
+            /// (a 4 MB chunk at a low limit can mean seconds of waiting).</summary>
+            public async System.Threading.Tasks.Task ThrottleAsync(int bytes, System.Threading.CancellationToken ct)
             {
                 if (_maxBytesPerSec <= 0) return;
                 _totalSent += bytes;
@@ -125,7 +127,7 @@ namespace TrFileTransfer
                 {
                     int ms = (int)(deficit * 1000.0);
                     if (ms > 0)
-                        System.Threading.Thread.Sleep(ms);
+                        await System.Threading.Tasks.Task.Delay(ms, ct).ConfigureAwait(false);
                 }
             }
         }

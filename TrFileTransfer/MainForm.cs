@@ -115,8 +115,10 @@ namespace TrFileTransfer
         /// <summary>Initializes the form, populates NIC list, and applies default language.</summary>
         public MainForm()
         {
-            InitializeComponent();
+            // Load config first — InitializeComponent already reads settings that must
+            // survive restarts (VerifyHash, SpeedLimit, KnownDevices)
             Config.Load();
+            InitializeComponent();
             PopulateBindAddresses();
             ApplyLanguage();
             ApplyConfig();
@@ -273,6 +275,7 @@ namespace TrFileTransfer
             _chkFolder.CheckedChanged += ChkFolder_CheckedChanged;
             _chkVerifyHash = new CheckBox { AutoSize = true, Margin = new Padding(2, 8, 16, 3) };
             _chkVerifyHash.Checked = Config.GetBool("VerifyHash", false);
+            _chkVerifyHash.CheckedChanged += (s2, e2) => Config.SetBool("VerifyHash", _chkVerifyHash.Checked);
             var optionsRow = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, BackColor = Color.White, Margin = new Padding(0) };
             optionsRow.Controls.Add(_chkMonitor);
             optionsRow.Controls.Add(_chkFolder);
@@ -535,6 +538,7 @@ namespace TrFileTransfer
             Config.Set("LastPath", _txtFile.Text.Trim());
             Config.SetBool("FolderMode", _chkFolder.Checked);
             Config.SetBool("MonitorMode", _chkMonitor.Checked);
+            Config.SetBool("VerifyHash", _chkVerifyHash.Checked);
             Config.SetInt("Concurrency", (int)_numConcurrency.Value);
             Config.SetInt("SrcPort", (int)_numSrcPort.Value);
             Config.Save();
@@ -1317,6 +1321,7 @@ namespace TrFileTransfer
             {
                 ResetClientUI();
                 UpdateCardComplete(card);
+                Notify(L.NotifySendDone, L.TransferComplete);
             }));
             c.OnStopped += () => this.Invoke((Action)(() => UpdateCardComplete(card)));
         }
@@ -1336,6 +1341,7 @@ namespace TrFileTransfer
             {
                 ResetClientUI();
                 UpdateCardComplete(card);
+                Notify(L.NotifySendDone, L.TransferComplete);
             }));
         }
 
@@ -1855,26 +1861,7 @@ namespace TrFileTransfer
             tlp.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
 
             _list = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false };
-            foreach (var s in _states)
-            {
-                if (s == null) continue;
-                string progress = s.TotalSize > 0
-                    ? string.Format("{0:F1}%", 100.0 * s.SentBytes / s.TotalSize)
-                    : "?";
-                _list.Items.Add(string.Format("{0} -> {1}:{2} [{3}] {4}",
-                    s.FileName, s.ServerIp, s.Port, progress,
-                    s.Created.ToLocalTime().ToString("g")));
-            }
-            foreach (var f in _folderStates)
-            {
-                if (f == null) continue;
-                string progress = f.TotalBytes > 0
-                    ? string.Format("{0:F1}%", 100.0 * f.SentBytes / f.TotalBytes)
-                    : "?";
-                _list.Items.Add(string.Format("{0}{1} ({2}) -> {3}:{4} [{5}] {6}",
-                    L.FolderTag, f.FolderName, f.FileCount, f.ServerIp, f.Port, progress,
-                    f.Created.ToLocalTime().ToString("g")));
-            }
+            FillList();
             tlp.Controls.Add(_list, 0, 0);
 
             var buttons = new FlowLayoutPanel
@@ -1979,28 +1966,37 @@ namespace TrFileTransfer
         {
             int selected = _list.SelectedIndex;
             _list.Items.Clear();
-            foreach (var s in _states)
-            {
-                if (s == null) continue;
-                string progress = s.TotalSize > 0
-                    ? string.Format("{0:F1}%", 100.0 * s.SentBytes / s.TotalSize)
-                    : "?";
-                _list.Items.Add(string.Format("{0} -> {1}:{2} [{3}] {4}",
-                    s.FileName, s.ServerIp, s.Port, progress,
-                    s.Created.ToLocalTime().ToString("g")));
-            }
-            foreach (var f in _folderStates)
-            {
-                if (f == null) continue;
-                string progress = f.TotalBytes > 0
-                    ? string.Format("{0:F1}%", 100.0 * f.SentBytes / f.TotalBytes)
-                    : "?";
-                _list.Items.Add(string.Format("{0}{1} ({2}) -> {3}:{4} [{5}] {6}",
-                    L.FolderTag, f.FolderName, f.FileCount, f.ServerIp, f.Port, progress,
-                    f.Created.ToLocalTime().ToString("g")));
-            }
+            FillList();
             if (selected >= 0 && selected < _list.Items.Count)
                 _list.SelectedIndex = selected;
+        }
+
+        private void FillList()
+        {
+            foreach (var s in _states)
+                if (s != null) _list.Items.Add(FormatState(s));
+            foreach (var f in _folderStates)
+                if (f != null) _list.Items.Add(FormatFolderState(f));
+        }
+
+        private static string FormatState(ResumeState s)
+        {
+            string progress = s.TotalSize > 0
+                ? string.Format("{0:F1}%", 100.0 * s.SentBytes / s.TotalSize)
+                : "?";
+            return string.Format("{0} -> {1}:{2} [{3}] {4}",
+                s.FileName, s.ServerIp, s.Port, progress,
+                s.Created.ToLocalTime().ToString("g"));
+        }
+
+        private static string FormatFolderState(FolderResumeState f)
+        {
+            string progress = f.TotalBytes > 0
+                ? string.Format("{0:F1}%", 100.0 * f.SentBytes / f.TotalBytes)
+                : "?";
+            return string.Format("{0}{1} ({2}) -> {3}:{4} [{5}] {6}",
+                L.FolderTag, f.FolderName, f.FileCount, f.ServerIp, f.Port, progress,
+                f.Created.ToLocalTime().ToString("g"));
         }
     }
 
