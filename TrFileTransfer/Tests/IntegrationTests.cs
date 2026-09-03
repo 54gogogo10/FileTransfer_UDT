@@ -62,7 +62,9 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_Discovery", DiscoveryTest);
             runner.Run("Integration_Factory_TCP", FactoryTcp);
             runner.Run("Integration_TCP_BindInUse_Typed", TcpBindInUseTyped);
+            runner.Run("Integration_TCP_FolderResume", TcpFolderResume);
             runner.Run("Integration_Factory_UDT", FactoryUdt, 1);
+            runner.Run("Integration_UDT_FolderResume", UdtFolderResume, 1);
             runner.Run("Integration_UDT_ResumeSingleFile", UdtResumeSingleFile, 1); // UDT flaky handshake retry
             runner.Run("Integration_UDT_ResumeAcrossRestart", UdtResumeAcrossRestart, 1);
             runner.Run("Integration_UDT_ResumeFullHashCorrupt", UdtResumeFullHashCorrupt, 1);
@@ -2052,6 +2054,158 @@ namespace TrFileTransfer.Tests
             finally
             {
                 try { Directory.Delete(sendDir, true); } catch { }
+            }
+        }
+
+        // ---- Folder resume (type 0x04) ----
+        // Pre-seeds the server session directory (one complete file, one half-done file),
+        // then sends a three-file folder via SendFolderResumableAsync. The server must skip
+        // the complete file, resume the half-done one from its on-disk offset, receive the
+        // remaining file, and finish with all three byte-identical to the source. A second
+        // send over the same session must take the "already complete" fast path.
+
+        private static void TcpFolderResume() { FolderResumeTest("tcp", false); }
+        private static void UdtFolderResume() { FolderResumeTest("udt", true); }
+
+        private static void FolderResumeTest(string kind, bool isUdt)
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_fr_s_" + kind + "_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            string recvDir = Path.Combine(TempBase(), "tr_fr_r_" + kind + "_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+
+            TransferServer tcpServer = null;
+            TransferUdtServer udtServer = null;
+            try
+            {
+                // Source folder: a.bin (root), c.bin (root), b.bin (subdirectory)
+                string srcFolder = Path.Combine(sendDir, "rfolder");
+                Directory.CreateDirectory(srcFolder);
+                var rng = new Random(99);
+                var c0 = new byte[1024 * 1024]; rng.NextBytes(c0);
+                var c1 = new byte[512 * 1024]; rng.NextBytes(c1);
+                var c2 = new byte[100 * 1024]; rng.NextBytes(c2);
+                string f0 = Path.Combine(srcFolder, "a.bin");
+                string f1 = Path.Combine(srcFolder, "c.bin");
+                string subDir = Path.Combine(srcFolder, "sub");
+                Directory.CreateDirectory(subDir);
+                string f2 = Path.Combine(subDir, "b.bin");
+                File.WriteAllBytes(f0, c0);
+                File.WriteAllBytes(f1, c1);
+                File.WriteAllBytes(f2, c2);
+
+                var sessionId = Guid.NewGuid();
+                string sessionDir = ServerWire.GetFolderSessionDir(recvDir, "rfolder", sessionId);
+
+                // Pre-seed: a.bin fully received, c.bin half received (manifest order is
+                // a.bin, c.bin, sub/b.bin — root files first, then subdirectories)
+                Directory.CreateDirectory(sessionDir);
+                File.WriteAllBytes(Path.Combine(sessionDir, "a.bin"), c0);
+                var half = new byte[c1.Length / 2];
+                Buffer.BlockCopy(c1, 0, half, 0, half.Length);
+                File.WriteAllBytes(Path.Combine(sessionDir, "c.bin"), half);
+
+                var serverStarted = new ManualResetEvent(false);
+                var serverDone = new ManualResetEvent(false);
+                bool serverOk = false;
+                string serverError = null;
+
+                if (isUdt)
+                {
+                    udtServer = new TransferUdtServer("127.0.0.1", port, recvDir);
+                    udtServer.OnStarted += () => serverStarted.Set();
+                    udtServer.OnTransferComplete += () => { serverOk = true; serverDone.Set(); };
+                    udtServer.OnError += msg => { serverError = msg; serverDone.Set(); };
+                    udtServer.Start();
+                }
+                else
+                {
+                    tcpServer = new TransferServer("127.0.0.1", port, recvDir);
+                    tcpServer.OnStarted += () => serverStarted.Set();
+                    tcpServer.OnTransferComplete += () => { serverOk = true; serverDone.Set(); };
+                    tcpServer.OnError += msg => { serverError = msg; serverDone.Set(); };
+                    tcpServer.Start();
+                }
+                if (!serverStarted.WaitOne(isUdt ? 15000 : 5000))
+                    throw new Exception("Server did not start");
+
+                var clientDone = new ManualResetEvent(false);
+                bool clientOk = false;
+                Task<Guid> sendTask;
+                if (isUdt)
+                {
+                    var client = new TransferUdtClient("127.0.0.1", port, srcFolder, 0, 4194304, 0);
+                    client.OnTransferComplete += () => { clientOk = true; clientDone.Set(); };
+                    client.OnError += msg => clientDone.Set();
+                    sendTask = client.SendFolderResumableAsync(sessionId);
+                }
+                else
+                {
+                    var client = new TransferClient("127.0.0.1", port, srcFolder, 0, 4194304, 0);
+                    client.OnTransferComplete += () => { clientOk = true; clientDone.Set(); };
+                    client.OnError += msg => clientDone.Set();
+                    sendTask = client.SendFolderResumableAsync(sessionId);
+                }
+
+                if (!serverDone.WaitOne(60000))
+                    throw new Exception("Server did not complete within 60s");
+                if (!serverOk)
+                    throw new Exception("Server error: " + (serverError ?? "unknown"));
+                sendTask.Wait(60000);
+                if (!clientDone.WaitOne(5000))
+                    throw new Exception("Client did not fire completion event");
+                if (!clientOk)
+                    throw new Exception("Client transfer failed");
+
+                // All three files must now exist and match the sources byte-for-byte
+                Assert.True(Utils.ConstantTimeEquals(c0, File.ReadAllBytes(Path.Combine(sessionDir, "a.bin"))), "a.bin content (skipped, untouched)");
+                Assert.True(Utils.ConstantTimeEquals(c1, File.ReadAllBytes(Path.Combine(sessionDir, "c.bin"))), "c.bin content (resumed from offset)");
+                Assert.True(Utils.ConstantTimeEquals(c2, File.ReadAllBytes(Path.Combine(sessionDir, "sub", "b.bin"))), "b.bin content (new file)");
+
+                // Success clears the client-side folder resume session
+                Assert.True(FolderResumeState.Load(sessionId) == null, "folder resume state deleted after success");
+
+                // Second send over the same session: server answers "already complete"
+                serverDone.Reset();
+                serverOk = false;
+                var clientDone2 = new ManualResetEvent(false);
+                bool clientOk2 = false;
+                Task<Guid> resendTask;
+                if (isUdt)
+                {
+                    var client = new TransferUdtClient("127.0.0.1", port, srcFolder, 0, 4194304, 0);
+                    client.OnTransferComplete += () => { clientOk2 = true; clientDone2.Set(); };
+                    client.OnError += msg => clientDone2.Set();
+                    resendTask = client.SendFolderResumableAsync(sessionId);
+                }
+                else
+                {
+                    var client = new TransferClient("127.0.0.1", port, srcFolder, 0, 4194304, 0);
+                    client.OnTransferComplete += () => { clientOk2 = true; clientDone2.Set(); };
+                    client.OnError += msg => clientDone2.Set();
+                    resendTask = client.SendFolderResumableAsync(sessionId);
+                }
+                if (!serverDone.WaitOne(60000))
+                    throw new Exception("Server did not complete second pass within 60s");
+                if (!serverOk)
+                    throw new Exception("Server error on second pass: " + (serverError ?? "unknown"));
+                resendTask.Wait(60000);
+                if (!clientDone2.WaitOne(5000))
+                    throw new Exception("Client did not fire completion event (second pass)");
+                if (!clientOk2)
+                    throw new Exception("Client second pass failed");
+
+                // Content unchanged by the fast-path send
+                Assert.True(Utils.ConstantTimeEquals(c0, File.ReadAllBytes(Path.Combine(sessionDir, "a.bin"))), "a.bin unchanged (second pass)");
+                Assert.True(Utils.ConstantTimeEquals(c2, File.ReadAllBytes(Path.Combine(sessionDir, "sub", "b.bin"))), "b.bin unchanged (second pass)");
+            }
+            finally
+            {
+                if (tcpServer != null) { try { tcpServer.Stop(); } catch { } }
+                if (udtServer != null) { try { udtServer.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
             }
         }
     }

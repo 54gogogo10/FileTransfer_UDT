@@ -199,6 +199,8 @@ namespace TrFileTransfer
                 return new WireOutcome { IsChunked = true, Success = await HandleChunkedFile(s, ctx, ct).ConfigureAwait(false) };
             if (transferType == 0x03)
                 return new WireOutcome { Success = await HandleResumableFile(s, ctx, ct).ConfigureAwait(false) };
+            if (transferType == 0x04)
+                return new WireOutcome { Success = await HandleFolderResumableAsync(s, ctx, ct).ConfigureAwait(false) };
             return new WireOutcome { Success = await HandleFileTransfer(s, ctx, ct).ConfigureAwait(false) };
         }
 
@@ -209,6 +211,199 @@ namespace TrFileTransfer
             if (string.IsNullOrWhiteSpace(name))
                 name = fallback;
             return name;
+        }
+
+        /// <summary>Deterministic save directory for a folder-resume session — the same
+        /// session always maps to the same directory (across restarts), without the
+        /// uniqueness suffix that GetUniqueSavePath would vary between attempts.</summary>
+        public static string GetFolderSessionDir(string saveDirectory, string folderName, Guid sessionId)
+        {
+            return Path.Combine(saveDirectory, folderName + "." + sessionId.ToString("N").Substring(0, 8));
+        }
+
+        /// <summary>
+        /// Folder resume (type 0x04). The client sends a manifest (path, size, full-file
+        /// SHA256 per file); the server scans its session directory for already-complete
+        /// files and answers where to continue. Files are assumed to be sent sequentially
+        /// in manifest order, so the resume point is (first incomplete index, offset in it).
+        /// </summary>
+        private static async Task<bool> HandleFolderResumableAsync(IWireStream s, ServerWireContext ctx, CancellationToken ct)
+        {
+            // Header: sessionId(16) + folderNameLen(2) + folderName + fileCount(4) + totalBytes(8)
+            var headBuf = new byte[16 + 2];
+            await s.ReadExactAsync(headBuf, 0, headBuf.Length, ct).ConfigureAwait(false);
+            var sidBytes = new byte[16];
+            Buffer.BlockCopy(headBuf, 0, sidBytes, 0, 16);
+            var sessionId = new Guid(sidBytes);
+            int folderNameLen = BitConverter.ToInt16(headBuf, 16);
+            if (folderNameLen <= 0 || folderNameLen > 4096) return false;
+
+            var folderNameBuf = new byte[folderNameLen];
+            await s.ReadExactAsync(folderNameBuf, 0, folderNameLen, ct).ConfigureAwait(false);
+            string folderName = SafeName(System.Text.Encoding.UTF8.GetString(folderNameBuf), "received_folder");
+
+            var countBuf = new byte[4 + 8];
+            await s.ReadExactAsync(countBuf, 0, countBuf.Length, ct).ConfigureAwait(false);
+            int fileCount = BitConverter.ToInt32(countBuf, 0);
+            long totalBytes = BitConverter.ToInt64(countBuf, 4);
+            if (fileCount <= 0 || fileCount > 1000000 || totalBytes < 0) return false;
+
+            var relativePaths = new string[fileCount];
+            var sizes = new long[fileCount];
+            var fullHashes = new byte[fileCount][];
+            long manifestTotal = 0;
+            for (int i = 0; i < fileCount; i++)
+            {
+                var fileHeader = new byte[8 + 2];
+                await s.ReadExactAsync(fileHeader, 0, fileHeader.Length, ct).ConfigureAwait(false);
+                long size = BitConverter.ToInt64(fileHeader, 0);
+                int pathLen = BitConverter.ToInt16(fileHeader, 8);
+                if (size < 0 || pathLen <= 0 || pathLen > 4096) return false;
+
+                var pathBuf = new byte[pathLen];
+                await s.ReadExactAsync(pathBuf, 0, pathLen, ct).ConfigureAwait(false);
+                relativePaths[i] = Utils.SanitizeRelativePath(System.Text.Encoding.UTF8.GetString(pathBuf));
+
+                var hashBuf = new byte[32];
+                await s.ReadExactAsync(hashBuf, 0, 32, ct).ConfigureAwait(false);
+                fullHashes[i] = hashBuf;
+
+                sizes[i] = size;
+                manifestTotal += size;
+            }
+            if (manifestTotal != totalBytes) return false;
+
+            string dir = GetFolderSessionDir(ctx.SaveDirectory, folderName, sessionId);
+            Directory.CreateDirectory(dir);
+
+            // Resume scan: everything before the first incomplete entry is considered done
+            int resumeIndex = fileCount;
+            long resumeOffset = 0;
+            for (int i = 0; i < fileCount; i++)
+            {
+                string path = Path.Combine(dir, relativePaths[i]);
+                if (!File.Exists(path))
+                {
+                    resumeIndex = i;
+                    resumeOffset = 0;
+                    break;
+                }
+                long len = new FileInfo(path).Length;
+                if (len == sizes[i])
+                {
+                    // Complete size — verify content against the manifest hash
+                    if (await VerifyFullHashFile(path, fullHashes[i], ct).ConfigureAwait(false))
+                        continue;
+                    resumeIndex = i;
+                    resumeOffset = 0;
+                    break;
+                }
+                if (len > 0 && len < sizes[i])
+                {
+                    resumeIndex = i;
+                    resumeOffset = len;
+                    break;
+                }
+                // Missing, empty-but-nonzero, or oversized — rewrite from scratch
+                resumeIndex = i;
+                resumeOffset = 0;
+                break;
+            }
+
+            byte status = (byte)(resumeIndex >= fileCount ? 2 : (resumeIndex > 0 || resumeOffset > 0 ? 1 : 0));
+
+            // 0x11 response: resumeFileIndex(8) + resumeOffset(8) + status(1)
+            var resp = new byte[1 + 8 + 8 + 1];
+            resp[0] = 0x11;
+            Buffer.BlockCopy(BitConverter.GetBytes((long)resumeIndex), 0, resp, 1, 8);
+            Buffer.BlockCopy(BitConverter.GetBytes(resumeOffset), 0, resp, 9, 8);
+            resp[17] = status;
+            await s.WriteExactAsync(resp, 0, resp.Length, ct).ConfigureAwait(false);
+
+            ctx.Cb.RaiseLog(string.Format("Folder resume: session={0} start={1}/{2} offset={3} status={4}",
+                sessionId.ToString("N"), resumeIndex, fileCount, resumeOffset, status));
+
+            if (status == 2)
+            {
+                ctx.Cb.RaiseLog(L.S_TransferDone(folderName, Utils.FormatSize(totalBytes), 0.0, ""));
+                ctx.Cb.RaiseComplete();
+                return true;
+            }
+
+            // Receive body: for each file from resumeIndex, [increment bytes][32-byte SHA256 of increment]
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            long completedBytes = resumeOffset;
+            for (int i = 0; i < resumeIndex; i++) completedBytes += sizes[i];
+
+            for (int i = resumeIndex; i < fileCount && !ct.IsCancellationRequested; i++)
+            {
+                long start = (i == resumeIndex) ? resumeOffset : 0;
+                string savePath = Path.Combine(dir, relativePaths[i]);
+                string subDir = Path.GetDirectoryName(savePath);
+                if (!string.IsNullOrEmpty(subDir) && !Directory.Exists(subDir))
+                    Directory.CreateDirectory(subDir);
+
+                using (var fileStream = new FileStream(savePath, start > 0 ? FileMode.Open : FileMode.Create,
+                    FileAccess.Write, FileShare.None, ctx.BufferSize, FileOptions.SequentialScan))
+                {
+                    if (start > 0)
+                        fileStream.Seek(start, SeekOrigin.Begin);
+
+                    using (var sha256 = System.Security.Cryptography.SHA256.Create())
+                    {
+                        long remaining = sizes[i] - start;
+                        if (remaining == 0)
+                        {
+                            sha256.TransformFinalBlock(Utils.EmptyBytes, 0, 0);
+                        }
+                        else
+                        {
+                            var buf = new byte[ctx.BufferSize];
+                            while (remaining > 0 && !ct.IsCancellationRequested)
+                            {
+                                int toRead = (int)Math.Min(remaining, (long)buf.Length);
+                                int read = await s.ReadSomeAsync(buf, 0, toRead, ct).ConfigureAwait(false);
+                                if (read <= 0)
+                                    throw new IOException(L.S_ConnClosedPrematurely);
+                                sha256.TransformBlock(buf, 0, read, null, 0);
+                                fileStream.Write(buf, 0, read);
+                                remaining -= read;
+                            }
+                            sha256.TransformFinalBlock(Utils.EmptyBytes, 0, 0);
+                        }
+
+                        var receivedHash = new byte[32];
+                        await s.ReadExactAsync(receivedHash, 0, 32, ct).ConfigureAwait(false);
+                        if (!Utils.ConstantTimeEquals(receivedHash, sha256.Hash))
+                        {
+                            // Keep the partial file so a retry can resume from it
+                            ctx.Cb.RaiseLog(L.S_HashFailed(relativePaths[i]));
+                            ctx.Cb.RaiseError(L.S_HashFailed(relativePaths[i]));
+                            return false;
+                        }
+                    }
+                }
+
+                ctx.Cb.RaiseFileReceived(savePath, sizes[i]);
+                completedBytes += sizes[i] - start;
+
+                ctx.Cb.RaiseProgress(new TransferProgress
+                {
+                    BytesTransferred = completedBytes,
+                    TotalBytes = totalBytes,
+                    SpeedBytesPerSecond = completedBytes / Math.Max(sw.Elapsed.TotalSeconds, 0.001),
+                    Elapsed = sw.Elapsed,
+                    FileName = folderName
+                });
+            }
+
+            sw.Stop();
+            ctx.Cb.RaiseLog(L.S_FolderTransferDone(folderName, fileCount, Utils.FormatSize(totalBytes),
+                sw.Elapsed.TotalSeconds,
+                Utils.FormatSize((long)(totalBytes / Math.Max(sw.Elapsed.TotalSeconds, 0.001)))));
+
+            ctx.Cb.RaiseComplete();
+            return true;
         }
 
         private static async Task<bool> HandleFileTransfer(IWireStream s, ServerWireContext ctx, CancellationToken ct)
@@ -904,6 +1099,148 @@ namespace TrFileTransfer
                 Utils.FormatSize((long)(totalSize / Math.Max(sw.Elapsed.TotalSeconds, 0.001)))));
 
             cb.RaiseComplete();
+        }
+
+        /// <summary>
+        /// Sends a folder with resume support (type 0x04). Sends a manifest with per-file
+        /// full-file SHA256, then only the bytes the server reports as missing. The client
+        /// persists a FolderResumeState so an interrupted session can be retried later.
+        /// </summary>
+        public static async Task SendFolderResumableAsync(IWireStream s, string folderPath, Guid sessionId,
+            string serverIp, int port, bool isUdt, int bufferSize, SpeedLimiter limiter, WireCallbacks cb,
+            CancellationToken ct)
+        {
+            string folderName = Path.GetFileName(folderPath.TrimEnd('\\', '/'));
+            if (string.IsNullOrWhiteSpace(folderName))
+                folderName = "folder";
+
+            var files = Directory.GetFiles(folderPath, "*", SearchOption.AllDirectories);
+            if (files.Length == 0)
+            {
+                cb.RaiseLog(L.S_ZeroFiles);
+                cb.RaiseError(L.S_ZeroFiles);
+                return;
+            }
+
+            // Pre-compute manifest entries; hashes let the server verify complete files on resume
+            cb.RaiseLog(L.ComputingFolderHashes(files.Length));
+            var relativePaths = new string[files.Length];
+            var sizes = new long[files.Length];
+            var hashes = new byte[files.Length][];
+            long totalBytes = 0;
+            for (int i = 0; i < files.Length; i++)
+            {
+                var fi = new FileInfo(files[i]);
+                sizes[i] = fi.Length;
+                relativePaths[i] = files[i].Substring(folderPath.Length).TrimStart('\\', '/');
+                hashes[i] = ComputeFileHash(files[i]);
+                totalBytes += sizes[i];
+            }
+
+            // Persist the session before sending so an interruption keeps it resumable
+            var state = new FolderResumeState
+            {
+                SessionId = sessionId,
+                FolderPath = folderPath,
+                FolderName = folderName,
+                ServerIp = serverIp,
+                Port = port,
+                IsUdt = isUdt,
+                Created = DateTime.UtcNow,
+                FileCount = files.Length,
+                TotalBytes = totalBytes,
+                SentBytes = 0
+            };
+            state.Save();
+
+            cb.RaiseLog(L.C_SendingFolder(folderName, files.Length, Utils.FormatSize(totalBytes)));
+
+            // Header: type(1) + sessionId(16) + folderNameLen(2) + folderName + fileCount(4) + totalBytes(8)
+            var folderNameBytes = System.Text.Encoding.UTF8.GetBytes(folderName);
+            var header = new byte[1 + 16 + 2 + folderNameBytes.Length + 4 + 8];
+            int pos = 0;
+            header[pos++] = 0x04;
+            Buffer.BlockCopy(sessionId.ToByteArray(), 0, header, pos, 16); pos += 16;
+            Buffer.BlockCopy(BitConverter.GetBytes((short)folderNameBytes.Length), 0, header, pos, 2); pos += 2;
+            Buffer.BlockCopy(folderNameBytes, 0, header, pos, folderNameBytes.Length); pos += folderNameBytes.Length;
+            Buffer.BlockCopy(BitConverter.GetBytes(files.Length), 0, header, pos, 4); pos += 4;
+            Buffer.BlockCopy(BitConverter.GetBytes(totalBytes), 0, header, pos, 8); pos += 8;
+            await s.WriteExactAsync(header, 0, header.Length, ct).ConfigureAwait(false);
+
+            // Manifest: per file [size(8)][pathLen(2)][path][fullHash(32)]
+            for (int i = 0; i < files.Length; i++)
+            {
+                byte[] relPathBytes = System.Text.Encoding.UTF8.GetBytes(relativePaths[i]);
+                var entry = new byte[8 + 2 + relPathBytes.Length + 32];
+                Buffer.BlockCopy(BitConverter.GetBytes(sizes[i]), 0, entry, 0, 8);
+                Buffer.BlockCopy(BitConverter.GetBytes((short)relPathBytes.Length), 0, entry, 8, 2);
+                Buffer.BlockCopy(relPathBytes, 0, entry, 10, relPathBytes.Length);
+                Buffer.BlockCopy(hashes[i], 0, entry, 10 + relPathBytes.Length, 32);
+                await s.WriteExactAsync(entry, 0, entry.Length, ct).ConfigureAwait(false);
+            }
+
+            // 0x11 response: resumeFileIndex(8) + resumeOffset(8) + status(1) = 18 bytes
+            var resp = new byte[1 + 8 + 8 + 1];
+            await s.ReadExactAsync(resp, 0, resp.Length, ct).ConfigureAwait(false);
+            if (resp[0] != 0x11)
+                throw new InvalidDataException(string.Format("Unexpected folder resume response type: {0}", resp[0]));
+            int resumeIndex = (int)BitConverter.ToInt64(resp, 1);
+            long resumeOffset = BitConverter.ToInt64(resp, 9);
+            byte status = resp[17];
+
+            if (status == 2)
+            {
+                cb.RaiseLog(L.C_AlreadyReceived(folderName));
+                FolderResumeState.Delete(sessionId);
+                cb.RaiseComplete();
+                return;
+            }
+
+            cb.RaiseLog(L.FolderResumeStart(resumeIndex + 1, files.Length, Utils.FormatSize(resumeOffset)));
+
+            state.SentBytes = resumeOffset;
+            for (int i = 0; i < resumeIndex; i++) state.SentBytes += sizes[i];
+            state.Save();
+
+            // Send body: per file [increment][32-byte SHA256 of the increment]
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            long totalSent = state.SentBytes;
+            for (int i = resumeIndex; i < files.Length && !ct.IsCancellationRequested; i++)
+            {
+                long start = (i == resumeIndex) ? resumeOffset : 0;
+                await SendFilePayload(s, files[i], sizes[i] - start, relativePaths[i],
+                    bufferSize, limiter, cb, ct, start).ConfigureAwait(false);
+                totalSent += sizes[i] - start;
+
+                state.SentBytes = totalSent;
+                state.Save();
+
+                cb.RaiseProgress(new TransferProgress
+                {
+                    BytesTransferred = totalSent,
+                    TotalBytes = totalBytes,
+                    SpeedBytesPerSecond = totalSent / Math.Max(sw.Elapsed.TotalSeconds, 0.001),
+                    Elapsed = sw.Elapsed,
+                    FileName = folderName
+                });
+            }
+
+            sw.Stop();
+            cb.RaiseLog(L.C_FolderTransferDone(folderName, files.Length, Utils.FormatSize(totalBytes),
+                sw.Elapsed.TotalSeconds,
+                Utils.FormatSize((long)(totalBytes / Math.Max(sw.Elapsed.TotalSeconds, 0.001)))));
+
+            FolderResumeState.Delete(sessionId);
+            cb.RaiseComplete();
+        }
+
+        /// <summary>Computes the SHA256 of a file's full content.</summary>
+        private static byte[] ComputeFileHash(string path)
+        {
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
+                FileShare.Read, 4194304, FileOptions.SequentialScan))
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+                return sha.ComputeHash(fs);
         }
 
         /// <summary>Sends one chunk of a larger file (type 0x02) for concurrent transfers.</summary>

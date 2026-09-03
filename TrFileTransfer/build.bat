@@ -50,6 +50,7 @@ echo.
     TransferServer.cs ^
     ResumeState.cs ^
     ServerResumeStore.cs ^
+    FolderResumeState.cs ^
     ConcurrentTransfer.cs ^
     TransferUdt.cs ^
     TransferClient.cs ^

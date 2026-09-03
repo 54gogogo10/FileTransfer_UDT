@@ -65,6 +65,49 @@
 
 末块可能小于其他块——服务端以头部 `chunkSize` 为准，不自行计算。
 
+### 断点续传（类型 `0x03` 与 `0x04`）
+
+单文件续传使用 `0x03`（头部 + 0x10 协商响应的完整字节布局见 AGENTS.md "TCP 线协议" 章节）；文件夹续传使用 `0x04`，两者共享同一偏移协商思想：**服务器偏移权威**，服务器无状态时客户端声明偏移不被信任、从头发送。
+
+#### 文件夹续传（类型 `0x04`）
+
+客户端发送清单（manifest），服务器扫描磁盘上已收到的文件后回答续传点：
+
+```
+[1 byte:  0x04]                 // 文件夹续传标记
+[16 bytes: sessionId]           // 会话 GUID
+[2 bytes: Int16 folderNameLen]
+[N bytes: UTF-8 folderName]
+[4 bytes: Int32 fileCount]
+[8 bytes: Int64 totalBytes]     // 所有文件大小之和（必须等于清单合计，否则拒绝）
+每个文件（清单，按顺序）：
+    [8 bytes: Int64 fileSize]
+    [2 bytes: Int16 pathLen]
+    [N bytes: UTF-8 relativePath]
+    [32 bytes: SHA256]          // 该文件完整内容的哈希（供服务器校验已收文件）
+```
+
+服务器协商响应（`0x11`，26 字节）：
+
+```
+[1 byte:  0x11]
+[8 bytes: Int64 resumeFileIndex]  // 首个未完成文件的清单序号（全部完成 = fileCount）
+[8 bytes: Int64 resumeOffset]     // 该文件内已收到的字节偏移
+[1 byte:  status]                 // 0=新会话 1=续传中 2=已全部完成
+```
+
+随后客户端从 `(resumeFileIndex, resumeOffset)` 开始，按清单顺序发送剩余内容，每个文件沿用 0x01 的文件体格式：
+
+```
+[M bytes: fileData]             // 该文件本次实际发送的字节（续传文件从 resumeOffset 起）
+[32 bytes: SHA256]              // 本次发送字节的 SHA-256（增量哈希，同 0x03）
+```
+
+服务器行为：
+- 保存目录由会话确定性推导：`<saveDir>/<folderName>.<sessionId 前 8 位>`——同一会话跨重启映射到同一目录，无需服务器落盘状态（磁盘文件本身就是状态）。
+- 续传扫描：文件存在且大小相符 → 用清单哈希全文件校验，通过则跳过，不符则从 0 重写；文件存在且偏小 → 从其大小偏移续传；其余（缺失/为空/超长）→ 从 0 重写。
+- 假定清单顺序发送（与 0x01 一致的顺序遍历）；任一文件增量哈希不符即中止，保留部分文件供下次续传。
+
 ### 服务器行为
 
 - 文件名通过 `Path.GetFileName()` 清理；文件夹传输的相对路径通过 `SanitizeRelativePath` 处理（替换 `..` / `.`）。

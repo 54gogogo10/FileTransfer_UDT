@@ -328,6 +328,21 @@ namespace TrFileTransfer
                 ? string.Format("TrFileTransfer v{0} 已启动。", version)
                 : string.Format("TrFileTransfer v{0} started.", version);
         }
+        public static string FolderTag { get { return IsChinese ? "[文件夹] " : "[Folder] "; } }
+        public static string QueueRetriesLabel { get { return IsChinese ? "失败重试:" : "Retries:"; } }
+        public static string RetryWord { get { return IsChinese ? "重试" : "retry"; } }
+        public static string ComputingFolderHashes(object count)
+        {
+            return IsChinese
+                ? string.Format("正在计算 {0} 个文件的校验值...", count)
+                : string.Format("Computing hashes for {0} files...", count);
+        }
+        public static string FolderResumeStart(object index, object count, object offset)
+        {
+            return IsChinese
+                ? string.Format("文件夹续传：从第 {0}/{1} 个文件恢复（偏移 {2}）。", index, count, offset)
+                : string.Format("Folder resume: starting at file {0}/{1} (offset {2}).", index, count, offset);
+        }
         public static string NotifySendDone { get { return IsChinese ? "发送完成" : "Send complete"; } }
         public static string NotifyReceiveDone { get { return IsChinese ? "收到文件" : "File received"; } }
         public static string OpenSaveDir { get { return IsChinese ? "打开目录" : "Open Folder"; } }

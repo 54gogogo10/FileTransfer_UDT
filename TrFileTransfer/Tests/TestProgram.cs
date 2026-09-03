@@ -100,6 +100,7 @@ namespace TrFileTransfer.Tests
             RunConfig(runner);
             RunL10N(runner);
             RunServerResumeStore(runner);
+            RunFolderResumeStore(runner);
         }
 
         private static void RunFormatSize(TestRunner runner)
@@ -323,6 +324,58 @@ namespace TrFileTransfer.Tests
                     ServerResumeStore.Delete(oldSid);
                     ServerResumeStore.Delete(freshSid);
                 }
+            });
+        }
+
+        private static void RunFolderResumeStore(TestRunner runner)
+        {
+            runner.Run("FolderResumeState_RoundTrip", () =>
+            {
+                var sid = Guid.NewGuid();
+                var state = new FolderResumeState
+                {
+                    SessionId = sid,
+                    FolderPath = @"D:\cc\tmp\fr-test\src",
+                    FolderName = "docs",
+                    ServerIp = "192.168.1.5",
+                    Port = 9000,
+                    IsUdt = true,
+                    Created = new DateTime(2026, 9, 3, 0, 0, 0, DateTimeKind.Utc),
+                    FileCount = 7,
+                    TotalBytes = 123456,
+                    SentBytes = 1000
+                };
+                state.Save();
+                try
+                {
+                    var loaded = FolderResumeState.Load(sid);
+                    Assert.True(loaded != null, "loaded not null");
+                    Assert.Equal(state.FolderPath, loaded.FolderPath, "folder path");
+                    Assert.Equal(state.FolderName, loaded.FolderName, "folder name");
+                    Assert.Equal(state.ServerIp, loaded.ServerIp, "server ip");
+                    Assert.Equal(state.Port, loaded.Port, "port");
+                    Assert.True(loaded.IsUdt, "isUdt");
+                    Assert.Equal(state.Created, loaded.Created, "created");
+                    Assert.Equal(state.FileCount, loaded.FileCount, "file count");
+                    Assert.Equal(state.TotalBytes, loaded.TotalBytes, "total bytes");
+                    Assert.Equal(state.SentBytes, loaded.SentBytes, "sent bytes");
+                }
+                finally
+                {
+                    FolderResumeState.Delete(sid);
+                }
+            });
+
+            runner.Run("FolderResumeState_Delete", () =>
+            {
+                var sid = Guid.NewGuid();
+                new FolderResumeState
+                {
+                    SessionId = sid, FolderPath = "x", FolderName = "y",
+                    ServerIp = "1.2.3.4", Port = 1, Created = DateTime.UtcNow
+                }.Save();
+                FolderResumeState.Delete(sid);
+                Assert.True(FolderResumeState.Load(sid) == null, "deleted -> null");
             });
         }
 

@@ -587,6 +587,16 @@ namespace TrFileTransfer
             await RunUdtTransfer(ct => SendChunkedInternal(offset, chunkSize, totalSize, ct));
         }
 
+        /// <summary>Sends a folder with resume support (type 0x04). Interrupted sessions
+        /// continue from where the server's files on disk left off.</summary>
+        /// <param name="existingSessionId">Session to resume, or null for a new session.</param>
+        public async Task<Guid> SendFolderResumableAsync(Guid? existingSessionId = null)
+        {
+            var sessionId = existingSessionId ?? Guid.NewGuid();
+            await RunUdtTransfer(ct => SendFolderResumableInternal(sessionId, ct));
+            return sessionId;
+        }
+
         public async Task<Guid> SendResumableAsync(Guid? existingSessionId = null, bool verifyHash = false)
         {
             var sessionId = existingSessionId ?? Guid.NewGuid();
@@ -704,6 +714,16 @@ namespace TrFileTransfer
             {
                 await ClientWire.SendChunkAsync(ws, _filePath, offset, chunkSize, totalSize,
                     _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
+            }
+        }
+
+        private async Task SendFolderResumableInternal(Guid sessionId, CancellationToken ct)
+        {
+            await UdtConnect(ct);
+            using (var ws = new UdtWireStream(_socket, false))
+            {
+                await ClientWire.SendFolderResumableAsync(ws, _filePath, sessionId,
+                    _serverIp, _port, true, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
         }
 

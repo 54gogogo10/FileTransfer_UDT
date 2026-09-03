@@ -33,6 +33,7 @@ echo.
     ..\DeviceDiscovery.cs ^
     ..\ResumeState.cs ^
     ..\ServerResumeStore.cs ^
+    ..\FolderResumeState.cs ^
     TestProgram.cs ^
     IntegrationTests.cs
 

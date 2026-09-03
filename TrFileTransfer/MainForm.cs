@@ -678,21 +678,46 @@ namespace TrFileTransfer
             {
                 foreach (var s in states) { if (s != null) validStates.Add(s); }
             }
-            if (validStates.Count == 0)
+            var folderStates = FolderResumeState.ListAll();
+            if (validStates.Count == 0 && folderStates.Count == 0)
             {
                 MessageBox.Show(L.ResumeListEmpty, L.ResumeListTitle,
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
-            using (var dlg = new ResumeDialog(validStates.ToArray()))
+            using (var dlg = new ResumeDialog(validStates.ToArray(), folderStates.ToArray()))
             {
-                if (dlg.ShowDialog() == DialogResult.OK && dlg.SelectedState != null)
+                var result = dlg.ShowDialog();
+                if (result == DialogResult.OK && dlg.SelectedFolderState != null)
+                {
+                    var f = dlg.SelectedFolderState;
+                    _txtServerIp.Text = f.ServerIp;
+                    _txtPortC.Text = f.Port.ToString();
+                    // Checked first — the CheckedChanged handler clears the path box
+                    _chkFolder.Checked = true;
+                    _txtFile.Text = f.FolderPath;
+                    _numConcurrency.Value = 1;
+                    _pendingResumeSession = f.SessionId;
+                    AddLog(L.ResumeQueued);
+                    if (f.IsUdt)
+                    {
+                        _rbClientTcp.Checked = false;
+                        _rbClientUdt.Checked = true;
+                    }
+                    else
+                    {
+                        _rbClientTcp.Checked = true;
+                        _rbClientUdt.Checked = false;
+                    }
+                }
+                else if (result == DialogResult.OK && dlg.SelectedState != null)
                 {
                     var s = dlg.SelectedState;
                     _txtServerIp.Text = s.ServerIp;
                     _txtPortC.Text = s.Port.ToString();
-                    _txtFile.Text = s.FilePath;
+                    // Checked first — the CheckedChanged handler clears the path box
                     _chkFolder.Checked = false;
+                    _txtFile.Text = s.FilePath;
                     _numConcurrency.Value = 1;
                     _pendingResumeSession = s.SessionId;
                     AddLog(L.ResumeQueued);
@@ -1162,16 +1187,27 @@ namespace TrFileTransfer
             bool isTcp = _rbClientTcp.Checked;
             int srcPort = (int)_numSrcPort.Value;
 
-            // Resume is only valid for single-file, single-connection sends, and only
-            // when the selected file still matches the one recorded in the resume state.
+            // Resume is only valid for single-connection sends, and only when the
+            // selected file/folder still matches the one recorded in the resume state.
             Guid? resumeSession = null;
-            if (!isFolder && concurrency == 1 && _pendingResumeSession.HasValue)
+            if (concurrency == 1 && _pendingResumeSession.HasValue)
             {
-                var st = ResumeState.Load(_pendingResumeSession.Value);
-                if (st != null && string.Equals(st.FilePath, path, StringComparison.OrdinalIgnoreCase))
-                    resumeSession = _pendingResumeSession;
+                if (isFolder)
+                {
+                    var fs = FolderResumeState.Load(_pendingResumeSession.Value);
+                    if (fs != null && string.Equals(fs.FolderPath, path, StringComparison.OrdinalIgnoreCase))
+                        resumeSession = _pendingResumeSession;
+                    else
+                        _pendingResumeSession = null;
+                }
                 else
-                    _pendingResumeSession = null;
+                {
+                    var st = ResumeState.Load(_pendingResumeSession.Value);
+                    if (st != null && string.Equals(st.FilePath, path, StringComparison.OrdinalIgnoreCase))
+                        resumeSession = _pendingResumeSession;
+                    else
+                        _pendingResumeSession = null;
+                }
             }
 
             await StartTransfer(path, isFolder, ip, port, isTcp, srcPort, concurrency,
@@ -1218,7 +1254,12 @@ namespace TrFileTransfer
                 {
                     _client = ClientFactory.CreateTcp(ip, port, path, srcPort, speedLimit);
                     WireClientEvents(_client);
-                    if (isFolder)
+                    if (isFolder && resumeSession.HasValue)
+                    {
+                        await _client.SendFolderResumableAsync(resumeSession.Value);
+                        _pendingResumeSession = null;
+                    }
+                    else if (isFolder)
                         await _client.SendFolderAsync(path);
                     else if (resumeSession.HasValue)
                     {
@@ -1232,7 +1273,12 @@ namespace TrFileTransfer
                 {
                     _clientUdt = ClientFactory.CreateUdt(ip, port, path, srcPort, speedLimit);
                     WireUdtClientEvents(_clientUdt);
-                    if (isFolder)
+                    if (isFolder && resumeSession.HasValue)
+                    {
+                        await _clientUdt.SendFolderResumableAsync(resumeSession.Value);
+                        _pendingResumeSession = null;
+                    }
+                    else if (isFolder)
                         await _clientUdt.SendFolderAsync(path);
                     else if (resumeSession.HasValue)
                     {
@@ -1784,29 +1830,33 @@ namespace TrFileTransfer
     public class ResumeDialog : Form
     {
         public ResumeState SelectedState;
+        public FolderResumeState SelectedFolderState;
         private ListBox _list;
         private Button _btnContinue, _btnDelete, _btnClearAll, _btnClose;
         private ResumeState[] _states;
+        private FolderResumeState[] _folderStates;
 
-        public ResumeDialog(ResumeState[] states)
+        public ResumeDialog(ResumeState[] states, FolderResumeState[] folderStates)
         {
-            _states = states;
+            _states = states ?? new ResumeState[0];
+            _folderStates = folderStates ?? new FolderResumeState[0];
             Text = L.ResumeListTitle;
-            Size = new Size(520, 320);
+            ClientSize = new Size(560, 340);
+            MinimumSize = new Size(460, 280);
             StartPosition = FormStartPosition.CenterParent;
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            MaximizeBox = false;
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MaximizeBox = true;
             MinimizeBox = false;
             Font = new Font("Segoe UI", 9f);
 
-            _list = new ListBox
+            var tlp = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(10) };
+            tlp.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+
+            _list = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false };
+            foreach (var s in _states)
             {
-                Location = new Point(12, 12), Width = 480, Height = 200,
-                IntegralHeight = false
-            };
-            for (int i = 0; i < states.Length; i++)
-            {
-                var s = states[i];
                 if (s == null) continue;
                 string progress = s.TotalSize > 0
                     ? string.Format("{0:F1}%", 100.0 * s.SentBytes / s.TotalSize)
@@ -1815,48 +1865,76 @@ namespace TrFileTransfer
                     s.FileName, s.ServerIp, s.Port, progress,
                     s.Created.ToLocalTime().ToString("g")));
             }
-            Controls.Add(_list);
+            foreach (var f in _folderStates)
+            {
+                if (f == null) continue;
+                string progress = f.TotalBytes > 0
+                    ? string.Format("{0:F1}%", 100.0 * f.SentBytes / f.TotalBytes)
+                    : "?";
+                _list.Items.Add(string.Format("{0}{1} ({2}) -> {3}:{4} [{5}] {6}",
+                    L.FolderTag, f.FolderName, f.FileCount, f.ServerIp, f.Port, progress,
+                    f.Created.ToLocalTime().ToString("g")));
+            }
+            tlp.Controls.Add(_list, 0, 0);
 
-            _btnContinue = new Button { Text = L.ResumeBtn, Location = new Point(12, 220), Width = 100 };
-            UiStyle.Primary(_btnContinue);
-            _btnContinue.Click += BtnContinue_Click;
-            Controls.Add(_btnContinue);
-
-            _btnDelete = new Button { Text = L.ResumeDelete, Location = new Point(120, 220), Width = 100 };
-            UiStyle.Secondary(_btnDelete);
-            _btnDelete.Click += BtnDelete_Click;
-            Controls.Add(_btnDelete);
-
-            _btnClearAll = new Button { Text = L.ResumeClearAll, Location = new Point(228, 220), Width = 100 };
-            UiStyle.Secondary(_btnClearAll);
-            _btnClearAll.Click += BtnClearAll_Click;
-            Controls.Add(_btnClearAll);
-
-            _btnClose = new Button { Text = L.CancelBtn, Location = new Point(370, 220), Width = 100 };
+            var buttons = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.RightToLeft,
+                WrapContents = false,
+                Margin = new Padding(0),
+                Padding = new Padding(0, 6, 0, 0)
+            };
+            _btnClose = new Button { Text = L.CancelBtn, Width = 100 };
             UiStyle.Secondary(_btnClose);
             _btnClose.Click += (__, ___) => Close();
-            Controls.Add(_btnClose);
+            buttons.Controls.Add(_btnClose);
+
+            _btnClearAll = new Button { Text = L.ResumeClearAll, Width = 100 };
+            UiStyle.Secondary(_btnClearAll);
+            _btnClearAll.Click += BtnClearAll_Click;
+            buttons.Controls.Add(_btnClearAll);
+
+            _btnDelete = new Button { Text = L.ResumeDelete, Width = 100 };
+            UiStyle.Secondary(_btnDelete);
+            _btnDelete.Click += BtnDelete_Click;
+            buttons.Controls.Add(_btnDelete);
+
+            _btnContinue = new Button { Text = L.ResumeBtn, Width = 100 };
+            UiStyle.Primary(_btnContinue);
+            _btnContinue.Click += BtnContinue_Click;
+            buttons.Controls.Add(_btnContinue);
+
+            tlp.Controls.Add(buttons, 0, 1);
+            Controls.Add(tlp);
+            AcceptButton = _btnContinue;
         }
 
         private void BtnContinue_Click(object sender, EventArgs e)
         {
             int idx = _list.SelectedIndex;
-            if (idx >= 0 && idx < _states.Length)
+            if (idx < 0) return;
+            if (idx < _states.Length)
             {
                 SelectedState = _states[idx];
-                DialogResult = DialogResult.OK;
-                Close();
             }
+            else
+            {
+                int folderIdx = idx - _states.Length;
+                if (folderIdx < _folderStates.Length)
+                    SelectedFolderState = _folderStates[folderIdx];
+            }
+            DialogResult = DialogResult.OK;
+            Close();
         }
 
         private void BtnDelete_Click(object sender, EventArgs e)
         {
             int idx = _list.SelectedIndex;
-            if (idx >= 0 && idx < _states.Length && _states[idx] != null)
+            if (idx < 0) return;
+            if (idx < _states.Length)
             {
-                ResumeState.Delete(_states[idx].SessionId);
-                _list.Items.RemoveAt(idx);
-                // rebuild state array without the deleted item
+                if (_states[idx] != null) ResumeState.Delete(_states[idx].SessionId);
                 var newStates = new System.Collections.Generic.List<ResumeState>();
                 for (int i = 0; i < _states.Length; i++)
                 {
@@ -1864,6 +1942,22 @@ namespace TrFileTransfer
                 }
                 _states = newStates.ToArray();
             }
+            else
+            {
+                int folderIdx = idx - _states.Length;
+                if (folderIdx < _folderStates.Length)
+                {
+                    if (_folderStates[folderIdx] != null)
+                        FolderResumeState.Delete(_folderStates[folderIdx].SessionId);
+                    var newFolders = new System.Collections.Generic.List<FolderResumeState>();
+                    for (int i = 0; i < _folderStates.Length; i++)
+                    {
+                        if (i != folderIdx && _folderStates[i] != null) newFolders.Add(_folderStates[i]);
+                    }
+                    _folderStates = newFolders.ToArray();
+                }
+            }
+            RefreshList();
         }
 
         private void BtnClearAll_Click(object sender, EventArgs e)
@@ -1872,8 +1966,41 @@ namespace TrFileTransfer
             {
                 if (_states[i] != null) ResumeState.Delete(_states[i].SessionId);
             }
-            _list.Items.Clear();
+            for (int i = 0; i < _folderStates.Length; i++)
+            {
+                if (_folderStates[i] != null) FolderResumeState.Delete(_folderStates[i].SessionId);
+            }
             _states = new ResumeState[0];
+            _folderStates = new FolderResumeState[0];
+            RefreshList();
+        }
+
+        private void RefreshList()
+        {
+            int selected = _list.SelectedIndex;
+            _list.Items.Clear();
+            foreach (var s in _states)
+            {
+                if (s == null) continue;
+                string progress = s.TotalSize > 0
+                    ? string.Format("{0:F1}%", 100.0 * s.SentBytes / s.TotalSize)
+                    : "?";
+                _list.Items.Add(string.Format("{0} -> {1}:{2} [{3}] {4}",
+                    s.FileName, s.ServerIp, s.Port, progress,
+                    s.Created.ToLocalTime().ToString("g")));
+            }
+            foreach (var f in _folderStates)
+            {
+                if (f == null) continue;
+                string progress = f.TotalBytes > 0
+                    ? string.Format("{0:F1}%", 100.0 * f.SentBytes / f.TotalBytes)
+                    : "?";
+                _list.Items.Add(string.Format("{0}{1} ({2}) -> {3}:{4} [{5}] {6}",
+                    L.FolderTag, f.FolderName, f.FileCount, f.ServerIp, f.Port, progress,
+                    f.Created.ToLocalTime().ToString("g")));
+            }
+            if (selected >= 0 && selected < _list.Items.Count)
+                _list.SelectedIndex = selected;
         }
     }
 
@@ -1901,7 +2028,7 @@ namespace TrFileTransfer
         }
     }
 
-    /// <summary>Send-queue dialog: batch tasks executed serially.</summary>
+    /// <summary>Send-queue dialog: batch tasks executed serially, with optional retries and per-item timing.</summary>
     public class QueueDialog : Form
     {
         private readonly Func<QueuedTask> _capture;
@@ -1910,6 +2037,7 @@ namespace TrFileTransfer
             = new System.Collections.Generic.List<QueuedTask>();
         private ListBox _list;
         private Button _btnAdd, _btnDelete, _btnClear, _btnStart, _btnClose;
+        private NumericUpDown _numRetries;
         private bool _running;
 
         public QueueDialog(Func<QueuedTask> capture, Func<QueuedTask, Task<bool>> executor,
@@ -1923,46 +2051,71 @@ namespace TrFileTransfer
                     _tasks.Add(t);
             }
             Text = L.QueueTitle;
-            Size = new Size(560, 360);
+            ClientSize = new Size(600, 400);
+            MinimumSize = new Size(500, 320);
             StartPosition = FormStartPosition.CenterParent;
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            MaximizeBox = false;
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MaximizeBox = true;
             MinimizeBox = false;
             Font = new Font("Segoe UI", 9f);
 
-            _list = new ListBox
-            {
-                Location = new Point(12, 12), Width = 520, Height = 240,
-                IntegralHeight = false
-            };
+            var tlp = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(10) };
+            tlp.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+
+            _list = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false };
             for (int i = 0; i < _tasks.Count; i++)
                 _list.Items.Add(FormatTask(_tasks[i]));
-            Controls.Add(_list);
+            tlp.Controls.Add(_list, 0, 0);
 
-            _btnAdd = new Button { Text = L.QueueAdd, Location = new Point(12, 262), Width = 100 };
+            var bottom = new TableLayoutPanel { Dock = DockStyle.Fill, Margin = new Padding(0), Padding = new Padding(0, 6, 0, 0), BackColor = Color.Transparent };
+            bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            bottom.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            bottom.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+
+            _btnAdd = new Button { Text = L.QueueAdd, Width = 100 };
             UiStyle.Secondary(_btnAdd);
             _btnAdd.Click += BtnAdd_Click;
-            Controls.Add(_btnAdd);
+            bottom.Controls.Add(_btnAdd, 0, 0);
 
-            _btnDelete = new Button { Text = L.QueueDelete, Location = new Point(120, 262), Width = 100 };
+            _btnDelete = new Button { Text = L.QueueDelete, Width = 100, Margin = new Padding(6, 3, 3, 3) };
             UiStyle.Secondary(_btnDelete);
             _btnDelete.Click += BtnDelete_Click;
-            Controls.Add(_btnDelete);
+            bottom.Controls.Add(_btnDelete, 1, 0);
 
-            _btnClear = new Button { Text = L.QueueClear, Location = new Point(228, 262), Width = 100 };
-            UiStyle.Secondary(_btnClear);
-            _btnClear.Click += BtnClear_Click;
-            Controls.Add(_btnClear);
-
-            _btnStart = new Button { Text = L.QueueStart, Location = new Point(336, 262), Width = 100 };
-            UiStyle.Primary(_btnStart);
-            _btnStart.Click += BtnStart_Click;
-            Controls.Add(_btnStart);
-
-            _btnClose = new Button { Text = L.CancelBtn, Location = new Point(444, 262), Width = 90 };
+            var right = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, Margin = new Padding(0) };
+            _btnClose = new Button { Text = L.CancelBtn, Width = 90 };
             UiStyle.Secondary(_btnClose);
             _btnClose.Click += (__, ___) => Close();
-            Controls.Add(_btnClose);
+            right.Controls.Add(_btnClose);
+
+            _btnStart = new Button { Text = L.QueueStart, Width = 100 };
+            UiStyle.Primary(_btnStart);
+            _btnStart.Click += BtnStart_Click;
+            right.Controls.Add(_btnStart);
+
+            _btnClear = new Button { Text = L.QueueClear, Width = 100 };
+            UiStyle.Secondary(_btnClear);
+            _btnClear.Click += BtnClear_Click;
+            right.Controls.Add(_btnClear);
+
+            // RightToLeft flow renders last-added leftmost: visual order = label, numeric, buttons
+            _numRetries = new NumericUpDown
+            {
+                Minimum = 0, Maximum = 5,
+                Value = Math.Max(0, Math.Min(5, Config.GetInt("QueueRetries", 1))),
+                Width = 44, Margin = new Padding(0, 4, 3, 3)
+            };
+            right.Controls.Add(_numRetries);
+
+            var lblRetry = new Label { Text = L.QueueRetriesLabel, AutoSize = true, Margin = new Padding(9, 9, 3, 0), ForeColor = Color.FromArgb(68, 68, 68) };
+            right.Controls.Add(lblRetry);
+
+            bottom.Controls.Add(right, 2, 0);
+            tlp.Controls.Add(bottom, 0, 1);
+            Controls.Add(tlp);
+            AcceptButton = _btnStart;
         }
 
         private void BtnAdd_Click(object sender, EventArgs e)
@@ -2004,13 +2157,28 @@ namespace TrFileTransfer
             _btnAdd.Enabled = false;
             _btnDelete.Enabled = false;
             _btnClear.Enabled = false;
+            _numRetries.Enabled = false;
+            Config.SetInt("QueueRetries", (int)_numRetries.Value);
+            int retries = (int)_numRetries.Value;
             try
             {
                 for (int i = 0; i < _tasks.Count; i++)
                 {
-                    _list.Items[i] = "\u25B6 " + FormatTask(_tasks[i]); // ▶
-                    bool ok = await _executor(_tasks[i]);
-                    _list.Items[i] = (ok ? "\u2713 " : "\u2717 ") + FormatTask(_tasks[i]); // ✓ / ✗
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    bool ok = false;
+                    for (int attempt = 0; ; attempt++)
+                    {
+                        string prefix = attempt > 0
+                            ? "\u25B6 " + FormatTask(_tasks[i]) + " (" + L.RetryWord + " " + attempt + "/" + retries + ")"
+                            : "\u25B6 " + FormatTask(_tasks[i]); // ▶
+                        _list.Items[i] = prefix;
+                        ok = await _executor(_tasks[i]);
+                        if (ok || attempt >= retries) break;
+                        await Task.Delay(500);
+                    }
+                    sw.Stop();
+                    _list.Items[i] = (ok ? "\u2713 " : "\u2717 ") + FormatTask(_tasks[i])
+                        + "  [" + sw.Elapsed.TotalSeconds.ToString("F1") + "s]"; // ✓ / ✗
                 }
             }
             finally
@@ -2020,6 +2188,7 @@ namespace TrFileTransfer
                 _btnAdd.Enabled = true;
                 _btnDelete.Enabled = true;
                 _btnClear.Enabled = true;
+                _numRetries.Enabled = true;
             }
         }
 
@@ -2050,34 +2219,47 @@ namespace TrFileTransfer
                 foreach (var d in knownDevices) _known.Add(d);
             }
             Text = L.ScanTitle;
-            Size = new Size(480, 320);
+            ClientSize = new Size(520, 360);
+            MinimumSize = new Size(440, 300);
             StartPosition = FormStartPosition.CenterParent;
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            MaximizeBox = false;
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MaximizeBox = true;
             MinimizeBox = false;
             Font = new Font("Segoe UI", 9f);
 
-            _list = new ListBox
+            var tlp = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(10) };
+            tlp.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+
+            _list = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false };
+            tlp.Controls.Add(_list, 0, 0);
+
+            var buttons = new FlowLayoutPanel
             {
-                Location = new Point(12, 12), Width = 440, Height = 200,
-                IntegralHeight = false
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.RightToLeft,
+                WrapContents = false,
+                Margin = new Padding(0),
+                Padding = new Padding(0, 6, 0, 0)
             };
-            Controls.Add(_list);
-
-            _btnRescan = new Button { Text = L.ScanRescan, Location = new Point(12, 222), Width = 100 };
-            UiStyle.Secondary(_btnRescan);
-            _btnRescan.Click += async (s2, e2) => await ScanAsync();
-            Controls.Add(_btnRescan);
-
-            _btnUse = new Button { Text = L.ScanUse, Location = new Point(120, 222), Width = 100 };
-            UiStyle.Primary(_btnUse);
-            _btnUse.Click += BtnUse_Click;
-            Controls.Add(_btnUse);
-
-            _btnClose = new Button { Text = L.CancelBtn, Location = new Point(228, 222), Width = 100 };
+            _btnClose = new Button { Text = L.CancelBtn, Width = 100 };
             UiStyle.Secondary(_btnClose);
             _btnClose.Click += (__, ___) => Close();
-            Controls.Add(_btnClose);
+            buttons.Controls.Add(_btnClose);
+
+            _btnUse = new Button { Text = L.ScanUse, Width = 100 };
+            UiStyle.Primary(_btnUse);
+            _btnUse.Click += BtnUse_Click;
+            buttons.Controls.Add(_btnUse);
+
+            _btnRescan = new Button { Text = L.ScanRescan, Width = 100 };
+            UiStyle.Secondary(_btnRescan);
+            _btnRescan.Click += async (s2, e2) => await ScanAsync();
+            buttons.Controls.Add(_btnRescan);
+
+            tlp.Controls.Add(buttons, 0, 1);
+            Controls.Add(tlp);
 
             Shown += async (s2, e2) => await ScanAsync();
         }
@@ -2180,18 +2362,20 @@ namespace TrFileTransfer
         {
             _entries = entries;
             Text = L.RecentFiles;
-            Size = new Size(560, 340);
+            ClientSize = new Size(600, 380);
+            MinimumSize = new Size(500, 300);
             StartPosition = FormStartPosition.CenterParent;
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            MaximizeBox = false;
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MaximizeBox = true;
             MinimizeBox = false;
             Font = new Font("Segoe UI", 9f);
 
-            _list = new ListBox
-            {
-                Location = new Point(12, 12), Width = 520, Height = 230,
-                IntegralHeight = false
-            };
+            var tlp = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(10) };
+            tlp.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+
+            _list = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false };
             if (entries == null || entries.Length == 0)
             {
                 _list.Items.Add(L.RecentFilesEmpty);
@@ -2202,17 +2386,29 @@ namespace TrFileTransfer
                     _list.Items.Add(FormatEntry(entries[i]));
             }
             _list.DoubleClick += (s2, e2) => BtnOpen_Click(null, null);
-            Controls.Add(_list);
+            tlp.Controls.Add(_list, 0, 0);
 
-            _btnOpen = new Button { Text = L.RecentOpen, Location = new Point(12, 252), Width = 110 };
-            UiStyle.Secondary(_btnOpen);
-            _btnOpen.Click += BtnOpen_Click;
-            Controls.Add(_btnOpen);
-
-            _btnClose = new Button { Text = L.CancelBtn, Location = new Point(130, 252), Width = 110 };
+            var buttons = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.RightToLeft,
+                WrapContents = false,
+                Margin = new Padding(0),
+                Padding = new Padding(0, 6, 0, 0)
+            };
+            _btnClose = new Button { Text = L.CancelBtn, Width = 110 };
             UiStyle.Secondary(_btnClose);
             _btnClose.Click += (__, ___) => Close();
-            Controls.Add(_btnClose);
+            buttons.Controls.Add(_btnClose);
+
+            _btnOpen = new Button { Text = L.RecentOpen, Width = 110 };
+            UiStyle.Secondary(_btnOpen);
+            _btnOpen.Click += BtnOpen_Click;
+            buttons.Controls.Add(_btnOpen);
+
+            tlp.Controls.Add(buttons, 0, 1);
+            Controls.Add(tlp);
+            AcceptButton = _btnOpen;
         }
 
         private static string FormatEntry(string entry)

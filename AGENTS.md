@@ -45,11 +45,11 @@ TrFileTransfer.Tests.exe
 
 ## 架构
 
-十三个源文件编译为单个 WinForms exe：
+十四个源文件编译为单个 WinForms exe：
 
 - **Program.cs** — 入口。`[STAThread]` Main 启动 `MainForm`。
-- **MainForm.cs** — GUI。窗口可缩放（TableLayoutPanel 根布局：表头/服务器/客户端为固定行，进度区 SplitContainer 左右分栏与日志区平分剩余空间；进度卡片宽度经 `SyncCardWidths` 随面板自适应）。按钮统一走 `UiStyle.Primary/Secondary` 扁平样式（蓝色主操作 + 白底描边次操作），四个对话框（Queue/Discovery/Resume/Recent）同样套用。日志为深色控制台风格（Consolas 9f，#1E1E1E）。服务器和客户端面板同时显示。协议选择（TCP/UDT）、服务器绑定地址下拉框。**并发控制**：`_numConcurrency`（1-8）。文件夹/监控模式复选框、**完整校验复选框**（续传时启用 0x03 全文件哈希）、**限速输入**（KB/s，0=不限，Config `SpeedLimit`）。动态进度卡片（左右两个 FlowLayoutPanel，TCP/UDT 独立字典按 IPEndPoint 区分，完成 3 秒后移除）。语言下拉框、日志上限 500 条、进度节流 100ms。`WireClientEvents`/`WireUdtClientEvents`/`WireConcurrentEvents` 辅助方法。**发送队列**（`QueueDialog` 串行批量执行，复用抽取的 `StartTransfer` 公共方法）。**设备发现**（"扫描"按钮 → `DiscoveryDialog`，服务器启动时 `DiscoveryServer` 在 UDP 端口广播响应）。**完成通知**（托盘 `NotifyIcon` BalloonTip + 提示音，Config `NotifyEnabled`/`NotifySound`）。**接收文件管理**（"打开目录"/"最近接收"按钮 + `OnFileReceived` 事件 + 按日期归档 Config `AutoArchive`）。`StartTransfer` 内部 try/catch 返回 bool，失败不再冒泡崩溃。**拖放批量入队**（拖多个文件/文件夹时逐项入队并直接打开 `QueueDialog`，单个仍填充路径框；`CaptureQueuedTaskFor(path, isFolder)` 从 `CaptureQueuedTask` 抽取复用）。**日志持久化**（`AddLog` 的每条日志同时经 `AppendLogFile` 写入 `%AppData%\TrFileTransfer\logs\yyyy-MM-dd.txt`，失败静默；保留 30 天，每日首次写日志时清理过期文件）。**设备记忆**（传输成功后 `RememberDevice` 记入 Config `KnownDevices`——普通发送与监控模式均记录——格式 `Name|Ip|Port|flags`（分号分隔多条，flags 位1=TCP 位2=UDT），上限 10 条；`DiscoveryDialog` 将在线结果按 Ip+Port 合并进已知列表去重显示）。**托盘常驻**（最小化时 `Hide()`；用户关闭窗口=取消关闭+`SaveConfig`+隐藏+BalloonTip；仅托盘菜单"退出"设置 `_trayExit` 后真正退出，退出时释放 `NotifyIcon` 防止托盘图标残留）。
-- **WireProtocol.cs** — **共享线协议核心**（0x00–0x03 全部逻辑唯一实现）。`IWireStream` 统一精确读/写字节流（`TcpWireStream` 包 `NetworkStream`，`UdtWireStream` 包 UDT socket）；`ServerWire`（接收端：0x00/0x01/0x02/0x03 处理、`ReceiveFilePayload`、全文件校验、续传协商）与 `ClientWire`（发送端：单文件/文件夹/分块/续传、`SendFilePayload` 双缓冲+令牌桶限速）；`WireCallbacks` 把日志/进度/错误/完成事件回传给传输类；`ServerWireContext` 持有分块与续传状态（`Shutdown()` 统一落盘）。0x02 分块返回 `WireOutcome{Success, IsChunked}`，让 TCP（无条件触发 per-client 完成）与 UDT（成功才 ACK）各自保留 ACK 语义。
+- **MainForm.cs** — GUI。窗口可缩放（TableLayoutPanel 根布局：表头/服务器/客户端为固定行，进度区 SplitContainer 左右分栏与日志区平分剩余空间；进度卡片宽度经 `SyncCardWidths` 随面板自适应）。按钮统一走 `UiStyle.Primary/Secondary` 扁平样式（蓝色主操作 + 白底描边次操作），四个对话框（Queue/Discovery/Resume/Recent）同样套用。日志为深色控制台风格（Consolas 9f，#1E1E1E）。服务器和客户端面板同时显示。协议选择（TCP/UDT）、服务器绑定地址下拉框。**并发控制**：`_numConcurrency`（1-8）。文件夹/监控模式复选框、**完整校验复选框**（续传时启用 0x03 全文件哈希）、**限速输入**（KB/s，0=不限，Config `SpeedLimit`）。动态进度卡片（左右两个 FlowLayoutPanel，TCP/UDT 独立字典按 IPEndPoint 区分，完成 3 秒后移除）。语言下拉框、日志上限 500 条、进度节流 100ms。`WireClientEvents`/`WireUdtClientEvents`/`WireConcurrentEvents` 辅助方法。**发送队列**（`QueueDialog` 串行批量执行，复用抽取的 `StartTransfer` 公共方法；失败自动重试 N 次——Config `QueueRetries`，0-5——列表项显示▶执行中/✓✗结果与耗时）。**续传列表**（`ResumeDialog` 同时列出单文件 `ResumeState` 与文件夹 `FolderResumeState` 会话，中括号 `[文件夹]` 前缀区分；选中后填充客户端面板并设 `_pendingResumeSession`，`StartTransfer` 按 isFolder 分派到 0x03/0x04）。**设备发现**（"扫描"按钮 → `DiscoveryDialog`，服务器启动时 `DiscoveryServer` 在 UDP 端口广播响应）。**完成通知**（托盘 `NotifyIcon` BalloonTip + 提示音，Config `NotifyEnabled`/`NotifySound`）。**接收文件管理**（"打开目录"/"最近接收"按钮 + `OnFileReceived` 事件 + 按日期归档 Config `AutoArchive`）。`StartTransfer` 内部 try/catch 返回 bool，失败不再冒泡崩溃。**拖放批量入队**（拖多个文件/文件夹时逐项入队并直接打开 `QueueDialog`，单个仍填充路径框；`CaptureQueuedTaskFor(path, isFolder)` 从 `CaptureQueuedTask` 抽取复用）。**日志持久化**（`AddLog` 的每条日志同时经 `AppendLogFile` 写入 `%AppData%\TrFileTransfer\logs\yyyy-MM-dd.txt`，失败静默；保留 30 天，每日首次写日志时清理过期文件）。**设备记忆**（传输成功后 `RememberDevice` 记入 Config `KnownDevices`——普通发送与监控模式均记录——格式 `Name|Ip|Port|flags`（分号分隔多条，flags 位1=TCP 位2=UDT），上限 10 条；`DiscoveryDialog` 将在线结果按 Ip+Port 合并进已知列表去重显示）。**托盘常驻**（最小化时 `Hide()`；用户关闭窗口=取消关闭+`SaveConfig`+隐藏+BalloonTip；仅托盘菜单"退出"设置 `_trayExit` 后真正退出，退出时释放 `NotifyIcon` 防止托盘图标残留）。
+- **WireProtocol.cs** — **共享线协议核心**（0x00–0x04 全部逻辑唯一实现）。`IWireStream` 统一精确读/写字节流（`TcpWireStream` 包 `NetworkStream`，`UdtWireStream` 包 UDT socket）；`ServerWire`（接收端：0x00/0x01/0x02/0x03/0x04 处理、`ReceiveFilePayload`、全文件校验、续传协商、文件夹续传扫描 `GetFolderSessionDir`）与 `ClientWire`（发送端：单文件/文件夹/分块/续传/文件夹续传、`SendFilePayload` 双缓冲+令牌桶限速）；`WireCallbacks` 把日志/进度/错误/完成事件回传给传输类；`ServerWireContext` 持有分块与续传状态（`Shutdown()` 统一落盘）。0x02 分块返回 `WireOutcome{Success, IsChunked}`，让 TCP（无条件触发 per-client 完成）与 UDT（成功才 ACK）各自保留 ACK 语义。
 - **TransferServer.cs** — TCP 传输薄封装：监听/接受循环/生命周期 + `ServerWireContext` 装配；协议处理全部委托 `ServerWire.HandleClientAsync`。`NoDelay = true`，LongRunning 接受循环。
 - **TransferClient.cs** — TCP 客户端薄封装：`CreateClient()`（源端口绑定，失败抛 `PortBindException`）+ `ConnectAsync()`；发送逻辑委托 `ClientWire`。公开 API：`SendAsync()`/`SendFolderAsync()`/`SendChunkedAsync()`/`SendResumableAsync(sessionId, verifyHash)`。
 - **TransferUdt.cs** — UDT 传输薄封装：`UdtNative` 引用计数 + Cdecl P/Invoke；`UdtDll` 提取嵌入 DLL；`UdtIo` 封装异步 I/O（**错误描述在线程内捕获**，`LastError` 供诊断）；`TransferUdtServer`/`TransferUdtClient` 仅保留 UDT 特有部分（accept 循环、连接握手 `WaitForConnectionReady`、成功后 1 字节应用层 ACK），协议处理委托 `ServerWire`/`ClientWire`。`udt_listen` backlog 32。
@@ -57,6 +57,7 @@ TrFileTransfer.Tests.exe
 - **Config.cs** — 键值配置持久化。`Get`/`GetInt`/`GetBool`/`Set`/`SetInt`/`SetBool`。启动时加载，关闭时保存。
 - **Shared.cs** — `TransferProgress`/`FileEntry` 结构体。`ChunkTracker`（分块重组）。`SpeedLimiter`（令牌桶限速）。`Utils` 静态辅助（`FormatSize`、`ConstantTimeEquals`、`LogTo`、`SanitizeRelativePath`、`GetUniqueSavePath`、`FindFreePort`、`EmptyBytes`）。
 - **ResumeState.cs** — 客户端续传状态持久化（含 `SourceMTime` 源文件变化检测）。
+- **FolderResumeState.cs** — 客户端**文件夹续传会话**持久化（`%AppData%\TrFileTransfer\folder-resume`，同一键值格式）：SessionId/源文件夹/目标地址/进度。服务器侧进度不落盘——磁盘文件本身就是状态，续传时由服务器扫描推导。
 - **ServerResumeStore.cs** — 服务器续传状态落盘（`%AppData%\TrFileTransfer\server-resume`），服务器重启后按磁盘偏移恢复；`CleanupStale(7)` 在 TCP/UDT 服务器 Start 时调用，清理 7 天以上客户端未返回的孤儿会话文件。
 - **DeviceDiscovery.cs** — UDP 设备发现：探测 `0xD1` → 响应 `0xD2`（名称/端口/协议位图），默认端口 45000（Config `DiscoveryPort`）。
 - **L10N.cs** — 本地化字符串。静态 `L` 类根据 `L.IsChinese` 返回英文或中文文本。命名规则见下方"本地化约定"。
@@ -84,7 +85,7 @@ TCP 和 UDT 服务器都使用 `Utils.GetUniqueSavePath`，在基础文件名（
 
 ## TCP 线协议
 
-所有传输以 1 字节类型开始：`0x00` = 单文件，`0x01` = 文件夹，`0x02` = 分块文件，`0x03` = 断点续传。
+所有传输以 1 字节类型开始：`0x00` = 单文件，`0x01` = 文件夹，`0x02` = 分块文件，`0x03` = 断点续传（单文件），`0x04` = 文件夹断点续传（清单 + 0x11 协商，完整字节布局见 `WIRE-PROTOCOL.md`）。
 
 ### 断点续传（类型 0x03）
 
@@ -133,6 +134,8 @@ TCP 和 UDT 服务器都使用 `Utils.GetUniqueSavePath`，在基础文件名（
 ```
 
 服务器根据需要从每个文件的相对路径在保存路径中创建子目录。如果某个文件的 SHA256 失败，整个文件夹传输中止。文件名冲突处理在文件夹保存目录名追加 `_1`、`_2`。
+
+文件夹断点续传（0x04）的服务器保存目录由会话确定性推导（`ServerWire.GetFolderSessionDir`：`<saveDir>/<folderName>.<sessionId 前 8 位>`），同一会话跨重启映射到同一目录；续传扫描对"大小相符"的文件用清单中的全文件哈希二次校验后才跳过。
 
 ## UDT 传输
 
