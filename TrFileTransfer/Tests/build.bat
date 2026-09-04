@@ -34,6 +34,7 @@ echo.
     ..\ResumeState.cs ^
     ..\ServerResumeStore.cs ^
     ..\FolderResumeState.cs ^
+    ..\Updater.cs ^
     TestProgram.cs ^
     IntegrationTests.cs
 

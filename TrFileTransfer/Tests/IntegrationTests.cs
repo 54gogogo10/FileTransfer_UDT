@@ -74,6 +74,14 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_UDT_SingleFile", UdtSingleFile, 1);
             runner.Run("Integration_UDT_LargeSingle", UdtLargeSingle, 1);
             runner.Run("Integration_UDT_LargeConcur", UdtLargeConcur, 1);
+            runner.Run("Integration_Update_CheckAndDownload", UpdateCheckAndDownload);
+            runner.Run("Integration_Update_DownloadHashMismatch", UpdateDownloadHashMismatch);
+            runner.Run("Integration_Update_Manifest404", UpdateCheckHttp404);
+            runner.Run("Integration_Update_ManifestInvalid", UpdateCheckInvalidManifest);
+            runner.Run("Integration_Update_NotNewer", UpdateNotNewer);
+            runner.Run("Integration_Update_GitHub_FullFlow", UpdateGitHubFullFlow);
+            runner.Run("Integration_Update_GitHub_BadSidecar", UpdateGitHubBadSidecar);
+            runner.Run("Integration_Update_GitHub_MissingSidecar", UpdateGitHubMissingSidecar);
         }
 
         private static void TcpSingleFile()
@@ -2207,6 +2215,316 @@ namespace TrFileTransfer.Tests
                 try { Directory.Delete(sendDir, true); } catch { }
                 try { Directory.Delete(recvDir, true); } catch { }
             }
+        }
+
+        // ---- Auto update (Updater vs a minimal local HTTP server) ----
+
+        /// <summary>Tiny blocking HTTP/1.1 file server on 127.0.0.1 — no HttpListener ACL
+        /// requirements, so it works under plain users and CI.</summary>
+        private sealed class MiniHttpServer : IDisposable
+        {
+            private readonly TcpListener _listener;
+            private readonly System.Collections.Generic.Dictionary<string, byte[]> _files =
+                new System.Collections.Generic.Dictionary<string, byte[]>();
+            private readonly Thread _thread;
+            private volatile bool _running = true;
+
+            public int Port { get; private set; }
+
+            public MiniHttpServer()
+            {
+                _listener = new TcpListener(System.Net.IPAddress.Loopback, 0);
+                _listener.Start();
+                Port = ((System.Net.IPEndPoint)_listener.LocalEndpoint).Port;
+                _thread = new Thread(Loop);
+                _thread.IsBackground = true;
+                _thread.Start();
+            }
+
+            public void SetFile(string path, byte[] data) { _files[path] = data; }
+
+            public string BaseUrl { get { return "http://127.0.0.1:" + Port; } }
+
+            private void Loop()
+            {
+                while (_running)
+                {
+                    TcpClient client;
+                    try { client = _listener.AcceptTcpClient(); }
+                    catch { break; }
+                    ThreadPool.QueueUserWorkItem(delegate { Handle(client); });
+                }
+            }
+
+            private void Handle(TcpClient client)
+            {
+                try
+                {
+                    client.ReceiveTimeout = 5000;
+                    client.SendTimeout = 5000;
+                    using (client)
+                    using (NetworkStream ns = client.GetStream())
+                    {
+                        string requestLine = ReadRequestLine(ns);
+                        string path = null;
+                        if (requestLine != null && requestLine.StartsWith("GET ", StringComparison.OrdinalIgnoreCase))
+                        {
+                            path = requestLine.Substring(4);
+                            int sp = path.IndexOf(' ');
+                            if (sp > 0) path = path.Substring(0, sp);
+                            int q = path.IndexOf('?');
+                            if (q >= 0) path = path.Substring(0, q);
+                        }
+
+                        byte[] body = null;
+                        bool found = path != null && _files.TryGetValue(path, out body);
+                        if (!found) body = System.Text.Encoding.UTF8.GetBytes("not found");
+                        byte[] head = System.Text.Encoding.ASCII.GetBytes(
+                            "HTTP/1.1 " + (found ? "200 OK" : "404 Not Found") + "\r\n" +
+                            "Content-Type: application/octet-stream\r\n" +
+                            "Content-Length: " + body.Length + "\r\n" +
+                            "Connection: close\r\n\r\n");
+                        ns.Write(head, 0, head.Length);
+                        ns.Write(body, 0, body.Length);
+                    }
+                }
+                catch { }
+            }
+
+            private static string ReadRequestLine(NetworkStream ns)
+            {
+                // First line of the request is enough (Connection: close, body-less GET).
+                var buf = new byte[8192];
+                var all = new System.Text.StringBuilder();
+                while (all.Length < 16384)
+                {
+                    int n = ns.Read(buf, 0, buf.Length);
+                    if (n <= 0) break;
+                    all.Append(System.Text.Encoding.ASCII.GetString(buf, 0, n));
+                    string s = all.ToString();
+                    int nl = s.IndexOf("\r\n", StringComparison.Ordinal);
+                    if (nl > 0) return s.Substring(0, nl);
+                    if (nl == 0) return null;
+                }
+                return null;
+            }
+
+            public void Dispose()
+            {
+                _running = false;
+                try { _listener.Stop(); } catch { }
+            }
+        }
+
+        private static void UpdateCheckAndDownload()
+        {
+            var server = new MiniHttpServer();
+            string dir = Path.Combine(TempBase(), "tr_upd_it_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            try
+            {
+                byte[] payload = new byte[100000];
+                for (int i = 0; i < payload.Length; i++) payload[i] = (byte)(i * 31 + 7);
+                string payloadPath = Path.Combine(dir, "payload.bin");
+                File.WriteAllBytes(payloadPath, payload);
+                string sha = Updater.ComputeSha256Hex(payloadPath);
+
+                string manifest = "version=9.9.9.9\r\n" +
+                    "url=" + server.BaseUrl + "/app.exe\r\n" +
+                    "sha256=" + sha + "\r\n" +
+                    "notes=integration test build\r\n";
+                server.SetFile("/manifest.txt", System.Text.Encoding.UTF8.GetBytes(manifest));
+                server.SetFile("/app.exe", payload);
+
+                UpdateManifest m = Updater.CheckAsync(server.BaseUrl + "/manifest.txt", 10000).Result;
+                Assert.True(m != null, "manifest fetched and parsed");
+                Assert.Equal(new Version(9, 9, 9, 9), m.Version, "version");
+                Assert.Equal(server.BaseUrl + "/app.exe", m.Url, "url");
+                Assert.Equal(sha, m.Sha256Hex, "sha256");
+                Assert.Equal("integration test build", m.Notes, "notes");
+                Assert.True(m.IsNewerThan(new Version(2, 1, 0, 0)), "newer than current release");
+
+                string dest = Path.Combine(dir, "downloaded.exe");
+                long lastRead = -1, lastTotal = -1;
+                Updater.DownloadAsync(m, dest, (r, t) => { lastRead = r; lastTotal = t; }, 15000).Wait();
+                Assert.True(File.Exists(dest), "downloaded file exists");
+                byte[] got = File.ReadAllBytes(dest);
+                Assert.Equal(payload.Length, got.Length, "downloaded length");
+                Assert.True(Utils.ConstantTimeEquals(payload, got), "downloaded bytes identical");
+                Assert.Equal((long)payload.Length, lastRead, "progress reported final read");
+                Assert.Equal((long)payload.Length, lastTotal, "progress reported total");
+            }
+            finally
+            {
+                server.Dispose();
+                try { Directory.Delete(dir, true); } catch { }
+            }
+        }
+
+        private static void UpdateDownloadHashMismatch()
+        {
+            var server = new MiniHttpServer();
+            string dir = Path.Combine(TempBase(), "tr_upd_hm_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            try
+            {
+                byte[] payload = System.Text.Encoding.UTF8.GetBytes("this is not the file you are hashing");
+                server.SetFile("/app.exe", payload);
+                string badSha = new string('0', 64);
+                string manifest = "version=9.9.9.9\r\n" +
+                    "url=" + server.BaseUrl + "/app.exe\r\n" +
+                    "sha256=" + badSha + "\r\n";
+                server.SetFile("/manifest.txt", System.Text.Encoding.UTF8.GetBytes(manifest));
+
+                UpdateManifest m = Updater.CheckAsync(server.BaseUrl + "/manifest.txt", 10000).Result;
+                string dest = Path.Combine(dir, "bad.exe");
+                Exception inner = null;
+                try { Updater.DownloadAsync(m, dest, null, 15000).Wait(); }
+                catch (AggregateException agg) { inner = agg.InnerException; }
+                Assert.True(inner is System.IO.InvalidDataException, "hash mismatch -> InvalidDataException, got: " + (inner == null ? "none" : inner.GetType().Name));
+                Assert.False(File.Exists(dest), "dest removed on mismatch");
+                Assert.False(File.Exists(dest + ".part"), "partial removed on mismatch");
+            }
+            finally
+            {
+                server.Dispose();
+                try { Directory.Delete(dir, true); } catch { }
+            }
+        }
+
+        private static void UpdateCheckHttp404()
+        {
+            var server = new MiniHttpServer();
+            try
+            {
+                Exception inner = null;
+                try { Updater.CheckAsync(server.BaseUrl + "/missing.txt", 10000).Wait(); }
+                catch (AggregateException agg) { inner = agg.InnerException; }
+                Assert.True(inner != null, "404 -> exception");
+                Assert.True(inner is System.Net.WebException, "404 -> WebException, got: " + inner.GetType().Name);
+            }
+            finally { server.Dispose(); }
+        }
+
+        private static void UpdateCheckInvalidManifest()
+        {
+            var server = new MiniHttpServer();
+            try
+            {
+                server.SetFile("/manifest.txt", System.Text.Encoding.UTF8.GetBytes("hello world\nno key value pairs here\n"));
+                Exception inner = null;
+                try { Updater.CheckAsync(server.BaseUrl + "/manifest.txt", 10000).Wait(); }
+                catch (AggregateException agg) { inner = agg.InnerException; }
+                Assert.True(inner is System.IO.InvalidDataException, "garbage manifest -> InvalidDataException, got: " + (inner == null ? "none" : inner.GetType().Name));
+            }
+            finally { server.Dispose(); }
+        }
+
+        private static void UpdateNotNewer()
+        {
+            var server = new MiniHttpServer();
+            try
+            {
+                string manifest = "version=1.0.0.0\r\n" +
+                    "url=" + server.BaseUrl + "/app.exe\r\n" +
+                    "sha256=" + new string('a', 64) + "\r\n";
+                server.SetFile("/manifest.txt", System.Text.Encoding.UTF8.GetBytes(manifest));
+
+                UpdateManifest m = Updater.CheckAsync(server.BaseUrl + "/manifest.txt", 10000).Result;
+                Assert.True(m != null, "manifest parsed");
+                Assert.False(m.IsNewerThan(new Version(2, 1, 0, 0)), "older version is not newer");
+            }
+            finally { server.Dispose(); }
+        }
+
+        /// <summary>Builds a GitHub /releases/latest-style JSON document around the
+        /// given server (asset URLs point at the same local server).</summary>
+        private static string GitHubReleaseJson(MiniHttpServer server, string tag, string notes)
+        {
+            return "{" +
+                "\"url\":\"https://api.github.com/repos/o/r/releases/1\"," +
+                "\"tag_name\":\"" + tag + "\"," +
+                "\"name\":\"" + tag + "\"," +
+                "\"body\":\"" + notes + "\"," +
+                "\"draft\":false," +
+                "\"assets\":[" +
+                "{\"name\":\"TrFileTransfer.exe\",\"browser_download_url\":\"" + server.BaseUrl + "/TrFileTransfer.exe\"}," +
+                "{\"name\":\"TrFileTransfer.exe.sha256\",\"browser_download_url\":\"" + server.BaseUrl + "/TrFileTransfer.exe.sha256\"}" +
+                "]}";
+        }
+
+        private static void UpdateGitHubFullFlow()
+        {
+            var server = new MiniHttpServer();
+            string dir = Path.Combine(TempBase(), "tr_upd_gh_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            try
+            {
+                byte[] payload = new byte[50000];
+                for (int i = 0; i < payload.Length; i++) payload[i] = (byte)(i * 7 + 3);
+                string payloadPath = Path.Combine(dir, "payload.bin");
+                File.WriteAllBytes(payloadPath, payload);
+                string sha = Updater.ComputeSha256Hex(payloadPath);
+
+                server.SetFile("/repos/o/r/releases/latest",
+                    System.Text.Encoding.UTF8.GetBytes(GitHubReleaseJson(server, "v9.9.9.9", "v\\u4e34\\u65f6\\u8bf4\\u660e")));
+                server.SetFile("/TrFileTransfer.exe", payload);
+                server.SetFile("/TrFileTransfer.exe.sha256", System.Text.Encoding.UTF8.GetBytes(sha + "\n"));
+
+                UpdateManifest m = Updater.CheckGitHubAsync(server.BaseUrl + "/repos/o/r/releases/latest", 10000).Result;
+                Assert.True(m != null, "manifest built");
+                Assert.Equal(new Version(9, 9, 9, 9), m.Version, "version from tag");
+                Assert.Equal(server.BaseUrl + "/TrFileTransfer.exe", m.Url, "exe asset url");
+                Assert.Equal(sha, m.Sha256Hex, "sha from sidecar");
+                Assert.Equal("v临时说明", m.Notes, "body with unicode escapes");
+                Assert.True(m.IsNewerThan(new Version(2, 1, 0, 0)), "newer than current");
+
+                string dest = Path.Combine(dir, "gh.exe");
+                Updater.DownloadAsync(m, dest, null, 15000).Wait();
+                byte[] got = File.ReadAllBytes(dest);
+                Assert.True(Utils.ConstantTimeEquals(payload, got), "downloaded bytes identical");
+            }
+            finally
+            {
+                server.Dispose();
+                try { Directory.Delete(dir, true); } catch { }
+            }
+        }
+
+        private static void UpdateGitHubBadSidecar()
+        {
+            var server = new MiniHttpServer();
+            try
+            {
+                server.SetFile("/repos/o/r/releases/latest",
+                    System.Text.Encoding.UTF8.GetBytes(GitHubReleaseJson(server, "v9.9.9.9", "")));
+                server.SetFile("/TrFileTransfer.exe", new byte[] { 1, 2, 3 });
+                server.SetFile("/TrFileTransfer.exe.sha256", System.Text.Encoding.UTF8.GetBytes("this-is-not-a-hash"));
+                Exception inner = null;
+                try { Updater.CheckGitHubAsync(server.BaseUrl + "/repos/o/r/releases/latest", 10000).Wait(); }
+                catch (AggregateException agg) { inner = agg.InnerException; }
+                Assert.True(inner is System.IO.InvalidDataException,
+                    "malformed sidecar -> InvalidDataException, got: " + (inner == null ? "none" : inner.GetType().Name));
+            }
+            finally { server.Dispose(); }
+        }
+
+        private static void UpdateGitHubMissingSidecar()
+        {
+            var server = new MiniHttpServer();
+            try
+            {
+                server.SetFile("/repos/o/r/releases/latest",
+                    System.Text.Encoding.UTF8.GetBytes(GitHubReleaseJson(server, "v9.9.9.9", "")));
+                server.SetFile("/TrFileTransfer.exe", new byte[] { 1, 2, 3 });
+                // no /TrFileTransfer.exe.sha256 -> 404
+                Exception inner = null;
+                try { Updater.CheckGitHubAsync(server.BaseUrl + "/repos/o/r/releases/latest", 10000).Wait(); }
+                catch (AggregateException agg) { inner = agg.InnerException; }
+                Assert.True(inner is System.Net.WebException,
+                    "missing sidecar -> WebException, got: " + (inner == null ? "none" : inner.GetType().Name));
+            }
+            finally { server.Dispose(); }
         }
     }
 }

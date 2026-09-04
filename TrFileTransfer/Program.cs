@@ -3,8 +3,8 @@ using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("TrFileTransfer")]
 [assembly: System.Reflection.AssemblyProduct("TrFileTransfer")]
-[assembly: System.Reflection.AssemblyVersion("2.0.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("2.0.0.0")]
+[assembly: System.Reflection.AssemblyVersion("2.1.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("2.1.0.0")]
 
 namespace TrFileTransfer
 {

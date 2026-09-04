@@ -410,5 +410,62 @@ namespace TrFileTransfer
             }
         }
 
+        // ---- Auto update ----
+        public static string UpdBtn { get { return IsChinese ? "检查更新" : "Check Update"; } }
+        public static string UpdTitle { get { return IsChinese ? "检查更新" : "Software Update"; } }
+        public static string UpdCurrentVersion(object version)
+        {
+            return IsChinese
+                ? string.Format("当前版本: v{0}", version)
+                : string.Format("Current version: v{0}", version);
+        }
+        public static string UpdUrlLabel { get { return IsChinese ? "更新源 URL:" : "Update source URL:"; } }
+        public static string UpdUrlHint { get { return IsChinese ? "GitHub Releases API（默认）或 version/url/sha256 清单地址" : "GitHub Releases API (default) or a version/url/sha256 manifest"; } }
+        public static string UpdAutoCheck { get { return IsChinese ? "启动时自动检查更新" : "Check for updates at startup"; } }
+        public static string UpdCheckNow { get { return IsChinese ? "立即检查" : "Check Now"; } }
+        public static string UpdLatest(object version)
+        {
+            return IsChinese
+                ? string.Format("已是最新版本 (v{0})。", version)
+                : string.Format("You are on the latest version (v{0}).", version);
+        }
+        public static string UpdAvailable(object current, object next)
+        {
+            return IsChinese
+                ? string.Format("发现新版本: v{0} → v{1}", current, next)
+                : string.Format("New version available: v{0} → v{1}", current, next);
+        }
+        public static string UpdNotesLabel { get { return IsChinese ? "更新说明:" : "Release notes:"; } }
+        public static string UpdDownloadBtn { get { return IsChinese ? "下载并安装" : "Download & Install"; } }
+        public static string UpdDownloading(object percent)
+        {
+            return IsChinese
+                ? string.Format("正在下载... {0}%", percent)
+                : string.Format("Downloading... {0}%", percent);
+        }
+        public static string UpdDownloadDone { get { return IsChinese ? "下载完成，校验通过。" : "Download complete, hash verified."; } }
+        public static string UpdRestartPrompt { get { return IsChinese ? "更新已就绪。现在重启应用以完成升级？" : "Update ready. Restart now to apply?"; } }
+        public static string UpdRestarting { get { return IsChinese ? "升级已应用，正在重启..." : "Update applied, restarting..."; } }
+        public static string UpdCheckFailed(string msg)
+        {
+            return IsChinese
+                ? string.Format("检查更新失败: {0}", msg)
+                : string.Format("Update check failed: {0}", msg);
+        }
+        public static string UpdDownloadFailed(string msg)
+        {
+            return IsChinese
+                ? string.Format("下载失败: {0}", msg)
+                : string.Format("Download failed: {0}", msg);
+        }
+        public static string UpdApplyFailed(string msg)
+        {
+            return IsChinese
+                ? string.Format("应用更新失败（已恢复原版本）: {0}", msg)
+                : string.Format("Failed to apply update (previous version restored): {0}", msg);
+        }
+        public static string UpdNoUrl { get { return IsChinese ? "请先填写更新源 URL。" : "Enter the manifest URL first."; } }
+        public static string UpdChecking { get { return IsChinese ? "正在检查更新..." : "Checking for updates..."; } }
+
     }
 }

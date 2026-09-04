@@ -16,6 +16,7 @@ namespace TrFileTransfer
         // Language
         private ComboBox _cmbLang;
         private Label _lblHeader;
+        private Button _btnCheckUpdate;
 
         // Progress split (server | client)
         private SplitContainer _splitProgress;
@@ -118,11 +119,13 @@ namespace TrFileTransfer
             // Load config first — InitializeComponent already reads settings that must
             // survive restarts (VerifyHash, SpeedLimit, KnownDevices)
             Config.Load();
+            Updater.DeleteStaleBackup(Application.ExecutablePath);
             InitializeComponent();
             PopulateBindAddresses();
             ApplyLanguage();
             ApplyConfig();
             AddLog(L.StartedVersion(AppVersion));
+            ScheduleStartupUpdateCheck();
         }
 
         protected override void OnShown(EventArgs e)
@@ -161,10 +164,11 @@ namespace TrFileTransfer
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
 
-            // Header row: app title on the left, language selector on the right
+            // Header row: app title on the left, language selector and update button on the right
             var header = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = Color.White, Margin = new Padding(0) };
             header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 116));
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 92));
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 108));
             _lblHeader = new Label
             {
                 AutoSize = false,
@@ -173,13 +177,17 @@ namespace TrFileTransfer
                 Font = new Font("Segoe UI", 11f, FontStyle.Bold),
                 ForeColor = Color.FromArgb(51, 51, 51)
             };
-            _cmbLang = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill, Margin = new Padding(3, 2, 0, 0) };
+            _cmbLang = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill, Margin = new Padding(3, 2, 6, 0) };
             _cmbLang.Items.Add("English");
             _cmbLang.Items.Add("中文");
             _cmbLang.SelectedIndex = 0;
             _cmbLang.SelectedIndexChanged += CmbLang_SelectedIndexChanged;
+            _btnCheckUpdate = new Button { Dock = DockStyle.Fill, Margin = new Padding(0, 2, 0, 0) };
+            UiStyle.Secondary(_btnCheckUpdate);
+            _btnCheckUpdate.Click += BtnCheckUpdate_Click;
             header.Controls.Add(_lblHeader, 0, 0);
             header.Controls.Add(_cmbLang, 1, 0);
+            header.Controls.Add(_btnCheckUpdate, 2, 0);
             root.Controls.Add(header, 0, 0);
 
             // ---- Server panel ----
@@ -335,6 +343,7 @@ namespace TrFileTransfer
                 this.WindowState = FormWindowState.Normal;
                 this.Activate();
             });
+            _trayMenu.Items.Add(L.UpdBtn, null, (s2, e2) => ShowUpdateDialog());
             _trayMenu.Items.Add(L.About, null, (s2, e2) =>
             {
                 MessageBox.Show(this, L.AboutText(AppVersion), L.About,
@@ -486,6 +495,7 @@ namespace TrFileTransfer
 
             _gbLog.Text = L.LogGroup;
             _btnExportLog.Text = L.ExportLog;
+            _btnCheckUpdate.Text = L.UpdBtn;
 
             PopulateBindAddresses();
         }
@@ -581,6 +591,80 @@ namespace TrFileTransfer
                 _cmbBind.SelectedIndex = previousSelection;
             else
                 _cmbBind.SelectedIndex = 0;
+        }
+
+        // ---- Auto update ----
+
+        /// <summary>Default update source: this project's GitHub Releases. The updater
+        /// detects api.github.com URLs and reads version/download URL from the release,
+        /// SHA256 from the .sha256 sidecar asset.</summary>
+        internal const string DefaultUpdateUrl =
+            "https://api.github.com/repos/54gogogo10/FileTransfer_UDT/releases/latest";
+
+        private void BtnCheckUpdate_Click(object sender, EventArgs e)
+        {
+            ShowUpdateDialog();
+        }
+
+        private void ShowUpdateDialog()
+        {
+            using (var dlg = new UpdateDialog())
+                dlg.ShowDialog(this);
+        }
+
+        /// <summary>Background startup check (URL configured + AutoUpdateCheck enabled).
+        /// Failures are silent — only a confirmed newer version opens the update dialog.</summary>
+        private void ScheduleStartupUpdateCheck()
+        {
+            string url = Config.Get("UpdateUrl", DefaultUpdateUrl);
+            if (string.IsNullOrWhiteSpace(url)) return;
+            if (!Config.GetBool("AutoUpdateCheck", true)) return;
+            Task.Run(async delegate
+            {
+                try
+                {
+                    await Task.Delay(3000).ConfigureAwait(false);
+                    UpdateManifest m = await Updater.CheckAnyAsync(url, 10000).ConfigureAwait(false);
+                    if (m.IsNewerThan(Updater.CurrentVersion))
+                    {
+                        try
+                        {
+                            BeginInvoke((MethodInvoker)delegate
+                            {
+                                if (IsDisposed) return;
+                                AddLog(L.UpdAvailable(AppVersion, m.Version.ToString()));
+                                ShowUpdateDialog();
+                            });
+                        }
+                        catch (ObjectDisposedException) { }
+                        catch (InvalidOperationException) { }
+                    }
+                }
+                catch { }
+            });
+        }
+
+        /// <summary>Called by UpdateDialog after a verified download: swap in the new exe
+        /// and restart. Invoked on the UI thread.</summary>
+        internal void ApplyUpdateAndRestart(string stagedPath)
+        {
+            try
+            {
+                Updater.Apply(stagedPath, Application.ExecutablePath);
+            }
+            catch (Exception ex)
+            {
+                AddLog(L.UpdApplyFailed(ex.Message));
+                MessageBox.Show(this, L.UpdApplyFailed(ex.Message), L.UpdTitle,
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            AddLog(L.UpdRestarting);
+            SaveConfig();
+            _trayExit = true;
+            try { System.Diagnostics.Process.Start(Application.ExecutablePath); }
+            catch { /* new exe is in place; user can start it manually */ }
+            Close();
         }
 
         private void BtnBrowseDir_Click(object sender, EventArgs e)
@@ -2429,6 +2513,242 @@ namespace TrFileTransfer
             {
                 try { System.Diagnostics.Process.Start("explorer.exe", "/select,\"" + path + "\""); } catch { }
             }
+        }
+    }
+
+    /// <summary>Auto-update dialog: manifest URL + auto-check setting, check-now, and
+    /// verified download that hands off to MainForm.ApplyUpdateAndRestart.</summary>
+    public class UpdateDialog : Form
+    {
+        private Label _lblCurrent;
+        private TextBox _txtUrl;
+        private CheckBox _chkAuto;
+        private Button _btnCheck, _btnInstall, _btnClose;
+        private Label _lblStatus;
+        private ProgressBar _progress;
+        private Label _lblNotes;
+        private UpdateManifest _manifest;
+
+        public UpdateDialog()
+        {
+            Text = L.UpdTitle;
+            ClientSize = new Size(520, 300);
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+            Font = new Font("Segoe UI", 9f);
+            BackColor = Color.White;
+
+            var tlp = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(12) };
+            tlp.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100));
+            tlp.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Absolute, 34));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Absolute, 22));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Absolute, 20));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+
+            _lblCurrent = new Label
+            {
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(51, 51, 51)
+            };
+            tlp.Controls.Add(_lblCurrent, 0, 0);
+            tlp.SetColumnSpan(_lblCurrent, 2);
+
+            var lblUrl = new Label
+            {
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleRight,
+                ForeColor = Color.FromArgb(68, 68, 68),
+                Text = L.UpdUrlLabel
+            };
+            _txtUrl = new TextBox { Dock = DockStyle.Fill, Text = Config.Get("UpdateUrl", MainForm.DefaultUpdateUrl) };
+            _txtUrl.TextChanged += (s, e) => Config.Set("UpdateUrl", _txtUrl.Text.Trim());
+            tlp.Controls.Add(lblUrl, 0, 1);
+            tlp.Controls.Add(_txtUrl, 1, 1);
+
+            _chkAuto = new CheckBox
+            {
+                AutoSize = true,
+                Checked = Config.GetBool("AutoUpdateCheck", true),
+                Text = L.UpdAutoCheck
+            };
+            _chkAuto.CheckedChanged += (s, e) => Config.SetBool("AutoUpdateCheck", _chkAuto.Checked);
+            tlp.Controls.Add(_chkAuto, 1, 2);
+            tlp.SetColumnSpan(_chkAuto, 2);
+
+            var actionRow = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                WrapContents = false,
+                BackColor = Color.White,
+                Margin = new Padding(0, 4, 0, 0)
+            };
+            _btnCheck = new Button { Width = 110, Height = 28 };
+            UiStyle.Primary(_btnCheck);
+            _btnCheck.Click += BtnCheck_Click;
+            _btnInstall = new Button { Width = 130, Height = 28, Enabled = false, Margin = new Padding(8, 0, 0, 0) };
+            UiStyle.Primary(_btnInstall);
+            _btnInstall.Click += BtnInstall_Click;
+            actionRow.Controls.Add(_btnCheck);
+            actionRow.Controls.Add(_btnInstall);
+            tlp.Controls.Add(actionRow, 1, 3);
+            tlp.SetColumnSpan(actionRow, 2);
+
+            _lblStatus = new Label
+            {
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleLeft,
+                ForeColor = Color.FromArgb(106, 106, 106),
+                Text = ""
+            };
+            tlp.Controls.Add(_lblStatus, 0, 4);
+            tlp.SetColumnSpan(_lblStatus, 2);
+
+            _progress = new ProgressBar { Dock = DockStyle.Fill, Height = 16, Visible = false };
+            tlp.Controls.Add(_progress, 0, 5);
+            tlp.SetColumnSpan(_progress, 2);
+
+            _lblNotes = new Label
+            {
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.TopLeft,
+                ForeColor = Color.FromArgb(68, 68, 68),
+                Text = "",
+                Padding = new Padding(2, 4, 0, 0)
+            };
+            tlp.Controls.Add(_lblNotes, 0, 6);
+            tlp.SetColumnSpan(_lblNotes, 2);
+
+            var buttons = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.RightToLeft,
+                WrapContents = false,
+                BackColor = Color.White,
+                Margin = new Padding(0)
+            };
+            _btnClose = new Button { Width = 100 };
+            UiStyle.Secondary(_btnClose);
+            _btnClose.Click += (s, e) => Close();
+            buttons.Controls.Add(_btnClose);
+            tlp.Controls.Add(buttons, 0, 7);
+            tlp.SetColumnSpan(buttons, 2);
+
+            Controls.Add(tlp);
+            ApplyLanguage();
+        }
+
+        private void ApplyLanguage()
+        {
+            _lblCurrent.Text = L.UpdCurrentVersion(Updater.CurrentVersion.ToString());
+            _btnCheck.Text = L.UpdCheckNow;
+            _btnInstall.Text = L.UpdDownloadBtn;
+            _btnClose.Text = L.CancelBtn;
+        }
+
+        private async void BtnCheck_Click(object sender, EventArgs e)
+        {
+            string url = _txtUrl.Text.Trim();
+            if (url.Length == 0)
+            {
+                _lblStatus.Text = L.UpdNoUrl;
+                return;
+            }
+            Config.Set("UpdateUrl", url);
+            _btnCheck.Enabled = false;
+            _btnInstall.Enabled = false;
+            _lblStatus.Text = L.UpdChecking;
+            _lblNotes.Text = "";
+            try
+            {
+                UpdateManifest m = await Updater.CheckAnyAsync(url, 15000).ConfigureAwait(true);
+                _manifest = m;
+                if (m.IsNewerThan(Updater.CurrentVersion))
+                {
+                    _lblStatus.Text = L.UpdAvailable(Updater.CurrentVersion, m.Version);
+                    _lblNotes.Text = string.IsNullOrEmpty(m.Notes) ? "" : L.UpdNotesLabel + "\n" + m.Notes;
+                    _btnInstall.Enabled = true;
+                }
+                else
+                {
+                    _lblStatus.Text = L.UpdLatest(Updater.CurrentVersion);
+                }
+            }
+            catch (Exception ex)
+            {
+                _lblStatus.Text = L.UpdCheckFailed(ex.Message);
+            }
+            _btnCheck.Enabled = true;
+        }
+
+        private async void BtnInstall_Click(object sender, EventArgs e)
+        {
+            if (_manifest == null) return;
+            _btnCheck.Enabled = false;
+            _btnInstall.Enabled = false;
+            _progress.Visible = true;
+            _progress.Value = 0;
+            string staged = Path.Combine(Updater.StagingDir, "TrFileTransfer.update.exe");
+            try
+            {
+                await Updater.DownloadAsync(_manifest, staged, (read, total) =>
+                {
+                    try
+                    {
+                        BeginInvoke((MethodInvoker)delegate
+                        {
+                            if (IsDisposed) return;
+                            if (total > 0)
+                            {
+                                _progress.Maximum = 100;
+                                _progress.Value = (int)Math.Min(100, read * 100 / total);
+                                _lblStatus.Text = L.UpdDownloading(_progress.Value);
+                            }
+                            else
+                            {
+                                _progress.Maximum = (int)Math.Max(1, read);
+                                _progress.Value = (int)read;
+                                _lblStatus.Text = L.UpdDownloading("-");
+                            }
+                        });
+                    }
+                    catch (ObjectDisposedException) { }
+                    catch (InvalidOperationException) { }
+                }, 30000).ConfigureAwait(true);
+
+                _lblStatus.Text = L.UpdDownloadDone;
+                if (MessageBox.Show(this, L.UpdRestartPrompt, L.UpdTitle,
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                {
+                    var main = Owner as MainForm;
+                    Close();
+                    if (main != null) main.ApplyUpdateAndRestart(staged);
+                }
+                else
+                {
+                    _btnCheck.Enabled = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                _lblStatus.Text = L.UpdDownloadFailed(ex.Message);
+                _progress.Visible = false;
+                _btnCheck.Enabled = true;
+                _btnInstall.Enabled = true;
+            }
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            Config.Save();
+            base.OnFormClosing(e);
         }
     }
 }

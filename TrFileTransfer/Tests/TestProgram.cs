@@ -101,6 +101,7 @@ namespace TrFileTransfer.Tests
             RunL10N(runner);
             RunServerResumeStore(runner);
             RunFolderResumeStore(runner);
+            RunUpdater(runner);
         }
 
         private static void RunFormatSize(TestRunner runner)
@@ -377,6 +378,190 @@ namespace TrFileTransfer.Tests
                 FolderResumeState.Delete(sid);
                 Assert.True(FolderResumeState.Load(sid) == null, "deleted -> null");
             });
+        }
+
+        private static void RunUpdater(TestRunner runner)
+        {
+            // ---- UpdateManifest.Parse ----
+            runner.Run("Update_Parse_Valid", () =>
+            {
+                string text = "version=2.2.0.0\r\nurl=http://192.168.1.10/app.exe\nsha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nnotes=Fixes\n";
+                var m = UpdateManifest.Parse(text);
+                Assert.True(m != null, "parsed");
+                Assert.Equal(new Version(2, 2, 0, 0), m.Version, "version");
+                Assert.Equal("http://192.168.1.10/app.exe", m.Url, "url");
+                Assert.Equal("Fixes", m.Notes, "notes");
+            });
+
+            runner.Run("Update_Parse_UppercaseHashNormalized", () =>
+            {
+                string text = "version=1.0.0.0\nurl=https://example.com/app.exe\nsha256=0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+                var m = UpdateManifest.Parse(text);
+                Assert.True(m != null, "parsed");
+                Assert.True(m.Sha256Hex == m.Sha256Hex.ToLowerInvariant(), "hash lowercased");
+            });
+
+            runner.Run("Update_Parse_MissingVersion", () =>
+                Assert.True(UpdateManifest.Parse("url=http://x/a.exe\nsha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") == null, "null"));
+            runner.Run("Update_Parse_MissingUrl", () =>
+                Assert.True(UpdateManifest.Parse("version=1.0.0.0\nsha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") == null, "null"));
+            runner.Run("Update_Parse_MissingSha", () =>
+                Assert.True(UpdateManifest.Parse("version=1.0.0.0\nurl=http://x/a.exe") == null, "null"));
+            runner.Run("Update_Parse_BadVersion", () =>
+                Assert.True(UpdateManifest.Parse("version=not.a.version\nurl=http://x/a.exe\nsha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") == null, "null"));
+            runner.Run("Update_Parse_HashTooShort", () =>
+                Assert.True(UpdateManifest.Parse("version=1.0.0.0\nurl=http://x/a.exe\nsha256=abc123") == null, "null"));
+            runner.Run("Update_Parse_HashNotHex", () =>
+                Assert.True(UpdateManifest.Parse("version=1.0.0.0\nurl=http://x/a.exe\nsha256=zz23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") == null, "null"));
+            runner.Run("Update_Parse_BadScheme", () =>
+                Assert.True(UpdateManifest.Parse("version=1.0.0.0\nurl=ftp://x/a.exe\nsha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") == null, "null"));
+            runner.Run("Update_Parse_Empty", () =>
+                Assert.True(UpdateManifest.Parse("") == null, "null"));
+            runner.Run("Update_Parse_UnknownKeysIgnored", () =>
+            {
+                string text = "# comment line\nfoo=bar\nversion=3.0.0.0\nurl=http://x/a.exe\nsha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+                var m = UpdateManifest.Parse(text);
+                Assert.True(m != null, "unknown keys ignored");
+                Assert.Equal(new Version(3, 0, 0, 0), m.Version, "version");
+            });
+
+            // ---- UpdateManifest.FromGitHubJson ----
+            runner.Run("Update_GitHub_Parse_Valid", () =>
+            {
+                string json = "{\"url\":\"https://api.github.com/repos/o/r/releases/1\"," +
+                    "\"tag_name\":\"v2.2.0.0\",\"name\":\"v2.2.0.0\"," +
+                    "\"body\":\"Fixes\\nSpeedups\"," +
+                    "\"draft\":false," +
+                    "\"assets\":[" +
+                    "{\"name\":\"sources.zip\",\"browser_download_url\":\"https://github.com/o/r/archive/refs.zip\"}," +
+                    "{\"name\":\"TrFileTransfer.exe\",\"browser_download_url\":\"https://github.com/o/r/releases/download/v2.2.0.0/TrFileTransfer.exe\"}," +
+                    "{\"name\":\"TrFileTransfer.exe.sha256\",\"browser_download_url\":\"https://github.com/o/r/releases/download/v2.2.0.0/TrFileTransfer.exe.sha256\"}" +
+                    "]}";
+                var m = UpdateManifest.FromGitHubJson(json);
+                Assert.True(m != null, "parsed");
+                Assert.Equal(new Version(2, 2, 0, 0), m.Version, "version from tag (v stripped)");
+                Assert.Equal("https://github.com/o/r/releases/download/v2.2.0.0/TrFileTransfer.exe", m.Url, "first .exe asset");
+                Assert.True(m.Url.IndexOf(".sha256", StringComparison.Ordinal) < 0, "sidecar not picked");
+                Assert.Equal("Fixes\nSpeedups", m.Notes, "body as notes (escapes decoded)");
+                Assert.True(m.Sha256Hex == null, "sha filled later by CheckGitHubAsync");
+            });
+
+            runner.Run("Update_GitHub_Parse_TagWithoutV", () =>
+            {
+                string json = "{\"tag_name\":\"3.1.4.1\",\"assets\":[{\"browser_download_url\":\"http://x/a.exe\"}]}";
+                var m = UpdateManifest.FromGitHubJson(json);
+                Assert.True(m != null, "parsed");
+                Assert.Equal(new Version(3, 1, 4, 1), m.Version, "bare tag");
+            });
+
+            runner.Run("Update_GitHub_Parse_NoExeAsset", () =>
+                Assert.True(UpdateManifest.FromGitHubJson(
+                    "{\"tag_name\":\"v1.0.0.0\",\"assets\":[{\"browser_download_url\":\"http://x/src.zip\"}]}") == null,
+                    "null without .exe asset"));
+
+            runner.Run("Update_GitHub_Parse_MissingTag", () =>
+                Assert.True(UpdateManifest.FromGitHubJson(
+                    "{\"assets\":[{\"browser_download_url\":\"http://x/a.exe\"}]}") == null, "null without tag"));
+
+            runner.Run("Update_GitHub_Parse_BadTag", () =>
+                Assert.True(UpdateManifest.FromGitHubJson(
+                    "{\"tag_name\":\"release-2026\",\"assets\":[{\"browser_download_url\":\"http://x/a.exe\"}]}") == null,
+                    "null with non-version tag"));
+
+            runner.Run("Update_GitHub_Parse_Empty", () =>
+                Assert.True(UpdateManifest.FromGitHubJson("") == null, "null"));
+
+            // ---- IsNewerThan ----
+            runner.Run("Update_IsNewer_True", () =>
+            {
+                var m = new UpdateManifest { Version = new Version(2, 1, 0, 0) };
+                Assert.True(m.IsNewerThan(new Version(2, 0, 9, 9)), "2.1.0.0 > 2.0.9.9");
+            });
+            runner.Run("Update_IsNewer_FalseOnEqual", () =>
+            {
+                var m = new UpdateManifest { Version = new Version(2, 1, 0, 0) };
+                Assert.False(m.IsNewerThan(new Version(2, 1, 0, 0)), "equal not newer");
+            });
+            runner.Run("Update_IsNewer_FalseOnOlder", () =>
+            {
+                var m = new UpdateManifest { Version = new Version(1, 9, 9, 0) };
+                Assert.False(m.IsNewerThan(new Version(2, 0, 0, 0)), "older not newer");
+            });
+            runner.Run("Update_IsNewer_RevisionCounts", () =>
+            {
+                var m = new UpdateManifest { Version = new Version(2, 0, 0, 1) };
+                Assert.True(m.IsNewerThan(new Version(2, 0, 0, 0)), "revision bump counts");
+            });
+
+            // ---- ComputeSha256Hex ----
+            runner.Run("Update_Sha256_KnownVector", () =>
+            {
+                string dir = Path.Combine(Path.GetTempPath(), "tr_upd_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    string path = Path.Combine(dir, "abc.txt");
+                    File.WriteAllText(path, "abc");
+                    // SHA256("abc")
+                    Assert.Equal("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                        Updater.ComputeSha256Hex(path), "sha256 of abc");
+                }
+                finally { try { Directory.Delete(dir, true); } catch { } }
+            });
+
+            // ---- Apply / rollback / backup cleanup ----
+            var applyDir = Path.Combine(Path.GetTempPath(), "tr_upd_apply_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(applyDir);
+            try
+            {
+                runner.Run("Update_Apply_SwapsAndBacksUp", () =>
+                {
+                    string target = Path.Combine(applyDir, "app.exe");
+                    string staged = Path.Combine(applyDir, "staged.exe");
+                    File.WriteAllText(target, "OLD");
+                    File.WriteAllText(staged, "NEW");
+                    Updater.Apply(staged, target);
+                    Assert.Equal("NEW", File.ReadAllText(target), "target replaced");
+                    Assert.Equal("OLD", File.ReadAllText(target + ".old"), "backup holds old content");
+                });
+
+                runner.Run("Update_Apply_RollbackOnFailure", () =>
+                {
+                    string target = Path.Combine(applyDir, "app2.exe");
+                    File.WriteAllText(target, "OLD");
+                    // staged file does not exist -> copy fails -> restore
+                    Assert.Throws(delegate { Updater.Apply(Path.Combine(applyDir, "missing.exe"), target); },
+                        "copy failure throws");
+                    Assert.Equal("OLD", File.ReadAllText(target), "target restored");
+                    Assert.False(File.Exists(target + ".old"), "no backup leftover after rollback");
+                });
+
+                runner.Run("Update_Apply_ReplacesStaleBackup", () =>
+                {
+                    string target = Path.Combine(applyDir, "app3.exe");
+                    string staged = Path.Combine(applyDir, "staged3.exe");
+                    File.WriteAllText(target, "OLD");
+                    File.WriteAllText(staged, "NEW");
+                    File.WriteAllText(target + ".old", "STALE");
+                    Updater.Apply(staged, target);
+                    Assert.Equal("OLD", File.ReadAllText(target + ".old"), "stale backup replaced by current old");
+                });
+
+                runner.Run("Update_DeleteStaleBackup", () =>
+                {
+                    string target = Path.Combine(applyDir, "app4.exe");
+                    File.WriteAllText(target, "X");
+                    File.WriteAllText(target + ".old", "OLD");
+                    Updater.DeleteStaleBackup(target);
+                    Assert.False(File.Exists(target + ".old"), "backup removed");
+                    Assert.True(File.Exists(target), "target untouched");
+                    Updater.DeleteStaleBackup(target); // no backup -> no throw
+                });
+            }
+            finally
+            {
+                try { Directory.Delete(applyDir, true); } catch { }
+            }
         }
 
         private static void RunL10N(TestRunner runner)
