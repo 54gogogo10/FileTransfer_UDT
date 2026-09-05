@@ -509,5 +509,26 @@ namespace TrFileTransfer
                 : string.Format("An unhandled error occurred. The program may be unstable:\n{0}\n\nDetails were written to crash.log in the log folder.", msg);
         }
 
+        // ---- Folder sync mode ----
+        public static string SyncModeLabel { get { return IsChinese ? "同步模式" : "Sync Mode"; } }
+        public static string C_SyncStart(object folder)
+        {
+            return IsChinese
+                ? string.Format("同步模式：仅传输与服务器差异的部分 ({0})", folder)
+                : string.Format("Sync mode: only differences will be sent ({0})", folder);
+        }
+
+        // ---- Auto start ----
+        public static string TrayAutoStart { get { return IsChinese ? "开机自启" : "Start with Windows"; } }
+        public static string AutoStartOn { get { return IsChinese ? "已开启开机自启。" : "Auto start with Windows enabled."; } }
+        public static string AutoStartOff { get { return IsChinese ? "已关闭开机自启。" : "Auto start with Windows disabled."; } }
+
+        // ---- Skip this version ----
+        public static string UpdSkip { get { return IsChinese ? "跳过此版本" : "Skip This Version"; } }
+
+        // ---- Discovery pairing flag ----
+        public static string ScanNeedsPairing { get { return IsChinese ? "[需配对]" : "[Pairing]"; } }
+        public static string UsePairingHint { get { return IsChinese ? "该设备已启用配对码，请先在客户端填写配对码再发送。" : "This device requires a pairing code — fill it in on the client before sending."; } }
+
     }
 }

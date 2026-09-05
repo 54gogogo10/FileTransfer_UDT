@@ -53,6 +53,7 @@ namespace TrFileTransfer
         private Button _btnSend;
         private Button _btnCancel;
         private CheckBox _chkFolder;
+        private CheckBox _chkSync;
         private CheckBox _chkMonitor;
         private NumericUpDown _numConcurrency;
         private Label _lblConcurrency;
@@ -299,12 +300,14 @@ namespace TrFileTransfer
             _chkMonitor.CheckedChanged += ChkMonitor_CheckedChanged;
             _chkFolder = new CheckBox { AutoSize = true, Margin = new Padding(2, 8, 16, 3) };
             _chkFolder.CheckedChanged += ChkFolder_CheckedChanged;
+            _chkSync = new CheckBox { AutoSize = true, Margin = new Padding(2, 8, 16, 3) };
             _chkVerifyHash = new CheckBox { AutoSize = true, Margin = new Padding(2, 8, 16, 3) };
             _chkVerifyHash.Checked = Config.GetBool("VerifyHash", false);
             _chkVerifyHash.CheckedChanged += (s2, e2) => Config.SetBool("VerifyHash", _chkVerifyHash.Checked);
             var optionsRow = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, BackColor = Color.White, Margin = new Padding(0) };
             optionsRow.Controls.Add(_chkMonitor);
             optionsRow.Controls.Add(_chkFolder);
+            optionsRow.Controls.Add(_chkSync);
             optionsRow.Controls.Add(_chkVerifyHash);
 
             _lblSrcPort = new Label { AutoSize = true, Margin = new Padding(2, 10, 4, 3), ForeColor = Color.FromArgb(68, 68, 68) };
@@ -369,6 +372,17 @@ namespace TrFileTransfer
                 this.WindowState = FormWindowState.Normal;
                 this.Activate();
             });
+            var autoStartItem = new ToolStripMenuItem(L.TrayAutoStart)
+            {
+                CheckOnClick = true,
+                Checked = AutoStart.IsEnabled()
+            };
+            autoStartItem.Click += (s2, e2) =>
+            {
+                AutoStart.Set(autoStartItem.Checked, Application.ExecutablePath);
+                AddLog(autoStartItem.Checked ? L.AutoStartOn : L.AutoStartOff);
+            };
+            _trayMenu.Items.Add(autoStartItem);
             _trayMenu.Items.Add(L.UpdBtn, null, (s2, e2) => ShowUpdateDialog());
             _trayMenu.Items.Add(L.About, null, (s2, e2) =>
             {
@@ -507,6 +521,7 @@ namespace TrFileTransfer
             _btnSend.Text = _chkMonitor.Checked ? L.StartMonitor : (_chkFolder.Checked ? L.SendFolder : L.SendFile);
             _btnCancel.Text = L.CancelBtn;
             _chkFolder.Text = L.FolderMode;
+            _chkSync.Text = L.SyncModeLabel;
             _btnResumeList.Text = L.ResumeBtn;
             _chkVerifyHash.Text = L.VerifyHashLabel;
             _lblSpeed.Text = L.SpeedLimitLabel;
@@ -558,6 +573,8 @@ namespace TrFileTransfer
             _txtPortC.Text = Config.Get("ClientPort", "8080");
             _txtFile.Text = Config.Get("LastPath", "");
             _chkFolder.Checked = Config.GetBool("FolderMode", false);
+            _chkSync.Checked = Config.GetBool("SyncMode", false);
+            _chkSync.Enabled = _chkFolder.Checked && !Config.GetBool("MonitorMode", false);
             _chkMonitor.Checked = Config.GetBool("MonitorMode", false);
             _numConcurrency.Value = Math.Max(1, Math.Min(8, Config.GetInt("Concurrency", 4)));
             _numSrcPort.Value = Math.Max(0, Math.Min(65535, Config.GetInt("SrcPort", 0)));
@@ -577,6 +594,7 @@ namespace TrFileTransfer
             Config.Set("ClientPort", _txtPortC.Text.Trim());
             Config.Set("LastPath", _txtFile.Text.Trim());
             Config.SetBool("FolderMode", _chkFolder.Checked);
+            Config.SetBool("SyncMode", _chkSync.Checked);
             Config.SetBool("MonitorMode", _chkMonitor.Checked);
             Config.SetBool("VerifyHash", _chkVerifyHash.Checked);
             Config.SetInt("Concurrency", (int)_numConcurrency.Value);
@@ -658,6 +676,11 @@ namespace TrFileTransfer
                     UpdateManifest m = await Updater.CheckAnyAsync(url, 10000).ConfigureAwait(false);
                     if (m.IsNewerThan(Updater.CurrentVersion))
                     {
+                        // Respect "skip this version" from the update dialog
+                        Version skipped;
+                        if (System.Version.TryParse(Config.Get("SkippedVersion", ""), out skipped)
+                            && m.Version <= skipped)
+                            return;
                         try
                         {
                             BeginInvoke((MethodInvoker)delegate
@@ -715,6 +738,9 @@ namespace TrFileTransfer
             _lblFile.Text = isFolder ? L.FolderLabel : L.FileLabel;
             _btnSend.Text = isFolder ? L.SendFolder : L.SendFile;
             _txtFile.Text = "";
+            // Sync builds on folder mode (0x04 diff transfer)
+            _chkSync.Enabled = isFolder;
+            if (!isFolder) _chkSync.Checked = false;
         }
 
         private void NumConcurrency_ValueChanged(object sender, EventArgs e)
@@ -729,6 +755,8 @@ namespace TrFileTransfer
             _lblFile.Text = isMonitor ? L.MonitorLabel : (_chkFolder.Checked ? L.FolderLabel : L.FileLabel);
             _btnSend.Text = isMonitor ? L.StartMonitor : (_chkFolder.Checked ? L.SendFolder : L.SendFile);
             _chkFolder.Enabled = !isMonitor;
+            _chkSync.Enabled = !isMonitor && _chkFolder.Checked;
+            if (isMonitor) _chkSync.Checked = false;
             _txtFile.Text = "";
         }
 
@@ -938,6 +966,11 @@ namespace TrFileTransfer
             {
                 _rbClientTcp.Checked = false;
                 _rbClientUdt.Checked = true;
+            }
+            if (d.RequiresPairing)
+            {
+                AddLog(L.UsePairingHint);
+                _txtPairing.Focus();
             }
         }
 
@@ -1297,7 +1330,7 @@ namespace TrFileTransfer
                 int dPort = Config.GetInt("DiscoveryPort", DiscoveryProtocol.DefaultPort);
                 if (_discoveryServer == null) _discoveryServer = new DiscoveryServer(dPort);
                 _discoveryServer.Start(Environment.MachineName, port,
-                    _chkServerTcp.Checked, _chkServerUdt.Checked);
+                    _chkServerTcp.Checked, _chkServerUdt.Checked, pairingCode != null);
             }
         }
 
@@ -1484,6 +1517,14 @@ namespace TrFileTransfer
                         await _client.SendFolderResumableAsync(resumeSession.Value);
                         _pendingResumeSession = null;
                     }
+                    else if (isFolder && _chkSync.Checked)
+                    {
+                        // Sync mode: stable session per (folder, target) — the server-side
+                        // 0x04 scan skips unchanged files, so only differences travel
+                        AddLog(L.C_SyncStart(path));
+                        Guid syncSession = FolderResumeState.DeriveSyncSession(path, ip, port, false);
+                        await _client.SendFolderResumableAsync(syncSession, keepState: true);
+                    }
                     else if (isFolder)
                         await _client.SendFolderAsync(path);
                     else if (resumeSession.HasValue)
@@ -1502,6 +1543,12 @@ namespace TrFileTransfer
                     {
                         await _clientUdt.SendFolderResumableAsync(resumeSession.Value);
                         _pendingResumeSession = null;
+                    }
+                    else if (isFolder && _chkSync.Checked)
+                    {
+                        AddLog(L.C_SyncStart(path));
+                        Guid syncSession = FolderResumeState.DeriveSyncSession(path, ip, port, true);
+                        await _clientUdt.SendFolderResumableAsync(syncSession, keepState: true);
                     }
                     else if (isFolder)
                         await _clientUdt.SendFolderAsync(path);
@@ -2575,7 +2622,8 @@ namespace TrFileTransfer
         {
             string prot = (d.SupportsTcp ? "TCP" : "") + (d.SupportsUdt ? (d.SupportsTcp ? "+UDT" : "UDT") : "");
             string tag = online ? "" : "  [" + L.ScanOffline + "]";
-            return string.Format("{0}  {1}:{2}  ({3}){4}", d.Name, d.Ip, d.Port, prot, tag);
+            string pairTag = d.RequiresPairing ? "  " + L.ScanNeedsPairing : "";
+            return string.Format("{0}  {1}:{2}  ({3}){4}{5}", d.Name, d.Ip, d.Port, prot, tag, pairTag);
         }
 
         private void BtnUse_Click(object sender, EventArgs e)
@@ -2681,7 +2729,7 @@ namespace TrFileTransfer
         private Label _lblCurrent;
         private TextBox _txtUrl;
         private CheckBox _chkAuto;
-        private Button _btnCheck, _btnInstall, _btnClose;
+        private Button _btnCheck, _btnInstall, _btnSkip, _btnClose;
         private Label _lblStatus;
         private ProgressBar _progress;
         private Label _lblNotes;
@@ -2754,8 +2802,12 @@ namespace TrFileTransfer
             _btnInstall = new Button { Width = 130, Height = 28, Enabled = false, Margin = new Padding(8, 0, 0, 0) };
             UiStyle.Primary(_btnInstall);
             _btnInstall.Click += BtnInstall_Click;
+            _btnSkip = new Button { Width = 120, Height = 28, Visible = false, Margin = new Padding(8, 0, 0, 0) };
+            UiStyle.Secondary(_btnSkip);
+            _btnSkip.Click += BtnSkip_Click;
             actionRow.Controls.Add(_btnCheck);
             actionRow.Controls.Add(_btnInstall);
+            actionRow.Controls.Add(_btnSkip);
             tlp.Controls.Add(actionRow, 1, 3);
             tlp.SetColumnSpan(actionRow, 2);
 
@@ -2808,6 +2860,7 @@ namespace TrFileTransfer
             _lblCurrent.Text = L.UpdCurrentVersion(Updater.CurrentVersion.ToString());
             _btnCheck.Text = L.UpdCheckNow;
             _btnInstall.Text = L.UpdDownloadBtn;
+            _btnSkip.Text = L.UpdSkip;
             _btnClose.Text = L.CancelBtn;
         }
 
@@ -2833,10 +2886,12 @@ namespace TrFileTransfer
                     _lblStatus.Text = L.UpdAvailable(Updater.CurrentVersion, m.Version);
                     _lblNotes.Text = string.IsNullOrEmpty(m.Notes) ? "" : L.UpdNotesLabel + "\n" + m.Notes;
                     _btnInstall.Enabled = true;
+                    _btnSkip.Visible = true;
                 }
                 else
                 {
                     _lblStatus.Text = L.UpdLatest(Updater.CurrentVersion);
+                    _btnSkip.Visible = false;
                 }
             }
             catch (Exception ex)
@@ -2844,6 +2899,16 @@ namespace TrFileTransfer
                 _lblStatus.Text = L.UpdCheckFailed(ex.Message);
             }
             _btnCheck.Enabled = true;
+        }
+
+        /// <summary>Remembers the offered version so the silent startup check stops
+        /// nagging about it. A manual "Check Now" still shows it.</summary>
+        private void BtnSkip_Click(object sender, EventArgs e)
+        {
+            if (_manifest == null) return;
+            Config.Set("SkippedVersion", _manifest.Version.ToString());
+            Config.Save();
+            Close();
         }
 
         private async void BtnInstall_Click(object sender, EventArgs e)

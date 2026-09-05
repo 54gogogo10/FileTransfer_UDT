@@ -90,6 +90,8 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_Auth_TCP_Lenient", TcpAuthLenient);
             runner.Run("Integration_Text_UDT", UdtTextMessage, 1);
             runner.Run("Integration_Auth_UDT", UdtAuthCorrectCode, 1);
+            runner.Run("Integration_FolderSync_TCP", TcpFolderSync);
+            runner.Run("Integration_FolderSync_UDT", UdtFolderSync, 1);
         }
 
         private static void TcpSingleFile()
@@ -1057,10 +1059,13 @@ namespace TrFileTransfer.Tests
         {
             int dPort = FindFreePort();
             int dPort2 = FindFreePort();
+            int dPort3 = FindFreePort();
             var server = new DiscoveryServer(dPort);
             server.Start("test-host", 8080, true, false);
             var server2 = new DiscoveryServer(dPort2);
             server2.Start("dual-host", 9090, true, true);
+            var server3 = new DiscoveryServer(dPort3);
+            server3.Start("locked-host", 7070, true, false, true);
             try
             {
                 var devices = DiscoveryClient.Scan(dPort, 3000, "127.0.0.1").Result;
@@ -1069,6 +1074,7 @@ namespace TrFileTransfer.Tests
                 Assert.Equal(8080, devices[0].Port, "device port");
                 Assert.True(devices[0].SupportsTcp, "tcp flag set");
                 Assert.False(devices[0].SupportsUdt, "udt flag clear");
+                Assert.False(devices[0].RequiresPairing, "pairing flag clear");
 
                 // Dual-protocol server: both flags set in the response bitmap
                 var devices2 = DiscoveryClient.Scan(dPort2, 3000, "127.0.0.1").Result;
@@ -1076,11 +1082,144 @@ namespace TrFileTransfer.Tests
                 Assert.Equal("dual-host", devices2[0].Name, "dual device name");
                 Assert.True(devices2[0].SupportsTcp, "dual tcp flag set");
                 Assert.True(devices2[0].SupportsUdt, "dual udt flag set");
+
+                // Server with pairing enabled advertises the pairing bit
+                var devices3 = DiscoveryClient.Scan(dPort3, 3000, "127.0.0.1").Result;
+                Assert.True(devices3.Length >= 1, "discovered pairing device");
+                Assert.Equal("locked-host", devices3[0].Name, "pairing device name");
+                Assert.True(devices3[0].RequiresPairing, "pairing flag set");
             }
             finally
             {
                 server.Stop();
                 server2.Stop();
+                server3.Stop();
+            }
+        }
+
+        /// <summary>
+        /// Sync mode end-to-end (TCP): three passes over the same derived session —
+        /// initial full send, no-op resend (server reports already complete), and a
+        /// third pass where only the newly added file travels.
+        /// </summary>
+        private static void TcpFolderSync()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_sync_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_sync_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            Guid sessionId = Guid.Empty;
+            TransferServer server = null;
+            try
+            {
+                var contentA = new byte[40 * 1024];
+                new Random(7).NextBytes(contentA);
+                File.WriteAllBytes(Path.Combine(sendDir, "a.bin"), contentA);
+
+                var started = new ManualResetEvent(false);
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => started.Set();
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+
+                sessionId = FolderResumeState.DeriveSyncSession(sendDir, "127.0.0.1", port, false);
+                string sessionDir = ServerWire.GetFolderSessionDir(recvDir, Path.GetFileName(sendDir), sessionId);
+
+                // Pass 1: initial sync sends everything
+                var client1 = new TransferClient("127.0.0.1", port, sendDir);
+                client1.SendFolderResumableAsync(sessionId, keepState: true).Wait(30000);
+                Thread.Sleep(300);
+                Assert.True(File.Exists(Path.Combine(sessionDir, "a.bin")), "a.bin after pass 1");
+                Assert.True(Utils.ConstantTimeEquals(contentA, File.ReadAllBytes(Path.Combine(sessionDir, "a.bin"))), "a.bin content after pass 1");
+
+                // Pass 2: nothing changed → status 2, nothing sent
+                var logs2 = new System.Collections.Generic.List<string>();
+                var client2 = new TransferClient("127.0.0.1", port, sendDir);
+                client2.OnLog += msg => logs2.Add(msg);
+                client2.SendFolderResumableAsync(sessionId, keepState: true).Wait(30000);
+                Thread.Sleep(300);
+                Assert.True(logs2.Exists(m => m.Contains("already fully received")), "pass 2: server reports already complete");
+
+                // Pass 3: add b.bin → a.bin skipped, only b.bin travels
+                var contentB = new byte[20 * 1024];
+                new Random(9).NextBytes(contentB);
+                File.WriteAllBytes(Path.Combine(sendDir, "b.bin"), contentB);
+                var logs3 = new System.Collections.Generic.List<string>();
+                var client3 = new TransferClient("127.0.0.1", port, sendDir);
+                client3.OnLog += msg => logs3.Add(msg);
+                client3.SendFolderResumableAsync(sessionId, keepState: true).Wait(30000);
+                Thread.Sleep(300);
+                Assert.True(logs3.Exists(m => m.Contains("starting at file 2/2")), "pass 3: resumed at file 2/2 (a.bin skipped)");
+                Assert.True(File.Exists(Path.Combine(sessionDir, "b.bin")), "b.bin after pass 3");
+                Assert.True(Utils.ConstantTimeEquals(contentB, File.ReadAllBytes(Path.Combine(sessionDir, "b.bin"))), "b.bin content");
+                Assert.True(Utils.ConstantTimeEquals(contentA, File.ReadAllBytes(Path.Combine(sessionDir, "a.bin"))), "a.bin unchanged by pass 3");
+
+                // Sync state survives completion and stays out of the resume dialog
+                var st = FolderResumeState.Load(sessionId);
+                Assert.True(st != null && st.IsSync, "sync state kept after completion");
+                Assert.False(FolderResumeState.ListAll().Exists(x => x.SessionId == sessionId), "sync state hidden from resume list");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+                if (sessionId != Guid.Empty) FolderResumeState.Delete(sessionId);
+            }
+        }
+
+        private static void UdtFolderSync()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_usync_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_usync_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            Guid sessionId = Guid.Empty;
+            TransferUdtServer server = null;
+            try
+            {
+                var contentA = new byte[24 * 1024];
+                new Random(11).NextBytes(contentA);
+                File.WriteAllBytes(Path.Combine(sendDir, "a.bin"), contentA);
+
+                var started = new ManualResetEvent(false);
+                server = new TransferUdtServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => started.Set();
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("UDT server did not start within 5s");
+
+                sessionId = FolderResumeState.DeriveSyncSession(sendDir, "127.0.0.1", port, true);
+                string sessionDir = ServerWire.GetFolderSessionDir(recvDir, Path.GetFileName(sendDir), sessionId);
+
+                var client1 = new TransferUdtClient("127.0.0.1", port, sendDir);
+                client1.SendFolderResumableAsync(sessionId, keepState: true).Wait(60000);
+                Thread.Sleep(300);
+                Assert.True(File.Exists(Path.Combine(sessionDir, "a.bin")), "a.bin after UDT pass 1");
+
+                // Pass 2: add b.bin → only b.bin travels
+                var contentB = new byte[16 * 1024];
+                new Random(13).NextBytes(contentB);
+                File.WriteAllBytes(Path.Combine(sendDir, "b.bin"), contentB);
+                var logs2 = new System.Collections.Generic.List<string>();
+                var client2 = new TransferUdtClient("127.0.0.1", port, sendDir);
+                client2.OnLog += msg => logs2.Add(msg);
+                client2.SendFolderResumableAsync(sessionId, keepState: true).Wait(60000);
+                Thread.Sleep(300);
+                Assert.True(logs2.Exists(m => m.Contains("starting at file 2/2")), "UDT pass 2: resumed at file 2/2");
+                Assert.True(File.Exists(Path.Combine(sessionDir, "b.bin")), "b.bin after UDT pass 2");
+                Assert.True(Utils.ConstantTimeEquals(contentB, File.ReadAllBytes(Path.Combine(sessionDir, "b.bin"))), "b.bin content");
+                Assert.True(Utils.ConstantTimeEquals(contentA, File.ReadAllBytes(Path.Combine(sessionDir, "a.bin"))), "a.bin unchanged");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+                if (sessionId != Guid.Empty) FolderResumeState.Delete(sessionId);
             }
         }
 

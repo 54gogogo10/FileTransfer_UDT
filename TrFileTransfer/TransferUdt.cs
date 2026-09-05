@@ -611,10 +611,12 @@ namespace TrFileTransfer
         /// <summary>Sends a folder with resume support (type 0x04). Interrupted sessions
         /// continue from where the server's files on disk left off.</summary>
         /// <param name="existingSessionId">Session to resume, or null for a new session.</param>
-        public async Task<Guid> SendFolderResumableAsync(Guid? existingSessionId = null)
+        /// <param name="keepState">Sync mode — keep the session state after completion so
+        /// repeat runs send only differences.</param>
+        public async Task<Guid> SendFolderResumableAsync(Guid? existingSessionId = null, bool keepState = false)
         {
             var sessionId = existingSessionId ?? Guid.NewGuid();
-            await RunUdtTransfer(ct => SendFolderResumableInternal(sessionId, ct));
+            await RunUdtTransfer(ct => SendFolderResumableInternal(sessionId, ct, keepState));
             return sessionId;
         }
 
@@ -748,14 +750,14 @@ namespace TrFileTransfer
             }
         }
 
-        private async Task SendFolderResumableInternal(Guid sessionId, CancellationToken ct)
+        private async Task SendFolderResumableInternal(Guid sessionId, CancellationToken ct, bool keepState)
         {
             await UdtConnect(ct);
             using (var ws = new UdtWireStream(_socket, false))
             {
                 await ClientWire.SendAuthFrameAsync(ws, PairingCode, _cb, ct).ConfigureAwait(false);
                 await ClientWire.SendFolderResumableAsync(ws, _filePath, sessionId,
-                    _serverIp, _port, true, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
+                    _serverIp, _port, true, _bufferSize, _limiter, _cb, ct, keepState).ConfigureAwait(false);
             }
         }
 

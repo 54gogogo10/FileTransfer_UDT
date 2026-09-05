@@ -16,6 +16,8 @@ namespace TrFileTransfer
         public int Port;
         public bool SupportsTcp;
         public bool SupportsUdt;
+        /// <summary>Server requires a pairing code (0x05) before any transfer.</summary>
+        public bool RequiresPairing;
     }
 
     /// <summary>Wire format for the UDP discovery protocol: probe 0xD1 → response 0xD2.</summary>
@@ -24,9 +26,13 @@ namespace TrFileTransfer
         public const int DefaultPort = 45000;
         public const byte Probe = 0xD1;
         public const byte Response = 0xD2;
+        /// <summary>Protocol bitmap bits: bit0=TCP bit1=UDT bit2=pairing required.</summary>
+        public const byte FlagTcp = 1;
+        public const byte FlagUdt = 2;
+        public const byte FlagPairing = 4;
 
-        /// <summary>Response layout: [0xD2][nameLen:1][name][port:2 big-endian][protocols:1 (bit0=TCP bit1=UDT)].</summary>
-        public static byte[] BuildResponse(string name, int port, bool tcp, bool udt)
+        /// <summary>Response layout: [0xD2][nameLen:1][name][port:2 big-endian][protocols:1 (bit0=TCP bit1=UDT bit2=pairing)].</summary>
+        public static byte[] BuildResponse(string name, int port, bool tcp, bool udt, bool pairing)
         {
             byte[] nameBytes = Encoding.UTF8.GetBytes(name ?? "");
             int len = Math.Min(nameBytes.Length, 255);
@@ -36,7 +42,7 @@ namespace TrFileTransfer
             Buffer.BlockCopy(nameBytes, 0, buf, 2, len);
             buf[2 + len] = (byte)((port >> 8) & 0xFF);
             buf[3 + len] = (byte)(port & 0xFF);
-            buf[4 + len] = (byte)((tcp ? 1 : 0) | (udt ? 2 : 0));
+            buf[4 + len] = (byte)((tcp ? FlagTcp : 0) | (udt ? FlagUdt : 0) | (pairing ? FlagPairing : 0));
             return buf;
         }
 
@@ -53,8 +59,9 @@ namespace TrFileTransfer
                 Name = name,
                 Ip = from.Address.ToString(),
                 Port = port,
-                SupportsTcp = (prot & 1) != 0,
-                SupportsUdt = (prot & 2) != 0
+                SupportsTcp = (prot & FlagTcp) != 0,
+                SupportsUdt = (prot & FlagUdt) != 0,
+                RequiresPairing = (prot & FlagPairing) != 0
             };
         }
     }
@@ -71,8 +78,14 @@ namespace TrFileTransfer
             _port = port;
         }
 
-        /// <summary>Starts answering probes. Safe to call again to refresh the payload.</summary>
+        /// <summary>Starts answering probes without the pairing flag (compat overload).</summary>
         public void Start(string serverName, int serverPort, bool tcp, bool udt)
+        {
+            Start(serverName, serverPort, tcp, udt, false);
+        }
+
+        /// <summary>Starts answering probes. Safe to call again to refresh the payload.</summary>
+        public void Start(string serverName, int serverPort, bool tcp, bool udt, bool pairing)
         {
             Stop();
             _cts = new CancellationTokenSource();
@@ -87,10 +100,10 @@ namespace TrFileTransfer
                 return;
             }
             var ct = _cts.Token;
-            Task.Run(() => Loop(ct, serverName, serverPort, tcp, udt));
+            Task.Run(() => Loop(ct, serverName, serverPort, tcp, udt, pairing));
         }
 
-        private async Task Loop(CancellationToken ct, string serverName, int serverPort, bool tcp, bool udt)
+        private async Task Loop(CancellationToken ct, string serverName, int serverPort, bool tcp, bool udt, bool pairing)
         {
             while (!ct.IsCancellationRequested)
             {
@@ -99,7 +112,7 @@ namespace TrFileTransfer
                     var result = await _udp.ReceiveAsync();
                     if (result.Buffer.Length >= 1 && result.Buffer[0] == DiscoveryProtocol.Probe)
                     {
-                        var resp = DiscoveryProtocol.BuildResponse(serverName, serverPort, tcp, udt);
+                        var resp = DiscoveryProtocol.BuildResponse(serverName, serverPort, tcp, udt, pairing);
                         await _udp.SendAsync(resp, resp.Length, result.RemoteEndPoint);
                     }
                 }

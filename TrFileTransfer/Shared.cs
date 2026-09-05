@@ -170,6 +170,45 @@ namespace TrFileTransfer
             }
         }
 
+        /// <summary>
+        /// HKCU Run-key auto start — survives reboots without admin rights. The exe path
+        /// is passed explicitly so this class carries no WinForms dependency.
+        /// </summary>
+        public static class AutoStart
+        {
+            private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+            private const string ValueName = "TrFileTransfer";
+
+            /// <summary>Whether a TrFileTransfer value exists under HKCU ...\Run.</summary>
+            public static bool IsEnabled()
+            {
+                try
+                {
+                    using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKey))
+                        return key != null && key.GetValue(ValueName) != null;
+                }
+                catch { return false; }
+            }
+
+            /// <summary>Registers (enable=true, value = quoted exePath) or removes the entry.
+            /// Setting again with a new path overwrites; disabling when absent is a no-op.</summary>
+            public static void Set(bool enable, string exePath)
+            {
+                try
+                {
+                    using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKey, true))
+                    {
+                        if (key == null) return;
+                        if (enable)
+                            key.SetValue(ValueName, "\"" + exePath + "\"");
+                        else if (key.GetValue(ValueName) != null)
+                            key.DeleteValue(ValueName);
+                    }
+                }
+                catch { }
+            }
+        }
+
         /// <summary>General-purpose utility helpers.</summary>
     public static class Utils
     {

@@ -103,6 +103,7 @@ namespace TrFileTransfer.Tests
             RunFolderResumeStore(runner);
             RunUpdater(runner);
             RunWire(runner);
+            RunSyncBatch(runner);
         }
 
         private static void RunFormatSize(TestRunner runner)
@@ -607,6 +608,98 @@ namespace TrFileTransfer.Tests
             runner.Run("ServerWire_MaxTextBytes", () =>
             {
                 Assert.Equal(1048576, ServerWire.MaxTextBytes, "1 MB cap");
+            });
+        }
+
+        private static void RunSyncBatch(TestRunner runner)
+        {
+            // ---- FolderResumeState.DeriveSyncSession ----
+            runner.Run("SyncSession_Deterministic", () =>
+            {
+                var a = FolderResumeState.DeriveSyncSession(@"D:\data\docs", "192.168.1.5", 8080, false);
+                var b = FolderResumeState.DeriveSyncSession(@"D:\data\docs\", "192.168.1.5", 8080, false);
+                var c = FolderResumeState.DeriveSyncSession(@"D:\DATA\DOCS", "192.168.1.5", 8080, false);
+                Assert.Equal(a, b, "trailing slash ignored");
+                Assert.Equal(a, c, "case-insensitive path");
+            });
+
+            runner.Run("SyncSession_DistinctInputs", () =>
+            {
+                var baseSession = FolderResumeState.DeriveSyncSession(@"D:\docs", "192.168.1.5", 8080, false);
+                Assert.True(FolderResumeState.DeriveSyncSession(@"D:\other", "192.168.1.5", 8080, false) != baseSession, "path differs");
+                Assert.True(FolderResumeState.DeriveSyncSession(@"D:\docs", "192.168.1.6", 8080, false) != baseSession, "ip differs");
+                Assert.True(FolderResumeState.DeriveSyncSession(@"D:\docs", "192.168.1.5", 8081, false) != baseSession, "port differs");
+                Assert.True(FolderResumeState.DeriveSyncSession(@"D:\docs", "192.168.1.5", 8080, true) != baseSession, "protocol differs");
+            });
+
+            // ---- IsSync persistence + resume-list filtering ----
+            runner.Run("SyncState_RoundTripAndFilter", () =>
+            {
+                var sid = Guid.NewGuid();
+                var plainSid = Guid.NewGuid();
+                try
+                {
+                    new FolderResumeState
+                    {
+                        SessionId = sid, FolderPath = @"D:\x", FolderName = "x",
+                        ServerIp = "1.2.3.4", Port = 1, Created = DateTime.UtcNow, IsSync = true
+                    }.Save();
+                    new FolderResumeState
+                    {
+                        SessionId = plainSid, FolderPath = @"D:\y", FolderName = "y",
+                        ServerIp = "1.2.3.4", Port = 1, Created = DateTime.UtcNow, IsSync = false
+                    }.Save();
+
+                    var loaded = FolderResumeState.Load(sid);
+                    Assert.True(loaded != null && loaded.IsSync, "IsSync persisted");
+
+                    var list = FolderResumeState.ListAll();
+                    Assert.False(list.Exists(s => s.SessionId == sid), "sync state hidden from resume list");
+                    Assert.True(list.Exists(s => s.SessionId == plainSid), "normal state listed");
+                }
+                finally
+                {
+                    FolderResumeState.Delete(sid);
+                    FolderResumeState.Delete(plainSid);
+                }
+            });
+
+            // ---- AutoStart (HKCU Run key) ----
+            runner.Run("AutoStart_SetAndRemove", () =>
+            {
+                try
+                {
+                    AutoStart.Set(false, null);
+                    Assert.False(AutoStart.IsEnabled(), "disabled after clear");
+                    AutoStart.Set(true, @"C:\Program Files\TrFileTransfer\TrFileTransfer.exe");
+                    Assert.True(AutoStart.IsEnabled(), "enabled");
+                    AutoStart.Set(true, @"C:\other\TrFileTransfer.exe");
+                    Assert.True(AutoStart.IsEnabled(), "re-set keeps enabled");
+                    AutoStart.Set(false, null);
+                    Assert.False(AutoStart.IsEnabled(), "removed");
+                    AutoStart.Set(false, null);
+                    Assert.False(AutoStart.IsEnabled(), "remove is idempotent");
+                }
+                finally
+                {
+                    AutoStart.Set(false, null); // leave the machine clean
+                }
+            });
+
+            // ---- Discovery pairing flag ----
+            runner.Run("Discovery_PairingFlag", () =>
+            {
+                var from = new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 1234);
+                byte[] withFlag = DiscoveryProtocol.BuildResponse("dev", 8080, true, true, true);
+                var parsed = DiscoveryProtocol.ParseResponse(withFlag, withFlag.Length, from);
+                Assert.True(parsed.HasValue, "parsed");
+                Assert.True(parsed.Value.RequiresPairing, "pairing flag set");
+                Assert.True(parsed.Value.SupportsTcp && parsed.Value.SupportsUdt, "protocol flags intact");
+
+                byte[] withoutFlag = DiscoveryProtocol.BuildResponse("dev", 8080, true, false, false);
+                var parsed2 = DiscoveryProtocol.ParseResponse(withoutFlag, withoutFlag.Length, from);
+                Assert.True(parsed2.HasValue && !parsed2.Value.RequiresPairing, "pairing flag clear");
+                Assert.True(parsed2.Value.SupportsTcp && !parsed2.Value.SupportsUdt, "protocols intact");
             });
         }
 

@@ -1241,10 +1241,13 @@ namespace TrFileTransfer
         /// Sends a folder with resume support (type 0x04). Sends a manifest with per-file
         /// full-file SHA256, then only the bytes the server reports as missing. The client
         /// persists a FolderResumeState so an interrupted session can be retried later.
+        /// With keepState=true (sync mode) the state survives completion — the session
+        /// maps to a fixed server directory, so repeat runs transfer only differences —
+        /// and the state is flagged IsSync to stay out of the resume dialog.
         /// </summary>
         public static async Task SendFolderResumableAsync(IWireStream s, string folderPath, Guid sessionId,
             string serverIp, int port, bool isUdt, int bufferSize, SpeedLimiter limiter, WireCallbacks cb,
-            CancellationToken ct)
+            CancellationToken ct, bool keepState = false)
         {
             string folderName = Path.GetFileName(folderPath.TrimEnd('\\', '/'));
             if (string.IsNullOrWhiteSpace(folderName))
@@ -1285,7 +1288,8 @@ namespace TrFileTransfer
                 Created = DateTime.UtcNow,
                 FileCount = files.Length,
                 TotalBytes = totalBytes,
-                SentBytes = 0
+                SentBytes = 0,
+                IsSync = keepState
             };
             state.Save();
 
@@ -1327,7 +1331,7 @@ namespace TrFileTransfer
             if (status == 2)
             {
                 cb.RaiseLog(L.C_AlreadyReceived(folderName));
-                FolderResumeState.Delete(sessionId);
+                if (!keepState) FolderResumeState.Delete(sessionId);
                 cb.RaiseComplete();
                 return;
             }
@@ -1366,7 +1370,9 @@ namespace TrFileTransfer
                 sw.Elapsed.TotalSeconds,
                 Utils.FormatSize((long)(totalBytes / Math.Max(sw.Elapsed.TotalSeconds, 0.001)))));
 
-            FolderResumeState.Delete(sessionId);
+            // Sync mode keeps the state: the next run of the same (folder, target) pair
+            // reuses the session and the server scan skips everything already received
+            if (!keepState) FolderResumeState.Delete(sessionId);
             cb.RaiseComplete();
         }
 
