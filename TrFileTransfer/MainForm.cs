@@ -1653,23 +1653,35 @@ namespace TrFileTransfer
             return card;
         }
 
+        /// <summary>Width each transfer card should have inside its host panel
+        /// (accounts for the vertical scrollbar once it appears).</summary>
+        private static int CardWidth(FlowLayoutPanel parent)
+        {
+            int w = parent.ClientSize.Width - (parent.VerticalScroll.Visible
+                ? SystemInformation.VerticalScrollBarWidth + 8
+                : 8);
+            return Math.Max(40, w);
+        }
+
         private Panel CreateTransferCard(FlowLayoutPanel parent)
         {
-            var panel = new Panel { Height = 44, Margin = new Padding(2), BackColor = Color.White };
+            // Size the card and its children to the host panel up front; the bar must
+            // never be sized against the panel while the card itself is still at its
+            // default width — that made every bar overflow its card.
+            int cardWidth = CardWidth(parent);
+            var panel = new Panel { Width = cardWidth, Height = 44, Margin = new Padding(2), BackColor = Color.White };
             var bar = new ProgressBar
             {
                 Location = new Point(6, 5),
-                Width = Math.Max(40, parent.ClientSize.Width - 20),
+                Width = cardWidth - 12,
                 Height = 16,
-                Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right,
                 Style = ProgressBarStyle.Continuous, Minimum = 0, Maximum = 100
             };
             var lbl = new Label
             {
                 Location = new Point(6, 25),
-                Width = Math.Max(40, parent.ClientSize.Width - 20),
+                Width = cardWidth - 12,
                 Height = 15,
-                Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right,
                 Text = "", AutoSize = false, TextAlign = ContentAlignment.MiddleLeft,
                 ForeColor = Color.FromArgb(85, 85, 85),
                 Font = new Font("Segoe UI", 8f)
@@ -1678,18 +1690,25 @@ namespace TrFileTransfer
             panel.Controls.Add(lbl);
             panel.Tag = new ProgressCardInfo { Bar = bar, Label = lbl };
             parent.Controls.Add(panel);
+            // Adding the card may have introduced the scrollbar (shrinking the client
+            // area) — re-sync every card so all widths stay uniform
+            SyncCardWidths(parent);
             return panel;
         }
 
-        /// <summary>Keeps every transfer card as wide as its host panel (minus scrollbar).</summary>
+        /// <summary>Keeps every transfer card, and the bar/label inside it, as wide as
+        /// its host panel (minus scrollbar). Child widths are set explicitly — anchoring
+        /// cannot recover from children that start wider than their card.</summary>
         private static void SyncCardWidths(FlowLayoutPanel parent)
         {
-            int w = parent.ClientSize.Width - (parent.VerticalScroll.Visible
-                ? SystemInformation.VerticalScrollBarWidth + 8
-                : 8);
-            if (w < 40) w = 40;
+            int w = CardWidth(parent);
             for (int i = 0; i < parent.Controls.Count; i++)
-                parent.Controls[i].Width = w;
+            {
+                var card = parent.Controls[i];
+                card.Width = w;
+                foreach (Control c in card.Controls)
+                    c.Width = w - 12;
+            }
         }
 
         private Panel GetOrCreateUdtCard(IPEndPoint ep)
