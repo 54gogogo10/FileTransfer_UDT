@@ -92,6 +92,8 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_Auth_UDT", UdtAuthCorrectCode, 1);
             runner.Run("Integration_FolderSync_TCP", TcpFolderSync);
             runner.Run("Integration_FolderSync_UDT", UdtFolderSync, 1);
+            runner.Run("Integration_HTTP_ListAndDownload", HttpShareListAndDownload);
+            runner.Run("Integration_HTTP_TokenAndTraversal", HttpShareTokenAndTraversal);
         }
 
         private static void TcpSingleFile()
@@ -2935,6 +2937,148 @@ namespace TrFileTransfer.Tests
                 if (server != null) { try { server.Stop(); } catch { } }
                 try { Directory.Delete(sendDir, true); } catch { }
                 try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        // ---- HTTP share (browser listing/download) ----
+
+        /// <summary>GET helper returning (status, body bytes, headers).</summary>
+        private static System.Tuple<int, byte[], System.Net.WebHeaderCollection> HttpGet(string url)
+        {
+            var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+            req.Method = "GET";
+            req.Timeout = 10000;
+            req.ReadWriteTimeout = 10000;
+            req.Proxy = null;
+            try
+            {
+                using (var resp = (System.Net.HttpWebResponse)req.GetResponse())
+                using (var ms = new MemoryStream())
+                {
+                    resp.GetResponseStream().CopyTo(ms);
+                    return System.Tuple.Create((int)resp.StatusCode, ms.ToArray(), resp.Headers);
+                }
+            }
+            catch (System.Net.WebException ex)
+            {
+                var resp = ex.Response as System.Net.HttpWebResponse;
+                if (resp == null) throw;
+                using (resp)
+                using (var ms = new MemoryStream())
+                {
+                    resp.GetResponseStream().CopyTo(ms);
+                    return System.Tuple.Create((int)resp.StatusCode, ms.ToArray(), resp.Headers);
+                }
+            }
+        }
+
+        private static void HttpShareListAndDownload()
+        {
+            int port = FindFreePort();
+            string root = Path.Combine(TempBase(), "tr_http_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            var server = new HttpShareServer();
+            try
+            {
+                var contentA = new byte[300 * 1024];
+                new Random(21).NextBytes(contentA);
+                File.WriteAllBytes(Path.Combine(root, "a 文件.bin"), contentA);
+                Directory.CreateDirectory(Path.Combine(root, "sub"));
+                byte[] contentB = System.Text.Encoding.UTF8.GetBytes("hello from subdir");
+                File.WriteAllBytes(Path.Combine(root, "sub", "b.txt"), contentB);
+
+                server.Start(root, port, null);
+                string baseUrl = "http://127.0.0.1:" + port + "/";
+
+                // Root listing shows both entries
+                var list = HttpGet(baseUrl);
+                Assert.Equal(200, list.Item1, "root listing 200");
+                string html = System.Text.Encoding.UTF8.GetString(list.Item2);
+                Assert.True(html.Contains("a 文件.bin") || html.Contains(Uri.EscapeDataString("a 文件.bin").Replace("+", "%20")) || html.Contains("a %E6%96%87%E4%BB%B6.bin"),
+                    "listing contains file name");
+                Assert.True(html.Contains("sub"), "listing contains subdir");
+
+                // Download with a non-ASCII name; content and length must match
+                var dl = HttpGet(baseUrl + "?f=" + Uri.EscapeDataString("a 文件.bin"));
+                Assert.Equal(200, dl.Item1, "download 200");
+                Assert.Equal(contentA.Length, dl.Item2.Length, "download length");
+                Assert.True(Utils.ConstantTimeEquals(contentA, dl.Item2), "download bytes identical");
+                Assert.Equal(contentA.Length.ToString(), dl.Item3["Content-Length"], "Content-Length header");
+
+                // Subdirectory navigation and download
+                var subList = HttpGet(baseUrl + "?p=" + Uri.EscapeDataString("sub"));
+                Assert.Equal(200, subList.Item1, "subdir listing 200");
+                Assert.True(System.Text.Encoding.UTF8.GetString(subList.Item2).Contains("b.txt"), "subdir listing shows b.txt");
+                var dlB = HttpGet(baseUrl + "?f=" + Uri.EscapeDataString("sub/b.txt"));
+                Assert.Equal(200, dlB.Item1, "subdir download 200");
+                Assert.True(Utils.ConstantTimeEquals(contentB, dlB.Item2), "subdir download bytes");
+
+                // Missing file -> 404
+                var missing = HttpGet(baseUrl + "?f=does_not_exist.bin");
+                Assert.Equal(404, missing.Item1, "missing file 404");
+            }
+            finally
+            {
+                server.Stop();
+                try { Directory.Delete(root, true); } catch { }
+            }
+        }
+
+        private static void HttpShareTokenAndTraversal()
+        {
+            int port = FindFreePort();
+            string root = Path.Combine(TempBase(), "tr_http_tk_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            var server = new HttpShareServer();
+            try
+            {
+                byte[] content = System.Text.Encoding.UTF8.GetBytes("top secret payload");
+                File.WriteAllBytes(Path.Combine(root, "secret.bin"), content);
+                // A file OUTSIDE the share root that traversal must never reach
+                string outsideDir = Path.Combine(TempBase(), "tr_http_out_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(outsideDir);
+                File.WriteAllBytes(Path.Combine(outsideDir, "escaped.txt"), new byte[] { 1 });
+
+                server.Start(root, port, "135790");
+                string baseUrl = "http://127.0.0.1:" + port + "/";
+
+                // No/wrong token -> token form, never the listing
+                var noTok = HttpGet(baseUrl);
+                Assert.Equal(200, noTok.Item1, "token gate 200");
+                string html = System.Text.Encoding.UTF8.GetString(noTok.Item2);
+                Assert.True(html.Contains("name=\"t\""), "token form served");
+                Assert.False(html.Contains("secret.bin"), "no listing without token");
+
+                var badTok = HttpGet(baseUrl + "?t=000000");
+                Assert.True(System.Text.Encoding.UTF8.GetString(badTok.Item2).Contains("name=\"t\""), "wrong token -> form");
+
+                // Correct token -> listing visible
+                var okTok = HttpGet(baseUrl + "?t=135790");
+                Assert.True(System.Text.Encoding.UTF8.GetString(okTok.Item2).Contains("secret.bin"), "correct token -> listing");
+
+                // Download needs the token too
+                var dlNoTok = HttpGet(baseUrl + "?f=secret.bin");
+                Assert.True(System.Text.Encoding.UTF8.GetString(dlNoTok.Item2).Contains("name=\"t\""), "download without token -> form");
+                var dlOk = HttpGet(baseUrl + "?t=135790&f=secret.bin");
+                Assert.Equal(200, dlOk.Item1, "download with token 200");
+                Assert.True(Utils.ConstantTimeEquals(content, dlOk.Item2), "download bytes with token");
+
+                // Traversal attempts are blocked (sanitized into the root or 404)
+                var trav1 = HttpGet(baseUrl + "?t=" + Uri.EscapeDataString("135790") + "&f=" + Uri.EscapeDataString("../tr_http_out_" + Path.GetFileName(outsideDir) + "/escaped.txt"));
+                Assert.True(trav1.Item1 == 404 || trav1.Item1 == 200,
+                    "traversal attempt answered");
+                if (trav1.Item1 == 200)
+                    Assert.False(Utils.ConstantTimeEquals(new byte[] { 1 }, trav1.Item2), "traversal must not leak outside file");
+
+                var missing = HttpGet(baseUrl + "?t=135790&f=nope.bin");
+                Assert.Equal(404, missing.Item1, "missing file 404");
+
+                try { Directory.Delete(outsideDir, true); } catch { }
+            }
+            finally
+            {
+                server.Stop();
+                try { Directory.Delete(root, true); } catch { }
             }
         }
     }

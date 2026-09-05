@@ -74,6 +74,8 @@ namespace TrFileTransfer
         private NotifyIcon _notifyIcon;
         private Button _btnOpenDir;
         private Button _btnRecent;
+        private Button _btnHttpShare;
+        private HttpShareServer _httpShare;
         private ContextMenuStrip _trayMenu;
         private bool _trayExit;
         private readonly System.Collections.Generic.List<string> _recentFiles
@@ -233,6 +235,9 @@ namespace TrFileTransfer
             _btnRecent = new Button { Width = 96, Height = 28, Margin = new Padding(0, 3, 0, 3) };
             UiStyle.Secondary(_btnRecent);
             _btnRecent.Click += BtnRecent_Click;
+            _btnHttpShare = new Button { Width = 96, Height = 28, Margin = new Padding(16, 3, 0, 3) };
+            UiStyle.Secondary(_btnHttpShare);
+            _btnHttpShare.Click += BtnHttpShare_Click;
             _chkPairing = new CheckBox { AutoSize = true, Margin = new Padding(16, 8, 3, 3) };
             _chkPairing.CheckedChanged += ChkPairing_CheckedChanged;
             _lblPairingCode = new Label
@@ -248,6 +253,7 @@ namespace TrFileTransfer
             serverButtons.Controls.Add(_btnStopServer);
             serverButtons.Controls.Add(_btnOpenDir);
             serverButtons.Controls.Add(_btnRecent);
+            serverButtons.Controls.Add(_btnHttpShare);
             serverButtons.Controls.Add(_chkPairing);
             serverButtons.Controls.Add(_lblPairingCode);
             tlpS.Controls.Add(_lblBind, 0, 0);
@@ -540,6 +546,10 @@ namespace TrFileTransfer
             _chkPairing.Text = L.PairingLabel;
             _btnSendText.Text = L.SendTextBtn;
             _lblPairingC.Text = L.PairingClientLabel;
+            if (_httpShare == null || !_httpShare.IsRunning)
+                _btnHttpShare.Text = L.HttpShareBtn;
+            else
+                _btnHttpShare.Text = L.HttpShareStop;
 
             PopulateBindAddresses();
         }
@@ -766,6 +776,45 @@ namespace TrFileTransfer
             if (_chkPairing.Checked)
                 _lblPairingCode.Text = WireAuth.GeneratePairingCode();
             _lblPairingCode.Visible = _chkPairing.Checked;
+        }
+
+        // ---- HTTP share (browser download) ----
+
+        private void BtnHttpShare_Click(object sender, EventArgs e)
+        {
+            if (_httpShare != null && _httpShare.IsRunning)
+            {
+                _httpShare.Stop();
+                _httpShare = null;
+                AddLog(L.HttpShareOff);
+                _btnHttpShare.Text = L.HttpShareBtn;
+                return;
+            }
+
+            string dir = _txtSaveDir.Text.Trim();
+            if (!Directory.Exists(dir))
+            {
+                MessageBox.Show(L.HttpShareDirMissing, L.DlgError, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            int port = Config.GetInt("HttpSharePort", HttpShareServer.DefaultPort);
+            var share = new HttpShareServer();
+            share.OnLog += msg => this.Invoke((Action)(() => AddLog(msg)));
+            try
+            {
+                // Pairing enabled -> reuse the pairing code as the share access code
+                string token = _chkPairing.Checked ? _lblPairingCode.Text : null;
+                share.Start(dir, port, token);
+                _httpShare = share;
+                _btnHttpShare.Text = L.HttpShareStop;
+                AddLog(L.HttpShareOn(share.LanUrl));
+            }
+            catch (Exception ex)
+            {
+                AddLog(L.HttpShareStartFailed(ex.Message));
+                MessageBox.Show(L.HttpShareStartFailed(ex.Message), L.DlgError,
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
 
         private void MainForm_DragEnter(object sender, DragEventArgs e)
@@ -2089,6 +2138,7 @@ namespace TrFileTransfer
             // Remove the tray icon before teardown, otherwise it lingers until hover
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
+            if (_httpShare != null) { try { _httpShare.Stop(); } catch { } _httpShare = null; }
             base.OnFormClosing(e);
         }
     }

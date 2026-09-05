@@ -530,5 +530,27 @@ namespace TrFileTransfer
         public static string ScanNeedsPairing { get { return IsChinese ? "[需配对]" : "[Pairing]"; } }
         public static string UsePairingHint { get { return IsChinese ? "该设备已启用配对码，请先在客户端填写配对码再发送。" : "This device requires a pairing code — fill it in on the client before sending."; } }
 
+        // ---- HTTP share ----
+        public static string HttpShareBtn { get { return IsChinese ? "HTTP 共享" : "HTTP Share"; } }
+        public static string HttpShareStop { get { return IsChinese ? "停止共享" : "Stop Share"; } }
+        public static string HttpShareOn(object url)
+        {
+            return IsChinese
+                ? string.Format("HTTP 共享已开启: {0} （浏览器打开即可下载）", url)
+                : string.Format("HTTP share on: {0} (open in a browser to download)", url);
+        }
+        public static string HttpShareOff { get { return IsChinese ? "HTTP 共享已关闭。" : "HTTP share stopped."; } }
+        public static string HttpShareDirMissing { get { return IsChinese ? "共享目录不存在。" : "Share directory does not exist."; } }
+        public static string HttpShareStartFailed(string msg)
+        {
+            return IsChinese
+                ? string.Format("HTTP 共享启动失败: {0}", msg)
+                : string.Format("HTTP share failed to start: {0}", msg);
+        }
+        public static string HttpShareEmpty { get { return IsChinese ? "（空目录）" : "(empty)"; } }
+        public static string HttpShareTokenPrompt { get { return IsChinese ? "此共享需要访问码，请输入对方显示的配对码。" : "This share requires an access code — enter the pairing code shown on the host."; } }
+        public static string HttpShareTokenSubmit { get { return IsChinese ? "打开" : "Open"; } }
+        public static string HttpShareWrongToken { get { return IsChinese ? "访问码不正确，请重试。" : "Wrong access code, try again."; } }
+
     }
 }

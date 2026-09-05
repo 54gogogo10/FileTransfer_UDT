@@ -56,6 +56,7 @@ echo.
     TransferClient.cs ^
     DeviceDiscovery.cs ^
     Updater.cs ^
+    HttpShare.cs ^
     MainForm.cs ^
     Program.cs
 
