@@ -37,6 +37,10 @@ namespace TrFileTransfer
         /// <summary>Whether a transfer is currently in progress.</summary>
         public bool IsRunning { get { return _isRunning; } }
 
+        /// <summary>Pairing code sent as a 0x05 auth frame before any transfer.
+        /// Null/empty sends nothing (compatible with servers that don't require it).</summary>
+        public string PairingCode { get; set; }
+
         /// <summary>
         /// Creates a TCP client for sending files or folders.
         /// </summary>
@@ -117,6 +121,12 @@ namespace TrFileTransfer
             var sessionId = existingSessionId ?? Guid.NewGuid();
             await RunTransfer(ct => SendResumableInternal(sessionId, ct, verifyHash));
             return sessionId;
+        }
+
+        /// <summary>Sends a UTF-8 text message (type 0x06) over TCP.</summary>
+        public async Task SendTextAsync(string text)
+        {
+            await RunTransfer(ct => SendTextInternal(text, ct));
         }
 
         private async Task RunTransfer(Func<CancellationToken, Task> transferAction)
@@ -200,6 +210,7 @@ namespace TrFileTransfer
         {
             using (var ws = await ConnectAsync(ct).ConfigureAwait(false))
             {
+                await ClientWire.SendAuthFrameAsync(ws, PairingCode, _cb, ct).ConfigureAwait(false);
                 await ClientWire.SendSingleFileAsync(ws, _filePath, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
         }
@@ -208,6 +219,7 @@ namespace TrFileTransfer
         {
             using (var ws = await ConnectAsync(ct).ConfigureAwait(false))
             {
+                await ClientWire.SendAuthFrameAsync(ws, PairingCode, _cb, ct).ConfigureAwait(false);
                 await ClientWire.SendFolderAsync(ws, folderPath, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
         }
@@ -216,6 +228,7 @@ namespace TrFileTransfer
         {
             using (var ws = await ConnectAsync(ct).ConfigureAwait(false))
             {
+                await ClientWire.SendAuthFrameAsync(ws, PairingCode, _cb, ct).ConfigureAwait(false);
                 await ClientWire.SendChunkAsync(ws, _filePath, offset, chunkSize, totalSize,
                     _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
@@ -225,6 +238,7 @@ namespace TrFileTransfer
         {
             using (var ws = await ConnectAsync(ct).ConfigureAwait(false))
             {
+                await ClientWire.SendAuthFrameAsync(ws, PairingCode, _cb, ct).ConfigureAwait(false);
                 await ClientWire.SendFolderResumableAsync(ws, _filePath, sessionId,
                     _serverIp, _port, false, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
@@ -234,8 +248,18 @@ namespace TrFileTransfer
         {
             using (var ws = await ConnectAsync(ct).ConfigureAwait(false))
             {
+                await ClientWire.SendAuthFrameAsync(ws, PairingCode, _cb, ct).ConfigureAwait(false);
                 await ClientWire.SendResumableAsync(ws, _filePath, sessionId, verifyHash,
                     _serverIp, _port, false, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
+            }
+        }
+
+        private async Task SendTextInternal(string text, CancellationToken ct)
+        {
+            using (var ws = await ConnectAsync(ct).ConfigureAwait(false))
+            {
+                await ClientWire.SendAuthFrameAsync(ws, PairingCode, _cb, ct).ConfigureAwait(false);
+                await ClientWire.SendTextAsync(ws, text, _cb, ct).ConfigureAwait(false);
             }
         }
 

@@ -118,6 +118,28 @@ namespace TrFileTransfer
 
     #region Shared callbacks and server context
 
+    /// <summary>Pairing-code helpers for the 0x05 authentication frame.</summary>
+    public static class WireAuth
+    {
+        /// <summary>SHA256 of the UTF-8 pairing code — what actually crosses the wire,
+        /// so the raw code never leaves the machine.</summary>
+        public static byte[] HashCode(string code)
+        {
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+                return sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(code ?? ""));
+        }
+
+        /// <summary>Cryptographically random 6-digit pairing code for the server UI.</summary>
+        public static string GeneratePairingCode()
+        {
+            var buf = new byte[4];
+            using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create())
+                rng.GetBytes(buf);
+            int v = BitConverter.ToInt32(buf, 0) & 0x7FFFFFFF;
+            return (v % 1000000).ToString("D6");
+        }
+    }
+
     /// <summary>Events the shared protocol code raises; transports fan these out to their own listeners.</summary>
     public class WireCallbacks
     {
@@ -126,12 +148,14 @@ namespace TrFileTransfer
         public Action<string> Error;
         public Action Complete;
         public Action<string, long> FileReceived;
+        public Action<string> TextReceived;
 
         public void RaiseLog(string msg) { var h = Log; if (h != null) h(msg); }
         public void RaiseProgress(TransferProgress p) { var h = Progress; if (h != null) h(p); }
         public void RaiseError(string msg) { var h = Error; if (h != null) h(msg); }
         public void RaiseComplete() { var h = Complete; if (h != null) h(); }
         public void RaiseFileReceived(string path, long size) { var h = FileReceived; if (h != null) h(path, size); }
+        public void RaiseTextReceived(string text) { var h = TextReceived; if (h != null) h(text); }
     }
 
     /// <summary>Outcome of a server-side protocol dispatch. Lets transports keep their own
@@ -149,6 +173,9 @@ namespace TrFileTransfer
     {
         public string SaveDirectory;
         public int BufferSize = 4194304;
+        /// <summary>When non-empty, clients must present this pairing code (0x05 frame)
+        /// before any transfer type is accepted. Empty = open to the LAN.</summary>
+        public string PairingCode;
         public readonly WireCallbacks Cb = new WireCallbacks();
         public readonly ConcurrentDictionary<string, ChunkTracker> ChunkTrackers
             = new ConcurrentDictionary<string, ChunkTracker>();
@@ -186,12 +213,41 @@ namespace TrFileTransfer
     /// <summary>Receiving side of the 0x00-0x03 protocol, shared by TCP and UDT servers.</summary>
     public static class ServerWire
     {
+        /// <summary>Maximum payload size for a 0x06 text message (1 MB of UTF-8 bytes).</summary>
+        public const int MaxTextBytes = 1048576;
+
+        /// <summary>Single-line preview of a text message for logs and balloon tips.</summary>
+        public static string Preview(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return "";
+            string line = text.Replace("\r", "").Replace("\n", " / ");
+            if (line.Length > 160) line = line.Substring(0, 160) + "…";
+            return line;
+        }
+
         /// <summary>Reads the transfer type and dispatches. Throws on connection errors.</summary>
         public static async Task<WireOutcome> HandleClientAsync(IWireStream s, ServerWireContext ctx, CancellationToken ct)
         {
             var typeBuf = new byte[1];
             await s.ReadExactAsync(typeBuf, 0, 1, ct).ConfigureAwait(false);
             byte transferType = typeBuf[0];
+
+            // Optional 0x05 pairing frame before any transfer type
+            if (transferType == 0x05)
+            {
+                if (!await HandleAuthAsync(s, ctx, ct).ConfigureAwait(false))
+                    return new WireOutcome { Success = false };
+                await s.ReadExactAsync(typeBuf, 0, 1, ct).ConfigureAwait(false);
+                transferType = typeBuf[0];
+            }
+            else if (!string.IsNullOrEmpty(ctx.PairingCode))
+            {
+                // Server requires pairing — reject clients that skip authentication
+                await SendAuthResponse(s, 1, ct).ConfigureAwait(false);
+                ctx.Cb.RaiseLog(L.S_AuthRequired);
+                ctx.Cb.RaiseError(L.S_AuthRequired);
+                return new WireOutcome { Success = false };
+            }
 
             if (transferType == 0x01)
                 return new WireOutcome { Success = await HandleFolderTransfer(s, ctx, ct).ConfigureAwait(false) };
@@ -201,7 +257,73 @@ namespace TrFileTransfer
                 return new WireOutcome { Success = await HandleResumableFile(s, ctx, ct).ConfigureAwait(false) };
             if (transferType == 0x04)
                 return new WireOutcome { Success = await HandleFolderResumableAsync(s, ctx, ct).ConfigureAwait(false) };
+            if (transferType == 0x06)
+                return new WireOutcome { Success = await HandleTextMessage(s, ctx, ct).ConfigureAwait(false) };
             return new WireOutcome { Success = await HandleFileTransfer(s, ctx, ct).ConfigureAwait(false) };
+        }
+
+        /// <summary>
+        /// Verifies a 0x05 pairing frame and answers with 0x15 status. A server without
+        /// a configured code accepts any 0x05 (lenient path — clients may always send
+        /// their code). Returns false (after rejecting) when the code is wrong.
+        /// </summary>
+        private static async Task<bool> HandleAuthAsync(IWireStream s, ServerWireContext ctx, CancellationToken ct)
+        {
+            var hashBuf = new byte[32];
+            await s.ReadExactAsync(hashBuf, 0, 32, ct).ConfigureAwait(false);
+
+            byte status;
+            if (string.IsNullOrEmpty(ctx.PairingCode))
+            {
+                status = 0;
+            }
+            else
+            {
+                status = Utils.ConstantTimeEquals(hashBuf, WireAuth.HashCode(ctx.PairingCode)) ? (byte)0 : (byte)1;
+            }
+            await SendAuthResponse(s, status, ct).ConfigureAwait(false);
+
+            if (status == 1)
+            {
+                ctx.Cb.RaiseLog(L.S_AuthFailed);
+                ctx.Cb.RaiseError(L.S_AuthFailed);
+                return false;
+            }
+            ctx.Cb.RaiseLog(L.S_AuthOk);
+            return true;
+        }
+
+        private static async Task SendAuthResponse(IWireStream s, byte status, CancellationToken ct)
+        {
+            var resp = new byte[2]; // type(1) + status(1)
+            resp[0] = 0x15;
+            resp[1] = status;
+            await s.WriteExactAsync(resp, 0, 2, ct).ConfigureAwait(false);
+        }
+
+        /// <summary>Receives a 0x06 UTF-8 text message. Delivered to the UI via
+        /// TextReceived; success mirrors file semantics (clean close on TCP, 1-byte
+        /// app ACK on UDT), so no extra response frame is sent.</summary>
+        private static async Task<bool> HandleTextMessage(IWireStream s, ServerWireContext ctx, CancellationToken ct)
+        {
+            var lenBuf = new byte[4];
+            await s.ReadExactAsync(lenBuf, 0, 4, ct).ConfigureAwait(false);
+            int len = BitConverter.ToInt32(lenBuf, 0);
+            if (len < 0 || len > MaxTextBytes)
+            {
+                ctx.Cb.RaiseLog(L.S_TextRejected);
+                ctx.Cb.RaiseError(L.S_TextRejected);
+                return false;
+            }
+
+            var buf = new byte[len];
+            if (len > 0)
+                await s.ReadExactAsync(buf, 0, len, ct).ConfigureAwait(false);
+            string text = System.Text.Encoding.UTF8.GetString(buf);
+
+            ctx.Cb.RaiseLog(L.S_TextReceived(Preview(text)));
+            ctx.Cb.RaiseTextReceived(text);
+            return true;
         }
 
         /// <summary>Normalizes a received name to a bare file name with a fallback.</summary>
@@ -1255,6 +1377,50 @@ namespace TrFileTransfer
                 FileShare.Read, 4194304, FileOptions.SequentialScan))
             using (var sha = System.Security.Cryptography.SHA256.Create())
                 return sha.ComputeHash(fs);
+        }
+
+        /// <summary>
+        /// Sends the 0x05 pairing frame and waits for the 0x15 verdict. No-op when
+        /// pairingCode is empty (works against servers with pairing disabled too —
+        /// they accept any 0x05). Throws IOException when the code is rejected.
+        /// </summary>
+        public static async Task SendAuthFrameAsync(IWireStream s, string pairingCode, WireCallbacks cb, CancellationToken ct)
+        {
+            if (string.IsNullOrEmpty(pairingCode)) return;
+            cb.RaiseLog(L.C_Authing);
+            var frame = new byte[1 + 32];
+            frame[0] = 0x05;
+            Buffer.BlockCopy(WireAuth.HashCode(pairingCode), 0, frame, 1, 32);
+            await s.WriteExactAsync(frame, 0, frame.Length, ct).ConfigureAwait(false);
+
+            var resp = new byte[2];
+            await s.ReadExactAsync(resp, 0, 2, ct).ConfigureAwait(false);
+            if (resp[0] != 0x15)
+                throw new InvalidDataException(string.Format("Unexpected auth response type: {0}", resp[0]));
+            if (resp[1] != 0)
+                throw new IOException(L.C_AuthFailed);
+        }
+
+        /// <summary>
+        /// Sends a UTF-8 text message (type 0x06): [0x06][4-byte byte length][UTF-8 bytes].
+        /// Delivery is confirmed the same way as files — clean close on TCP, the
+        /// 1-byte application ACK on UDT — so no separate response frame exists.
+        /// </summary>
+        public static async Task SendTextAsync(IWireStream s, string text, WireCallbacks cb, CancellationToken ct)
+        {
+            byte[] payload = System.Text.Encoding.UTF8.GetBytes(text);
+            if (payload.Length > ServerWire.MaxTextBytes)
+                throw new IOException(L.SendTextTooLarge);
+
+            var header = new byte[1 + 4];
+            header[0] = 0x06;
+            Buffer.BlockCopy(BitConverter.GetBytes(payload.Length), 0, header, 1, 4);
+            await s.WriteExactAsync(header, 0, header.Length, ct).ConfigureAwait(false);
+            if (payload.Length > 0)
+                await s.WriteExactAsync(payload, 0, payload.Length, ct).ConfigureAwait(false);
+
+            cb.RaiseLog(L.C_SendingText(ServerWire.Preview(text), Utils.FormatSize(payload.Length)));
+            cb.RaiseComplete();
         }
 
         /// <summary>Sends one chunk of a larger file (type 0x02) for concurrent transfers.</summary>

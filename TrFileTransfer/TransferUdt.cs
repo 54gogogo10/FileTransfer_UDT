@@ -245,6 +245,8 @@ namespace TrFileTransfer
         public event Action OnTransferComplete;
         /// <summary>Fired when a file has been fully received and saved (path, size).</summary>
         public event Action<string, long> OnFileReceived;
+        /// <summary>Fired when a 0x06 text message has been received.</summary>
+        public event Action<string> OnTextReceived;
         /// <summary>Fired when the server starts listening.</summary>
         public event Action OnStarted;
         /// <summary>Fired when the server stops.</summary>
@@ -258,6 +260,14 @@ namespace TrFileTransfer
 
         /// <summary>Whether the server is currently listening.</summary>
         public bool IsRunning { get { return _isRunning; } }
+
+        /// <summary>When non-empty, clients must present this pairing code (0x05) before
+        /// any transfer is accepted. Set before Start().</summary>
+        public string PairingCode
+        {
+            get { return _wire.PairingCode; }
+            set { _wire.PairingCode = value; }
+        }
 
         /// <summary>Creates a UDT server that listens for incoming file transfers.</summary>
         /// <param name="bindAddress">IPv4 address to bind to, or "0.0.0.0" for all interfaces.</param>
@@ -285,6 +295,10 @@ namespace TrFileTransfer
             _wire.Cb.FileReceived = delegate(string path, long size)
             {
                 var h = OnFileReceived; if (h != null) h(path, size);
+            };
+            _wire.Cb.TextReceived = delegate(string text)
+            {
+                var h = OnTextReceived; if (h != null) h(text);
             };
         }
 
@@ -531,6 +545,10 @@ namespace TrFileTransfer
         /// <summary>Whether a transfer is currently in progress.</summary>
         public bool IsRunning { get { return _isRunning; } }
 
+        /// <summary>Pairing code sent as a 0x05 auth frame before any transfer.
+        /// Null/empty sends nothing (compatible with servers that don't require it).</summary>
+        public string PairingCode { get; set; }
+
         /// <summary>Creates a UDT client for sending files or folders.</summary>
         /// <param name="serverIp">Target server IPv4 address.</param>
         /// <param name="port">Target server port.</param>
@@ -605,6 +623,12 @@ namespace TrFileTransfer
             var sessionId = existingSessionId ?? Guid.NewGuid();
             await RunUdtTransfer(ct => SendResumableUdtInternal(sessionId, ct, verifyHash));
             return sessionId;
+        }
+
+        /// <summary>Sends a UTF-8 text message (type 0x06) over UDT.</summary>
+        public async Task SendTextAsync(string text)
+        {
+            await RunUdtTransfer(ct => SendTextInternal(text, ct));
         }
 
         private async Task RunUdtTransfer(Func<CancellationToken, Task> transferAction)
@@ -698,6 +722,7 @@ namespace TrFileTransfer
             await UdtConnect(ct);
             using (var ws = new UdtWireStream(_socket, false))
             {
+                await ClientWire.SendAuthFrameAsync(ws, PairingCode, _cb, ct).ConfigureAwait(false);
                 await ClientWire.SendSingleFileAsync(ws, _filePath, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
         }
@@ -707,6 +732,7 @@ namespace TrFileTransfer
             await UdtConnect(ct);
             using (var ws = new UdtWireStream(_socket, false))
             {
+                await ClientWire.SendAuthFrameAsync(ws, PairingCode, _cb, ct).ConfigureAwait(false);
                 await ClientWire.SendFolderAsync(ws, folderPath, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
         }
@@ -716,6 +742,7 @@ namespace TrFileTransfer
             await UdtConnect(ct);
             using (var ws = new UdtWireStream(_socket, false))
             {
+                await ClientWire.SendAuthFrameAsync(ws, PairingCode, _cb, ct).ConfigureAwait(false);
                 await ClientWire.SendChunkAsync(ws, _filePath, offset, chunkSize, totalSize,
                     _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
@@ -726,6 +753,7 @@ namespace TrFileTransfer
             await UdtConnect(ct);
             using (var ws = new UdtWireStream(_socket, false))
             {
+                await ClientWire.SendAuthFrameAsync(ws, PairingCode, _cb, ct).ConfigureAwait(false);
                 await ClientWire.SendFolderResumableAsync(ws, _filePath, sessionId,
                     _serverIp, _port, true, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
@@ -736,8 +764,19 @@ namespace TrFileTransfer
             await UdtConnect(ct);
             using (var ws = new UdtWireStream(_socket, false))
             {
+                await ClientWire.SendAuthFrameAsync(ws, PairingCode, _cb, ct).ConfigureAwait(false);
                 await ClientWire.SendResumableAsync(ws, _filePath, sessionId, verifyHash,
                     _serverIp, _port, true, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
+            }
+        }
+
+        private async Task SendTextInternal(string text, CancellationToken ct)
+        {
+            await UdtConnect(ct);
+            using (var ws = new UdtWireStream(_socket, false))
+            {
+                await ClientWire.SendAuthFrameAsync(ws, PairingCode, _cb, ct).ConfigureAwait(false);
+                await ClientWire.SendTextAsync(ws, text, _cb, ct).ConfigureAwait(false);
             }
         }
 

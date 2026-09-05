@@ -102,6 +102,7 @@ namespace TrFileTransfer.Tests
             RunServerResumeStore(runner);
             RunFolderResumeStore(runner);
             RunUpdater(runner);
+            RunWire(runner);
         }
 
         private static void RunFormatSize(TestRunner runner)
@@ -562,6 +563,51 @@ namespace TrFileTransfer.Tests
             {
                 try { Directory.Delete(applyDir, true); } catch { }
             }
+        }
+
+        private static void RunWire(TestRunner runner)
+        {
+            runner.Run("WireAuth_HashCode_KnownVector", () =>
+            {
+                // SHA256("123456")
+                string hex = BitConverter.ToString(WireAuth.HashCode("123456")).Replace("-", "").ToLowerInvariant();
+                Assert.Equal("8d969eef6ecad3c29a3a629280e686cf0c3f5d5a86aff3ca12020c923adc6c92", hex, "sha256 of 123456");
+            });
+
+            runner.Run("WireAuth_HashCode_Deterministic", () =>
+            {
+                var a = WireAuth.HashCode("246810");
+                var b = WireAuth.HashCode("246810");
+                Assert.True(Utils.ConstantTimeEquals(a, b), "same code same hash");
+                Assert.False(Utils.ConstantTimeEquals(a, WireAuth.HashCode("246811")), "different code different hash");
+                Assert.True(Utils.ConstantTimeEquals(WireAuth.HashCode(null), WireAuth.HashCode("")), "null == empty");
+            });
+
+            runner.Run("WireAuth_GeneratePairingCode", () =>
+            {
+                for (int i = 0; i < 50; i++)
+                {
+                    string code = WireAuth.GeneratePairingCode();
+                    Assert.Equal(6, code.Length, "6 digits");
+                    for (int j = 0; j < code.Length; j++)
+                        Assert.True(code[j] >= '0' && code[j] <= '9', "digit char");
+                }
+            });
+
+            runner.Run("ServerWire_Preview", () =>
+            {
+                Assert.Equal("", ServerWire.Preview(""), "empty");
+                Assert.Equal("a / b", ServerWire.Preview("a\nb"), "newline single-line");
+                Assert.Equal("a / b", ServerWire.Preview("a\r\nb"), "crlf single-line");
+                string longText = new string('x', 300);
+                string p = ServerWire.Preview(longText);
+                Assert.True(p.Length < 300 && p.EndsWith("…"), "long text truncated");
+            });
+
+            runner.Run("ServerWire_MaxTextBytes", () =>
+            {
+                Assert.Equal(1048576, ServerWire.MaxTextBytes, "1 MB cap");
+            });
         }
 
         private static void RunL10N(TestRunner runner)

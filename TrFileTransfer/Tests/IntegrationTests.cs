@@ -82,6 +82,14 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_Update_GitHub_FullFlow", UpdateGitHubFullFlow);
             runner.Run("Integration_Update_GitHub_BadSidecar", UpdateGitHubBadSidecar);
             runner.Run("Integration_Update_GitHub_MissingSidecar", UpdateGitHubMissingSidecar);
+            runner.Run("Integration_Text_TCP", TcpTextMessage);
+            runner.Run("Integration_Text_TCP_Large", TcpTextLarge);
+            runner.Run("Integration_Auth_TCP_CorrectCode", TcpAuthCorrectCode);
+            runner.Run("Integration_Auth_TCP_WrongCode", TcpAuthWrongCode);
+            runner.Run("Integration_Auth_TCP_NoCode", TcpAuthNoCode);
+            runner.Run("Integration_Auth_TCP_Lenient", TcpAuthLenient);
+            runner.Run("Integration_Text_UDT", UdtTextMessage, 1);
+            runner.Run("Integration_Auth_UDT", UdtAuthCorrectCode, 1);
         }
 
         private static void TcpSingleFile()
@@ -2525,6 +2533,270 @@ namespace TrFileTransfer.Tests
                     "missing sidecar -> WebException, got: " + (inner == null ? "none" : inner.GetType().Name));
             }
             finally { server.Dispose(); }
+        }
+
+        // ---- Pairing auth (0x05) and text messages (0x06) ----
+
+        /// <summary>Common scaffold: starts a TCP server on a free port and returns its pieces.</summary>
+        private sealed class TcpServerFixture : IDisposable
+        {
+            public TransferServer Server;
+            public int Port;
+            public string SendDir;
+            public string RecvDir;
+            public readonly ManualResetEvent Started = new ManualResetEvent(false);
+
+            public TcpServerFixture()
+            {
+                Port = FindFreePort();
+                SendDir = Path.Combine(TempBase(), "tr_auth_send_" + Guid.NewGuid().ToString("N"));
+                RecvDir = Path.Combine(TempBase(), "tr_auth_recv_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(SendDir);
+                Directory.CreateDirectory(RecvDir);
+                Server = new TransferServer("127.0.0.1", Port, RecvDir);
+                Server.OnStarted += () => Started.Set();
+            }
+
+            public void Start()
+            {
+                Server.Start();
+                if (!Started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+            }
+
+            public void Dispose()
+            {
+                try { Server.Stop(); } catch { }
+                try { Directory.Delete(SendDir, true); } catch { }
+                try { Directory.Delete(RecvDir, true); } catch { }
+            }
+        }
+
+        private static byte[] MakeTestFile(string path, int size)
+        {
+            var content = new byte[size];
+            new Random(size).NextBytes(content);
+            File.WriteAllBytes(path, content);
+            return content;
+        }
+
+        private static void TcpTextMessage()
+        {
+            using (var fx = new TcpServerFixture())
+            {
+                string text = "你好，TrFileTransfer!\nLine2\tTab END";
+                string received = null;
+                var gotText = new ManualResetEvent(false);
+                fx.Server.OnTextReceived += t => { received = t; gotText.Set(); };
+                fx.Start();
+
+                var client = new TransferClient("127.0.0.1", fx.Port, "", 0, 4194304, 0);
+                client.SendTextAsync(text).Wait(30000);
+
+                if (!gotText.WaitOne(5000))
+                    throw new Exception("Text message was not received");
+                Assert.Equal(text, received, "text content matches");
+            }
+        }
+
+        private static void TcpTextLarge()
+        {
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < 20000; i++)
+                sb.Append("文本内容ABC123你好世界"); // 36 UTF-8 bytes per unit → ~720 KB
+            string text = sb.ToString();
+
+            using (var fx = new TcpServerFixture())
+            {
+                string received = null;
+                var gotText = new ManualResetEvent(false);
+                fx.Server.OnTextReceived += t => { received = t; gotText.Set(); };
+                fx.Start();
+
+                var client = new TransferClient("127.0.0.1", fx.Port, "", 0, 4194304, 0);
+                client.SendTextAsync(text).Wait(30000);
+
+                if (!gotText.WaitOne(10000))
+                    throw new Exception("Large text was not received");
+                Assert.Equal(text.Length, received.Length, "large text length matches");
+                Assert.Equal(text, received, "large text content matches");
+            }
+        }
+
+        private static void TcpAuthCorrectCode()
+        {
+            using (var fx = new TcpServerFixture())
+            {
+                fx.Server.PairingCode = "135790";
+                var testFile = Path.Combine(fx.SendDir, "auth_ok.bin");
+                byte[] content = MakeTestFile(testFile, 64 * 1024);
+
+                var serverDone = new ManualResetEvent(false);
+                bool serverOk = false;
+                fx.Server.OnTransferComplete += () => { serverOk = true; serverDone.Set(); };
+                fx.Server.OnError += _ => serverDone.Set();
+                fx.Start();
+
+                var client = new TransferClient("127.0.0.1", fx.Port, testFile);
+                client.PairingCode = "135790";
+                client.SendAsync().Wait(30000);
+
+                if (!serverDone.WaitOne(30000))
+                    throw new Exception("Server did not complete within 30s");
+                if (!serverOk)
+                    throw new Exception("Server rejected a correct pairing code");
+
+                Thread.Sleep(300);
+                var received = File.ReadAllBytes(Path.Combine(fx.RecvDir, "auth_ok.bin"));
+                Assert.True(Utils.ConstantTimeEquals(content, received), "file content matches");
+            }
+        }
+
+        private static void TcpAuthWrongCode()
+        {
+            using (var fx = new TcpServerFixture())
+            {
+                fx.Server.PairingCode = "135790";
+                var testFile = Path.Combine(fx.SendDir, "auth_bad.bin");
+                MakeTestFile(testFile, 8192);
+                fx.Start();
+
+                var client = new TransferClient("127.0.0.1", fx.Port, testFile);
+                client.PairingCode = "000000";
+                bool threw = false;
+                try { client.SendAsync().Wait(30000); }
+                catch { threw = true; }
+                Assert.True(threw, "wrong pairing code -> transfer fails");
+
+                Thread.Sleep(300);
+                Assert.False(File.Exists(Path.Combine(fx.RecvDir, "auth_bad.bin")), "no file saved on rejected code");
+            }
+        }
+
+        private static void TcpAuthNoCode()
+        {
+            using (var fx = new TcpServerFixture())
+            {
+                fx.Server.PairingCode = "135790";
+                var testFile = Path.Combine(fx.SendDir, "auth_none.bin");
+                MakeTestFile(testFile, 8192);
+                fx.Start();
+
+                // Old-style client that never authenticates
+                var client = new TransferClient("127.0.0.1", fx.Port, testFile);
+                bool threw = false;
+                try { client.SendAsync().Wait(30000); }
+                catch { threw = true; }
+                Assert.True(threw, "unauthenticated client -> transfer fails");
+
+                Thread.Sleep(300);
+                Assert.False(File.Exists(Path.Combine(fx.RecvDir, "auth_none.bin")), "no file saved for unauthenticated client");
+            }
+        }
+
+        private static void TcpAuthLenient()
+        {
+            using (var fx = new TcpServerFixture())
+            {
+                // Server without pairing accepts a client that still sends its code
+                var testFile = Path.Combine(fx.SendDir, "auth_lenient.bin");
+                byte[] content = MakeTestFile(testFile, 16 * 1024);
+
+                var serverDone = new ManualResetEvent(false);
+                bool serverOk = false;
+                fx.Server.OnTransferComplete += () => { serverOk = true; serverDone.Set(); };
+                fx.Server.OnError += _ => serverDone.Set();
+                fx.Start();
+
+                var client = new TransferClient("127.0.0.1", fx.Port, testFile);
+                client.PairingCode = "246888";
+                client.SendAsync().Wait(30000);
+
+                if (!serverDone.WaitOne(30000))
+                    throw new Exception("Server did not complete within 30s");
+                if (!serverOk)
+                    throw new Exception("Server rejected a client against an open server");
+
+                Thread.Sleep(300);
+                var received = File.ReadAllBytes(Path.Combine(fx.RecvDir, "auth_lenient.bin"));
+                Assert.True(Utils.ConstantTimeEquals(content, received), "file content matches");
+            }
+        }
+
+        private static void UdtTextMessage()
+        {
+            int port = FindFreePort();
+            string recvDir = Path.Combine(TempBase(), "tr_udt_text_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(recvDir);
+            TransferUdtServer server = null;
+            try
+            {
+                string text = "UDT 文本消息\nsecond line 中文";
+                string received = null;
+                var gotText = new ManualResetEvent(false);
+                var started = new ManualResetEvent(false);
+
+                server = new TransferUdtServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => started.Set();
+                server.OnTextReceived += t => { received = t; gotText.Set(); };
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("UDT server did not start within 5s");
+
+                var client = new TransferUdtClient("127.0.0.1", port, "", 0, 4194304, 0);
+                client.SendTextAsync(text).Wait(60000);
+
+                if (!gotText.WaitOne(10000))
+                    throw new Exception("UDT text was not received");
+                Assert.Equal(text, received, "UDT text content matches");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        private static void UdtAuthCorrectCode()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_udt_auth_send_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_udt_auth_recv_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdtServer server = null;
+            try
+            {
+                var testFile = Path.Combine(sendDir, "udt_auth.bin");
+                byte[] content = MakeTestFile(testFile, 32 * 1024);
+
+                var started = new ManualResetEvent(false);
+                var done = new ManualResetEvent(false);
+                server = new TransferUdtServer("127.0.0.1", port, recvDir);
+                server.PairingCode = "654321";
+                server.OnStarted += () => started.Set();
+                server.OnFileReceived += (p, s) => done.Set();
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("UDT server did not start within 5s");
+
+                var client = new TransferUdtClient("127.0.0.1", port, testFile, 0, 4194304, 0);
+                client.PairingCode = "654321";
+                client.SendAsync().Wait(60000);
+
+                if (!done.WaitOne(60000))
+                    throw new Exception("UDT file with pairing was not received");
+
+                Thread.Sleep(300);
+                var received = File.ReadAllBytes(Path.Combine(recvDir, "udt_auth.bin"));
+                Assert.True(Utils.ConstantTimeEquals(content, received), "UDT file content matches");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
         }
     }
 }

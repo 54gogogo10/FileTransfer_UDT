@@ -467,5 +467,47 @@ namespace TrFileTransfer
         public static string UpdNoUrl { get { return IsChinese ? "请先填写更新源 URL。" : "Enter the manifest URL first."; } }
         public static string UpdChecking { get { return IsChinese ? "正在检查更新..." : "Checking for updates..."; } }
 
+        // ---- Pairing (0x05 auth) ----
+        public static string PairingLabel { get { return IsChinese ? "配对码" : "Pairing"; } }
+        public static string PairingClientLabel { get { return IsChinese ? "配对码:" : "Pairing:"; } }
+        public static string S_AuthOk { get { return IsChinese ? "配对码验证通过。" : "Pairing code verified."; } }
+        public static string S_AuthFailed { get { return IsChinese ? "配对码验证失败，已拒绝连接。" : "Pairing code verification FAILED — connection rejected."; } }
+        public static string S_AuthRequired { get { return IsChinese ? "服务器已启用配对码，客户端未认证，连接被拒绝。" : "Server requires a pairing code; unauthenticated client rejected."; } }
+        public static string C_Authing { get { return IsChinese ? "正在验证配对码..." : "Verifying pairing code..."; } }
+        public static string C_AuthFailed { get { return IsChinese ? "配对码错误，服务器拒绝连接。" : "Pairing code rejected by the server."; } }
+
+        // ---- Text messages (0x06) ----
+        public static string SendTextBtn { get { return IsChinese ? "发文本" : "Text"; } }
+        public static string SendTextTitle { get { return IsChinese ? "发送文本" : "Send Text"; } }
+        public static string SendTextSend { get { return IsChinese ? "发送" : "Send"; } }
+        public static string SendTextEmpty { get { return IsChinese ? "请输入要发送的文本。" : "Enter some text to send."; } }
+        public static string SendTextTooLarge { get { return IsChinese ? "文本过长（上限 1 MB）。" : "Text too long (max 1 MB)."; } }
+        public static string SendTextDone { get { return IsChinese ? "文本已发送。" : "Text sent."; } }
+        public static string S_TextReceived(object preview)
+        {
+            return IsChinese
+                ? string.Format("收到文本: {0}", preview)
+                : string.Format("Text received: {0}", preview);
+        }
+        public static string S_TextRejected { get { return IsChinese ? "文本消息无效（过大或长度不符）。" : "Invalid text message (too large or length mismatch)."; } }
+        public static string TextReceivedTitle { get { return IsChinese ? "收到文本" : "Text Received"; } }
+        public static string CopyBtn { get { return IsChinese ? "复制" : "Copy"; } }
+        public static string Copied { get { return IsChinese ? "已复制到剪贴板。" : "Copied to clipboard."; } }
+        public static string NotifyTextTitle { get { return IsChinese ? "收到文本消息" : "Text message received"; } }
+        public static string C_SendingText(object preview, string sizeStr)
+        {
+            return IsChinese
+                ? string.Format("正在发送文本: {0} ({1})", preview, sizeStr)
+                : string.Format("Sending text: {0} ({1})", preview, sizeStr);
+        }
+
+        // ---- Crash handling ----
+        public static string CrashPrompt(string msg)
+        {
+            return IsChinese
+                ? string.Format("发生未处理的错误，程序可能不稳定：\n{0}\n\n详细信息已写入日志目录的 crash.log。", msg)
+                : string.Format("An unhandled error occurred. The program may be unstable:\n{0}\n\nDetails were written to crash.log in the log folder.", msg);
+        }
+
     }
 }

@@ -30,6 +30,8 @@ namespace TrFileTransfer
         public event Action OnTransferComplete;
         /// <summary>Fired when a file has been fully received and saved (path, size).</summary>
         public event Action<string, long> OnFileReceived;
+        /// <summary>Fired when a 0x06 text message has been received.</summary>
+        public event Action<string> OnTextReceived;
         /// <summary>Fired when the server starts listening.</summary>
         public event Action OnStarted;
         /// <summary>Fired when the server stops.</summary>
@@ -76,6 +78,18 @@ namespace TrFileTransfer
             {
                 var h = OnFileReceived; if (h != null) h(path, size);
             };
+            _wire.Cb.TextReceived = delegate(string text)
+            {
+                var h = OnTextReceived; if (h != null) h(text);
+            };
+        }
+
+        /// <summary>When non-empty, clients must present this pairing code (0x05) before
+        /// any transfer is accepted. Set before Start().</summary>
+        public string PairingCode
+        {
+            get { return _wire.PairingCode; }
+            set { _wire.PairingCode = value; }
         }
 
         /// <summary>Starts listening for incoming connections. Fires OnStarted on success.</summary>

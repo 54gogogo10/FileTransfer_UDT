@@ -155,14 +155,18 @@ namespace TrFileTransfer
         {
             public const int ClientBufferSize = 4194304;
 
-            public static TransferClient CreateTcp(string serverIp, int port, string filePath, int srcPort, int speedLimit)
+            public static TransferClient CreateTcp(string serverIp, int port, string filePath, int srcPort, int speedLimit, string pairingCode = null)
             {
-                return new TransferClient(serverIp, port, filePath, srcPort, ClientBufferSize, speedLimit);
+                var client = new TransferClient(serverIp, port, filePath, srcPort, ClientBufferSize, speedLimit);
+                client.PairingCode = pairingCode;
+                return client;
             }
 
-            public static TransferUdtClient CreateUdt(string serverIp, int port, string filePath, int srcPort, int speedLimit)
+            public static TransferUdtClient CreateUdt(string serverIp, int port, string filePath, int srcPort, int speedLimit, string pairingCode = null)
             {
-                return new TransferUdtClient(serverIp, port, filePath, srcPort, ClientBufferSize, speedLimit);
+                var client = new TransferUdtClient(serverIp, port, filePath, srcPort, ClientBufferSize, speedLimit);
+                client.PairingCode = pairingCode;
+                return client;
             }
         }
 

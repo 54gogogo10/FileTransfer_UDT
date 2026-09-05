@@ -38,6 +38,8 @@ namespace TrFileTransfer
         private Button _btnBrowseDir;
         private Button _btnStartServer;
         private Button _btnStopServer;
+        private CheckBox _chkPairing;
+        private Label _lblPairingCode;
 
         // Client controls
         private GroupBox _gbClient;
@@ -62,6 +64,10 @@ namespace TrFileTransfer
         private NumericUpDown _numSpeed;
         private Button _btnQueue;
         private Button _btnScan;
+        private Button _btnSendText;
+        private Label _lblPairingC;
+        private TextBox _txtPairing;
+        private TextReceivedDialog _textRecvDialog;
         private int _monitorSpeedBytesPerSec;
         private DiscoveryServer _discoveryServer;
         private NotifyIcon _notifyIcon;
@@ -226,11 +232,23 @@ namespace TrFileTransfer
             _btnRecent = new Button { Width = 96, Height = 28, Margin = new Padding(0, 3, 0, 3) };
             UiStyle.Secondary(_btnRecent);
             _btnRecent.Click += BtnRecent_Click;
+            _chkPairing = new CheckBox { AutoSize = true, Margin = new Padding(16, 8, 3, 3) };
+            _chkPairing.CheckedChanged += ChkPairing_CheckedChanged;
+            _lblPairingCode = new Label
+            {
+                AutoSize = true,
+                Margin = new Padding(6, 10, 3, 3),
+                Font = new Font("Consolas", 10f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(0, 120, 215),
+                Visible = false
+            };
             var serverButtons = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, BackColor = Color.White, Margin = new Padding(0) };
             serverButtons.Controls.Add(_btnStartServer);
             serverButtons.Controls.Add(_btnStopServer);
             serverButtons.Controls.Add(_btnOpenDir);
             serverButtons.Controls.Add(_btnRecent);
+            serverButtons.Controls.Add(_chkPairing);
+            serverButtons.Controls.Add(_lblPairingCode);
             tlpS.Controls.Add(_lblBind, 0, 0);
             tlpS.Controls.Add(_cmbBind, 1, 0);
             tlpS.Controls.Add(_lblPortS, 2, 0);
@@ -318,10 +336,18 @@ namespace TrFileTransfer
             _btnResumeList = new Button { Width = 72, Height = 26, Margin = new Padding(2, 3, 0, 3) };
             UiStyle.Secondary(_btnResumeList);
             _btnResumeList.Click += BtnResumeList_Click;
+            _btnSendText = new Button { Width = 72, Height = 26, Margin = new Padding(14, 3, 8, 3) };
+            UiStyle.Secondary(_btnSendText);
+            _btnSendText.Click += BtnSendText_Click;
+            _lblPairingC = new Label { AutoSize = true, Margin = new Padding(10, 10, 4, 3), ForeColor = Color.FromArgb(68, 68, 68) };
+            _txtPairing = new TextBox { Width = 58, MaxLength = 12, Margin = new Padding(0, 6, 0, 3) };
             var actionRow = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, BackColor = Color.White, Margin = new Padding(0) };
             actionRow.Controls.Add(_btnScan);
             actionRow.Controls.Add(_btnQueue);
             actionRow.Controls.Add(_btnResumeList);
+            actionRow.Controls.Add(_btnSendText);
+            actionRow.Controls.Add(_lblPairingC);
+            actionRow.Controls.Add(_txtPairing);
 
             // Tray icon for completion notifications (Win7-compatible balloon tips)
             _notifyIcon = new NotifyIcon
@@ -496,6 +522,9 @@ namespace TrFileTransfer
             _gbLog.Text = L.LogGroup;
             _btnExportLog.Text = L.ExportLog;
             _btnCheckUpdate.Text = L.UpdBtn;
+            _chkPairing.Text = L.PairingLabel;
+            _btnSendText.Text = L.SendTextBtn;
+            _lblPairingC.Text = L.PairingClientLabel;
 
             PopulateBindAddresses();
         }
@@ -532,6 +561,7 @@ namespace TrFileTransfer
             _chkMonitor.Checked = Config.GetBool("MonitorMode", false);
             _numConcurrency.Value = Math.Max(1, Math.Min(8, Config.GetInt("Concurrency", 4)));
             _numSrcPort.Value = Math.Max(0, Math.Min(65535, Config.GetInt("SrcPort", 0)));
+            _txtPairing.Text = Config.Get("PairingCode", "");
         }
 
         private void SaveConfig()
@@ -551,6 +581,7 @@ namespace TrFileTransfer
             Config.SetBool("VerifyHash", _chkVerifyHash.Checked);
             Config.SetInt("Concurrency", (int)_numConcurrency.Value);
             Config.SetInt("SrcPort", (int)_numSrcPort.Value);
+            Config.Set("PairingCode", _txtPairing.Text.Trim());
             Config.Save();
         }
 
@@ -699,6 +730,14 @@ namespace TrFileTransfer
             _btnSend.Text = isMonitor ? L.StartMonitor : (_chkFolder.Checked ? L.SendFolder : L.SendFile);
             _chkFolder.Enabled = !isMonitor;
             _txtFile.Text = "";
+        }
+
+        private void ChkPairing_CheckedChanged(object sender, EventArgs e)
+        {
+            // Show a fresh code immediately; Start regenerates one per server session
+            if (_chkPairing.Checked)
+                _lblPairingCode.Text = WireAuth.GeneratePairingCode();
+            _lblPairingCode.Visible = _chkPairing.Checked;
         }
 
         private void MainForm_DragEnter(object sender, DragEventArgs e)
@@ -1041,6 +1080,87 @@ namespace TrFileTransfer
             return Path.Combine(saveDir, DateTime.Now.ToString("yyyy-MM-dd"));
         }
 
+        // ---- Text messages (0x06) ----
+
+        /// <summary>Shows a received text message: log, balloon tip, and a non-modal viewer.</summary>
+        private void OnTextReceived(string text)
+        {
+            string preview = ServerWire.Preview(text);
+            AddLog(L.S_TextReceived(preview));
+            Notify(L.NotifyTextTitle, preview);
+            if (_textRecvDialog == null || _textRecvDialog.IsDisposed)
+                _textRecvDialog = new TextReceivedDialog(text);
+            else
+                _textRecvDialog.AppendMessage(text);
+            _textRecvDialog.Show(this);
+            _textRecvDialog.Activate();
+        }
+
+        private async void BtnSendText_Click(object sender, EventArgs e)
+        {
+            string text;
+            using (var dlg = new TextSendDialog())
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                text = dlg.MessageText;
+            }
+            if (string.IsNullOrEmpty(text)) return;
+
+            string ip = _txtServerIp.Text.Trim();
+            int port;
+            if (ip.Length == 0 || !int.TryParse(_txtPortC.Text.Trim(), out port) || port < 1 || port > 65535)
+            {
+                MessageBox.Show(this, L.InvalidPort, L.DlgError, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            bool isUdt = _rbClientUdt.Checked;
+            _btnSendText.Enabled = false;
+            try
+            {
+                bool ok = await SendTextMessageAsync(text, ip, port, isUdt).ConfigureAwait(true);
+                if (ok)
+                {
+                    AddLog(L.SendTextDone);
+                    RememberDevice(ip, port, isUdt);
+                }
+            }
+            finally
+            {
+                _btnSendText.Enabled = true;
+            }
+        }
+
+        /// <summary>One-shot text transfer; returns false when the send failed
+        /// (the error is already logged via the client's OnLog/OnError events).</summary>
+        private async Task<bool> SendTextMessageAsync(string text, string ip, int port, bool isUdt)
+        {
+            var done = new TaskCompletionSource<bool>();
+            Exception error = null;
+            string pairing = _txtPairing.Text.Trim();
+
+            if (isUdt)
+            {
+                var client = new TransferUdtClient(ip, port, "", 0, 4194304, 0);
+                client.PairingCode = pairing;
+                client.OnLog += msg => this.Invoke((Action)(() => AddLog(msg)));
+                client.OnError += msg => { error = new Exception(msg); };
+                client.OnStopped += () => done.TrySetResult(error == null);
+                await client.SendTextAsync(text).ConfigureAwait(true);
+            }
+            else
+            {
+                var client = new TransferClient(ip, port, "", 0, 4194304, 0);
+                client.PairingCode = pairing;
+                client.OnLog += msg => this.Invoke((Action)(() => AddLog(msg)));
+                client.OnError += msg => { error = new Exception(msg); };
+                client.OnStopped += () => done.TrySetResult(error == null);
+                try { await client.SendTextAsync(text).ConfigureAwait(true); }
+                catch { /* RunTransfer rethrows after raising OnError; OnStopped settles the task */ }
+            }
+            return await done.Task.ConfigureAwait(true);
+        }
+
         private void BtnStartServer_Click(object sender, EventArgs e)
         {
             int port;
@@ -1069,13 +1189,23 @@ namespace TrFileTransfer
             DisableServerInputs();
             _serverCount = 0;
 
+            // A fresh pairing code per server session keeps old codes from lingering
+            string pairingCode = null;
+            if (_chkPairing.Checked)
+            {
+                pairingCode = WireAuth.GeneratePairingCode();
+                _lblPairingCode.Text = pairingCode;
+            }
+
             if (_chkServerTcp.Checked)
             {
                 bool tcpStarted = false;
                 var tcpServer = new TransferServer(bindAddr, port, GetArchiveDir(saveDir));
+                tcpServer.PairingCode = pairingCode;
                 tcpServer.OnLog += msg => this.Invoke((Action)(() => AddLog(msg)));
                 tcpServer.OnError += msg => this.Invoke((Action)(() => _lblStatusS.Text = L.ErrorPrefix + msg));
                 tcpServer.OnFileReceived += (path, size) => this.Invoke((Action)(() => OnFileReceived(path, size)));
+                tcpServer.OnTextReceived += t => this.Invoke((Action)(() => OnTextReceived(t)));
                 tcpServer.OnClientConnected += ep => this.Invoke((Action)(() => { }));
                 tcpServer.OnClientProgress += (ep, p) => this.Invoke((Action)(() =>
                 {
@@ -1115,9 +1245,11 @@ namespace TrFileTransfer
             {
                 bool udtStarted = false;
                 var udtServer = new TransferUdtServer(bindAddr, port, GetArchiveDir(saveDir));
+                udtServer.PairingCode = pairingCode;
                 udtServer.OnLog += msg => this.Invoke((Action)(() => AddLog(msg)));
                 udtServer.OnError += msg => this.Invoke((Action)(() => _lblStatusS.Text = L.ErrorPrefix + msg));
                 udtServer.OnFileReceived += (path, size) => this.Invoke((Action)(() => OnFileReceived(path, size)));
+                udtServer.OnTextReceived += t => this.Invoke((Action)(() => OnTextReceived(t)));
                 udtServer.OnClientConnected += ep => this.Invoke((Action)(() => { }));
                 udtServer.OnClientProgress += (ep, p) => this.Invoke((Action)(() =>
                 {
@@ -1173,6 +1305,7 @@ namespace TrFileTransfer
         {
             _chkServerTcp.Enabled = false;
             _chkServerUdt.Enabled = false;
+            _chkPairing.Enabled = false;
             _cmbLang.Enabled = false;
             _cmbBind.Enabled = false;
             _txtPortS.Enabled = false;
@@ -1186,6 +1319,7 @@ namespace TrFileTransfer
             _btnStopServer.Enabled = false;
             _chkServerTcp.Enabled = true;
             _chkServerUdt.Enabled = true;
+            _chkPairing.Enabled = true;
             _cmbLang.Enabled = true;
             _cmbBind.Enabled = true;
             _txtPortS.Enabled = true;
@@ -1213,6 +1347,8 @@ namespace TrFileTransfer
             _numSpeed.Enabled = false;
             _btnQueue.Enabled = false;
             _btnScan.Enabled = false;
+            _btnSendText.Enabled = false;
+            _txtPairing.Enabled = false;
         }
 
         private void OnServerStarted()
@@ -1332,6 +1468,7 @@ namespace TrFileTransfer
                 {
                     // Multi-concurrent transfer
                     var concurrent = new ConcurrentTransfer(ip, port, path, concurrency, isTcp, srcPort, speedLimit);
+                    concurrent.PairingCode = _txtPairing.Text.Trim();
                     WireConcurrentEvents(concurrent);
                     if (isFolder)
                         await concurrent.SendFolderAsync();
@@ -1340,7 +1477,7 @@ namespace TrFileTransfer
                 }
                 else if (isTcp)
                 {
-                    _client = ClientFactory.CreateTcp(ip, port, path, srcPort, speedLimit);
+                    _client = ClientFactory.CreateTcp(ip, port, path, srcPort, speedLimit, _txtPairing.Text.Trim());
                     WireClientEvents(_client);
                     if (isFolder && resumeSession.HasValue)
                     {
@@ -1359,7 +1496,7 @@ namespace TrFileTransfer
                 }
                 else
                 {
-                    _clientUdt = ClientFactory.CreateUdt(ip, port, path, srcPort, speedLimit);
+                    _clientUdt = ClientFactory.CreateUdt(ip, port, path, srcPort, speedLimit, _txtPairing.Text.Trim());
                     WireUdtClientEvents(_clientUdt);
                     if (isFolder && resumeSession.HasValue)
                     {
@@ -1488,6 +1625,8 @@ namespace TrFileTransfer
             _numSpeed.Enabled = true;
             _btnQueue.Enabled = true;
             _btnScan.Enabled = true;
+            _btnSendText.Enabled = true;
+            _txtPairing.Enabled = true;
         }
 
         private static string FormatEta(TransferProgress p)
@@ -1759,7 +1898,7 @@ namespace TrFileTransfer
                 var card = (Panel)this.Invoke((Func<Panel>)(() => CreateTransferCard(_progressPanelC)));
                 if (_rbClientTcp.Checked)
                 {
-                    var client = ClientFactory.CreateTcp(ip, port, filePath, _monitorSrcPort, _monitorSpeedBytesPerSec);
+                    var client = ClientFactory.CreateTcp(ip, port, filePath, _monitorSrcPort, _monitorSpeedBytesPerSec, _txtPairing.Text.Trim());
                     client.OnLog += msg => this.Invoke((Action)(() => AddLog(msg)));
                     client.OnProgress += p => this.Invoke((Action)(() => UpdateCardProgress(card, p)));
                     client.OnError += msg => this.Invoke((Action)(() => AddLog(L.MonitorFileSendFailed(fileName, msg))));
@@ -1769,7 +1908,7 @@ namespace TrFileTransfer
                 }
                 else
                 {
-                    var clientUdt = ClientFactory.CreateUdt(ip, port, filePath, _monitorSrcPort, _monitorSpeedBytesPerSec);
+                    var clientUdt = ClientFactory.CreateUdt(ip, port, filePath, _monitorSrcPort, _monitorSpeedBytesPerSec, _txtPairing.Text.Trim());
                     clientUdt.OnLog += msg => this.Invoke((Action)(() => AddLog(msg)));
                     clientUdt.OnProgress += p => this.Invoke((Action)(() => UpdateCardProgress(card, p)));
                     clientUdt.OnError += msg => this.Invoke((Action)(() => AddLog(L.MonitorFileSendFailed(fileName, msg))));
@@ -2749,6 +2888,138 @@ namespace TrFileTransfer
         {
             Config.Save();
             base.OnFormClosing(e);
+        }
+    }
+
+    /// <summary>Modal input dialog for sending a text message (0x06) to the server.</summary>
+    public class TextSendDialog : Form
+    {
+        private readonly TextBox _txt;
+
+        public string MessageText { get { return _txt.Text; } }
+
+        public TextSendDialog()
+        {
+            Text = L.SendTextTitle;
+            ClientSize = new Size(460, 240);
+            MinimumSize = new Size(380, 200);
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MinimizeBox = false;
+            MaximizeBox = false;
+            Font = new Font("Segoe UI", 9f);
+            BackColor = Color.White;
+
+            var tlp = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(10) };
+            tlp.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+
+            _txt = new TextBox { Dock = DockStyle.Fill, Multiline = true, ScrollBars = ScrollBars.Both };
+            tlp.Controls.Add(_txt, 0, 0);
+
+            var buttons = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.RightToLeft,
+                WrapContents = false,
+                Margin = new Padding(0),
+                Padding = new Padding(0, 6, 0, 0)
+            };
+            var btnCancel = new Button { Text = L.CancelBtn, Width = 100 };
+            UiStyle.Secondary(btnCancel);
+            btnCancel.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
+            buttons.Controls.Add(btnCancel);
+
+            var btnSend = new Button { Text = L.SendTextSend, Width = 100 };
+            UiStyle.Primary(btnSend);
+            btnSend.Click += BtnSend_Click;
+            buttons.Controls.Add(btnSend);
+
+            tlp.Controls.Add(buttons, 0, 1);
+            Controls.Add(tlp);
+            AcceptButton = btnSend;
+        }
+
+        private void BtnSend_Click(object sender, EventArgs e)
+        {
+            if (_txt.Text.Length == 0)
+            {
+                MessageBox.Show(this, L.SendTextEmpty, L.SendTextTitle,
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            DialogResult = DialogResult.OK;
+            Close();
+        }
+    }
+
+    /// <summary>Non-modal viewer for received text messages; accumulates messages while open.</summary>
+    public class TextReceivedDialog : Form
+    {
+        private readonly TextBox _txt;
+
+        public TextReceivedDialog(string firstMessage)
+        {
+            Text = L.TextReceivedTitle;
+            ClientSize = new Size(460, 240);
+            MinimumSize = new Size(380, 200);
+            StartPosition = FormStartPosition.CenterParent;
+            Font = new Font("Segoe UI", 9f);
+            BackColor = Color.White;
+            FormClosing += (s, e) => { Hide(); if (e.CloseReason == CloseReason.UserClosing) e.Cancel = true; };
+
+            var tlp = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(10) };
+            tlp.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+
+            _txt = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Multiline = true,
+                ReadOnly = true,
+                ScrollBars = ScrollBars.Both,
+                BackColor = Color.White
+            };
+            _txt.Text = "[" + DateTime.Now.ToString("HH:mm:ss") + "]\r\n" + firstMessage;
+            tlp.Controls.Add(_txt, 0, 0);
+
+            var buttons = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.RightToLeft,
+                WrapContents = false,
+                Margin = new Padding(0),
+                Padding = new Padding(0, 6, 0, 0)
+            };
+            var btnClose = new Button { Text = L.CancelBtn, Width = 100 };
+            UiStyle.Secondary(btnClose);
+            btnClose.Click += (s, e) => Close();
+            buttons.Controls.Add(btnClose);
+
+            var btnCopy = new Button { Text = L.CopyBtn, Width = 100 };
+            UiStyle.Primary(btnCopy);
+            btnCopy.Click += (s, e) =>
+            {
+                try
+                {
+                    Clipboard.SetText(_txt.Text);
+                    MessageBox.Show(this, L.Copied, L.TextReceivedTitle,
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                catch { }
+            };
+            buttons.Controls.Add(btnCopy);
+
+            tlp.Controls.Add(buttons, 0, 1);
+            Controls.Add(tlp);
+        }
+
+        /// <summary>Appends another received message with a timestamp separator.</summary>
+        public void AppendMessage(string text)
+        {
+            _txt.AppendText("\r\n\r\n[" + DateTime.Now.ToString("HH:mm:ss") + "]\r\n" + text);
         }
     }
 }
