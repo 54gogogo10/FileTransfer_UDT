@@ -95,6 +95,8 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_HTTP_ListAndDownload", HttpShareListAndDownload);
             runner.Run("Integration_HTTP_TokenAndTraversal", HttpShareTokenAndTraversal);
             runner.Run("Integration_FanOut_TwoTargets", FanOutTwoTargets);
+            runner.Run("Integration_HTTP_Upload", HttpShareUpload);
+            runner.Run("Integration_HTTP_UploadTokenAndTraversalName", HttpShareUploadTokenAndTraversalName);
         }
 
         private static void TcpSingleFile()
@@ -3137,6 +3139,176 @@ namespace TrFileTransfer.Tests
                 try { Directory.Delete(sendDir, true); } catch { }
                 try { Directory.Delete(recv1, true); } catch { }
                 try { Directory.Delete(recv2, true); } catch { }
+            }
+        }
+
+        // ---- HTTP share upload (multipart POST) ----
+
+        /// <summary>Builds a multipart/form-data body: fields then files.</summary>
+        private static byte[] BuildMultipart(string boundary,
+            System.Collections.Generic.Dictionary<string, string> fields,
+            System.Collections.Generic.Dictionary<string, byte[]> files)
+        {
+            var ms = new MemoryStream();
+            foreach (var kv in fields)
+            {
+                byte[] part = System.Text.Encoding.UTF8.GetBytes(
+                    "--" + boundary + "\r\n" +
+                    "Content-Disposition: form-data; name=\"" + kv.Key + "\"\r\n\r\n" +
+                    kv.Value + "\r\n");
+                ms.Write(part, 0, part.Length);
+            }
+            foreach (var kv in files)
+            {
+                byte[] head = System.Text.Encoding.UTF8.GetBytes(
+                    "--" + boundary + "\r\n" +
+                    "Content-Disposition: form-data; name=\"file\"; filename=\"" + kv.Key + "\"\r\n" +
+                    "Content-Type: application/octet-stream\r\n\r\n");
+                ms.Write(head, 0, head.Length);
+                ms.Write(kv.Value, 0, kv.Value.Length);
+                byte[] tail = System.Text.Encoding.UTF8.GetBytes("\r\n");
+                ms.Write(tail, 0, tail.Length);
+            }
+            byte[] end = System.Text.Encoding.UTF8.GetBytes("--" + boundary + "--\r\n");
+            ms.Write(end, 0, end.Length);
+            return ms.ToArray();
+        }
+
+        private static System.Tuple<int, byte[], string> HttpPost(string url, string contentType, byte[] body)
+        {
+            var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+            req.Method = "POST";
+            req.Timeout = 30000;
+            req.ReadWriteTimeout = 30000;
+            req.Proxy = null;
+            req.ContentType = contentType;
+            req.ContentLength = body.Length;
+            req.AllowAutoRedirect = false;
+            using (var rs = req.GetRequestStream())
+                rs.Write(body, 0, body.Length);
+            try
+            {
+                using (var resp = (System.Net.HttpWebResponse)req.GetResponse())
+                using (var ms = new MemoryStream())
+                {
+                    resp.GetResponseStream().CopyTo(ms);
+                    return System.Tuple.Create((int)resp.StatusCode, ms.ToArray(), resp.Headers["Location"]);
+                }
+            }
+            catch (System.Net.WebException ex)
+            {
+                var resp = ex.Response as System.Net.HttpWebResponse;
+                if (resp == null) throw;
+                using (resp)
+                using (var ms = new MemoryStream())
+                {
+                    resp.GetResponseStream().CopyTo(ms);
+                    return System.Tuple.Create((int)resp.StatusCode, ms.ToArray(), resp.Headers["Location"]);
+                }
+            }
+        }
+
+        private static void HttpShareUpload()
+        {
+            int port = FindFreePort();
+            string root = Path.Combine(TempBase(), "tr_http_up_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            var server = new HttpShareServer();
+            try
+            {
+                // Payload larger than the 64KB read buffer, with boundary-prefix fragments
+                // inside to stress the streaming pattern scanner across chunk edges
+                var content = new byte[300 * 1024];
+                new Random(77).NextBytes(content);
+                System.Text.Encoding.UTF8.GetBytes("--BOUND\r\n").CopyTo(content, 50000);
+                System.Text.Encoding.UTF8.GetBytes("\r\n--BOUN").CopyTo(content, 150000);
+                var small = System.Text.Encoding.UTF8.GetBytes("second file body");
+                var content2 = new byte[64 * 1024 + 17];
+                new Random(78).NextBytes(content2);
+
+                server.Start(root, port, null);
+                string baseUrl = "http://127.0.0.1:" + port + "/";
+
+                var files = new System.Collections.Generic.Dictionary<string, byte[]>
+                {
+                    { "up 大文件.bin", content },
+                    { "second.bin", content2 },
+                    { "small.txt", small }
+                };
+                var fields = new System.Collections.Generic.Dictionary<string, string>
+                {
+                    { "p", "" }
+                };
+                byte[] body = BuildMultipart("BOUND", fields, files);
+                var resp = HttpPost(baseUrl, "multipart/form-data; boundary=BOUND", body);
+
+                Assert.Equal(303, resp.Item1, "upload responds 303");
+                Assert.True(resp.Item3 != null && resp.Item3.StartsWith("/?p="), "redirect back to listing");
+                Assert.Equal(3, Directory.GetFiles(root).Length, "three files uploaded");
+
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(Path.Combine(root, "up 大文件.bin"))), "multipart file 1 bytes");
+                Assert.True(Utils.ConstantTimeEquals(content2, File.ReadAllBytes(Path.Combine(root, "second.bin"))), "file 2 bytes");
+                Assert.True(Utils.ConstantTimeEquals(small, File.ReadAllBytes(Path.Combine(root, "small.txt"))), "file 3 bytes");
+
+                // Listing now shows the uploaded names
+                var list = HttpGet(baseUrl);
+                Assert.True(System.Text.Encoding.UTF8.GetString(list.Item2).Contains("second.bin"), "listing shows uploaded file");
+
+                // Upload into a subdirectory via the p field
+                Directory.CreateDirectory(Path.Combine(root, "sub"));
+                var fieldsSub = new System.Collections.Generic.Dictionary<string, string> { { "p", "sub" } };
+                var filesSub = new System.Collections.Generic.Dictionary<string, byte[]> { { "inner.txt", small } };
+                var resp2 = HttpPost(baseUrl, "multipart/form-data; boundary=BOUND", BuildMultipart("BOUND", fieldsSub, filesSub));
+                Assert.Equal(303, resp2.Item1, "subdir upload 303");
+                Assert.True(Utils.ConstantTimeEquals(small, File.ReadAllBytes(Path.Combine(root, "sub", "inner.txt"))), "subdir upload bytes");
+            }
+            finally
+            {
+                server.Stop();
+                try { Directory.Delete(root, true); } catch { }
+            }
+        }
+
+        private static void HttpShareUploadTokenAndTraversalName()
+        {
+            int port = FindFreePort();
+            string root = Path.Combine(TempBase(), "tr_http_upt_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            var server = new HttpShareServer();
+            try
+            {
+                byte[] content = System.Text.Encoding.UTF8.GetBytes("guarded upload");
+                server.Start(root, port, "246810");
+                string baseUrl = "http://127.0.0.1:" + port + "/";
+
+                // Without token: POST is refused (token form instead of an upload)
+                var files = new System.Collections.Generic.Dictionary<string, byte[]> { { "a.txt", content } };
+                var noTok = HttpPost(baseUrl, "multipart/form-data; boundary=B",
+                    BuildMultipart("B", new System.Collections.Generic.Dictionary<string, string>(), files));
+                Assert.False(noTok.Item1 == 303, "upload without token must not succeed");
+                Assert.Equal(0, Directory.GetFiles(root).Length, "nothing written without token");
+
+                // With token: upload works
+                var withTok = HttpPost(baseUrl + "?t=246810", "multipart/form-data; boundary=B",
+                    BuildMultipart("B", new System.Collections.Generic.Dictionary<string, string>(), files));
+                Assert.Equal(303, withTok.Item1, "upload with token 303");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(Path.Combine(root, "a.txt"))), "token upload bytes");
+
+                // Traversal filename is stripped to a bare name inside the share root
+                var evil = new System.Collections.Generic.Dictionary<string, byte[]> { { "..\\..\\evil.txt", content } };
+                var respEvil = HttpPost(baseUrl + "?t=246810", "multipart/form-data; boundary=B",
+                    BuildMultipart("B", new System.Collections.Generic.Dictionary<string, string>(), evil));
+                Assert.Equal(303, respEvil.Item1, "traversal-named upload still handled");
+                Assert.True(File.Exists(Path.Combine(root, "evil.txt")), "name stripped to bare file name");
+                string parent = Path.GetDirectoryName(root.TrimEnd(Path.DirectorySeparatorChar));
+                Assert.False(File.Exists(Path.Combine(parent, "evil.txt")), "nothing written outside root");
+            }
+            finally
+            {
+                server.Stop();
+                try { Directory.Delete(root, true); } catch { }
+                string parent = Path.GetDirectoryName(root.TrimEnd(Path.DirectorySeparatorChar));
+                try { File.Delete(Path.Combine(parent, "evil.txt")); } catch { }
             }
         }
     }

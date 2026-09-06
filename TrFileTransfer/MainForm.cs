@@ -76,6 +76,8 @@ namespace TrFileTransfer
         private Button _btnOpenDir;
         private Button _btnRecent;
         private Button _btnHttpShare;
+        private Label _lblHttpPort;
+        private NumericUpDown _numHttpPort;
         private HttpShareServer _httpShare;
         private ContextMenuStrip _trayMenu;
         private bool _trayExit;
@@ -229,19 +231,27 @@ namespace TrFileTransfer
             _btnBrowseDir = new Button { Dock = DockStyle.Fill, Margin = new Padding(3, 5, 3, 5) };
             UiStyle.Secondary(_btnBrowseDir);
             _btnBrowseDir.Click += BtnBrowseDir_Click;
-            _btnStartServer = new Button { Width = 108, Height = 28, Margin = new Padding(0, 3, 8, 3) };
+            _btnStartServer = new Button { Width = 82, Height = 28, Margin = new Padding(0, 3, 6, 3) };
             UiStyle.Primary(_btnStartServer);
             _btnStartServer.Click += BtnStartServer_Click;
-            _btnStopServer = new Button { Width = 108, Height = 28, Margin = new Padding(0, 3, 8, 3), Enabled = false };
+            _btnStopServer = new Button { Width = 82, Height = 28, Margin = new Padding(0, 3, 6, 3), Enabled = false };
             UiStyle.Secondary(_btnStopServer);
             _btnStopServer.Click += BtnStopServer_Click;
-            _btnOpenDir = new Button { Width = 96, Height = 28, Margin = new Padding(0, 3, 8, 3) };
+            _btnOpenDir = new Button { Width = 62, Height = 28, Margin = new Padding(0, 3, 6, 3) };
             UiStyle.Secondary(_btnOpenDir);
             _btnOpenDir.Click += BtnOpenDir_Click;
-            _btnRecent = new Button { Width = 96, Height = 28, Margin = new Padding(0, 3, 0, 3) };
+            _btnRecent = new Button { Width = 62, Height = 28, Margin = new Padding(0, 3, 6, 3) };
             UiStyle.Secondary(_btnRecent);
             _btnRecent.Click += BtnRecent_Click;
-            _btnHttpShare = new Button { Width = 96, Height = 28, Margin = new Padding(16, 3, 0, 3) };
+            _lblHttpPort = new Label { AutoSize = true, Margin = new Padding(10, 9, 3, 0), ForeColor = Color.FromArgb(68, 68, 68) };
+            _numHttpPort = new NumericUpDown
+            {
+                Width = 56, Minimum = 1, Maximum = 65535,
+                Value = Math.Max(1, Math.Min(65535, Config.GetInt("HttpSharePort", HttpShareServer.DefaultPort))),
+                Margin = new Padding(0, 5, 6, 3)
+            };
+            _numHttpPort.ValueChanged += (s2, e2) => Config.SetInt("HttpSharePort", (int)_numHttpPort.Value);
+            _btnHttpShare = new Button { Width = 62, Height = 28, Margin = new Padding(0, 3, 6, 3) };
             UiStyle.Secondary(_btnHttpShare);
             _btnHttpShare.Click += BtnHttpShare_Click;
             _chkPairing = new CheckBox { AutoSize = true, Margin = new Padding(16, 8, 3, 3) };
@@ -259,6 +269,8 @@ namespace TrFileTransfer
             serverButtons.Controls.Add(_btnStopServer);
             serverButtons.Controls.Add(_btnOpenDir);
             serverButtons.Controls.Add(_btnRecent);
+            serverButtons.Controls.Add(_lblHttpPort);
+            serverButtons.Controls.Add(_numHttpPort);
             serverButtons.Controls.Add(_btnHttpShare);
             serverButtons.Controls.Add(_chkPairing);
             serverButtons.Controls.Add(_lblPairingCode);
@@ -557,6 +569,7 @@ namespace TrFileTransfer
             _btnSendText.Text = L.SendTextBtn;
             _btnFanOut.Text = L.FanOutBtn;
             _lblPairingC.Text = L.PairingClientLabel;
+            _lblHttpPort.Text = L.HttpPortLabel;
             if (_httpShare == null || !_httpShare.IsRunning)
                 _btnHttpShare.Text = L.HttpShareBtn;
             else
@@ -808,7 +821,8 @@ namespace TrFileTransfer
                 MessageBox.Show(L.HttpShareDirMissing, L.DlgError, MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
-            int port = Config.GetInt("HttpSharePort", HttpShareServer.DefaultPort);
+            int port = (int)_numHttpPort.Value;
+            Config.SetInt("HttpSharePort", port);
             var share = new HttpShareServer();
             share.OnLog += msg => this.Invoke((Action)(() => AddLog(msg)));
             try

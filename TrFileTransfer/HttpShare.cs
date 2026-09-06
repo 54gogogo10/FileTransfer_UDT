@@ -36,6 +36,9 @@ namespace TrFileTransfer
         public bool IsRunning { get { return _isRunning; } }
         public int Port { get; private set; }
 
+        /// <summary>Hard cap for a single upload request body (4 GB).</summary>
+        public const long MaxUploadBytes = 4L * 1024 * 1024 * 1024;
+
         /// <summary>MIME types served inline (browser plays/preview); everything else is
         /// sent as an attachment. HTML/SVG are deliberately absent — inline markup could
         /// script the listing page and read the access token from its links.</summary>
@@ -147,14 +150,19 @@ namespace TrFileTransfer
                 using (client)
                 using (NetworkStream ns = client.GetStream())
                 {
-                    string requestLine = await ReadRequestHeadAsync(ns, ct).ConfigureAwait(false);
-                    if (requestLine == null || !requestLine.StartsWith("GET ", StringComparison.Ordinal))
-                    {
-                        await WriteSimpleAsync(ns, 405, "Method Not Allowed", ct).ConfigureAwait(false);
-                        return;
-                    }
-                    // "/?t=x&p=y HTTP/1.1" -> "/?t=x&p=y"
-                    string rawPath = requestLine.Substring(4).TrimEnd(' ');
+                    // One buffered reader for the whole request: bytes read past the head
+                    // (start of a POST body) must survive into the body parsing
+                    var reader = new NetBufReader(ns);
+
+                    string head = await reader.ReadHeadAsync(ct).ConfigureAwait(false);
+                    if (head == null) return;
+                    string requestLine = head.Length > 0 ? head : "";
+                    int nl = requestLine.IndexOf("\r\n", StringComparison.Ordinal);
+                    if (nl >= 0) requestLine = requestLine.Substring(0, nl);
+                    var headers = ParseHeaders(head);
+
+                    string method = requestLine.Length > 0 ? requestLine.Split(' ')[0] : "";
+                    string rawPath = method.Length > 0 ? requestLine.Substring(method.Length).TrimStart(' ') : "";
                     int sp = rawPath.IndexOf(' ');
                     if (sp >= 0) rawPath = rawPath.Substring(0, sp);
                     if (rawPath.Length == 0 || rawPath[0] != '/') rawPath = "/" + rawPath;
@@ -169,8 +177,29 @@ namespace TrFileTransfer
                     // Token gate: every real response requires ?t=<token> when set
                     if (_token.Length > 0 && tArg != _token)
                     {
+                        // Drain the request body first — closing mid-upload resets
+                        // the connection under the client before it reads the reply
+                        string clenGate;
+                        if (method == "POST" && headers.TryGetValue("Content-Length", out clenGate))
+                        {
+                            long bodyLen;
+                            if (long.TryParse(clenGate, out bodyLen) && bodyLen > 0 && bodyLen <= MaxUploadBytes)
+                                await reader.DiscardAsync(bodyLen, ct).ConfigureAwait(false);
+                        }
                         await WriteBytesAsync(ns, "200 OK", "text/html; charset=utf-8",
                             BuildTokenForm(tArg == ""), ct).ConfigureAwait(false);
+                        return;
+                    }
+
+                    if (method == "POST")
+                    {
+                        await HandleUploadAsync(ns, reader, headers, query, peer, ct).ConfigureAwait(false);
+                        return;
+                    }
+
+                    if (method != "GET")
+                    {
+                        await WriteSimpleAsync(ns, 405, "Method Not Allowed", ct).ConfigureAwait(false);
                         return;
                     }
 
@@ -198,26 +227,287 @@ namespace TrFileTransfer
             }
         }
 
-        /// <summary>Reads up to the blank line that ends the request head; returns the
-        /// request line (first line). Null on premature close.</summary>
-        private static async Task<string> ReadRequestHeadAsync(NetworkStream ns, CancellationToken ct)
+        /// <summary>Buffers the network stream so pattern scans never lose bytes that
+        /// arrive past a match — essential for multipart bodies.</summary>
+        private sealed class NetBufReader
         {
-            var head = new byte[16384];
-            int total = 0;
-            while (total < head.Length)
+            private readonly NetworkStream _ns;
+            internal readonly byte[] _buf = new byte[65536];
+            internal int _start;
+            internal int _end;
+
+            public NetBufReader(NetworkStream ns) { _ns = ns; }
+
+            /// <summary>Reads the request head (all header lines, no trailing blank
+            /// line). Null on premature close.</summary>
+            public async Task<string> ReadHeadAsync(CancellationToken ct)
             {
-                int n = await ns.ReadAsync(head, total, head.Length - total, ct).ConfigureAwait(false);
-                if (n <= 0) return null;
-                total += n;
-                string s = Encoding.ASCII.GetString(head, 0, total);
-                int idx = s.IndexOf("\r\n\r\n", StringComparison.Ordinal);
-                if (idx >= 0)
+                var head = new MemoryStream();
+                byte[] crlfcrlf = { 13, 10, 13, 10 };
+                if (!await ReadUntilAsync(this, crlfcrlf, head, 65536, ct).ConfigureAwait(false))
+                    return null;
+                string all = Encoding.UTF8.GetString(head.ToArray());
+                int idx = all.LastIndexOf("\r\n\r\n", StringComparison.Ordinal);
+                return idx >= 0 ? all.Substring(0, idx) : all;
+            }
+
+            /// <summary>Fills the buffer (compacting first); returns bytes available.</summary>
+            public async Task<int> FillAsync(CancellationToken ct)
+            {
+                if (_start > 0)
                 {
-                    int nl = s.IndexOf("\r\n", StringComparison.Ordinal);
-                    return nl > 0 ? s.Substring(0, nl) : null;
+                    Array.Copy(_buf, _start, _buf, 0, _end - _start);
+                    _end -= _start;
+                    _start = 0;
+                }
+                if (_end == _buf.Length) return _end - _start;
+                int n = await _ns.ReadAsync(_buf, _end, _buf.Length - _end, ct).ConfigureAwait(false);
+                _end += n;
+                return _end - _start;
+            }
+
+            /// <summary>Reads exactly count bytes (from buffer or network).</summary>
+            public async Task<byte[]> ReadExactAsync(int count, CancellationToken ct)
+            {
+                var outBuf = new byte[count];
+                int got = 0;
+                while (got < count)
+                {
+                    int avail = _end - _start;
+                    if (avail == 0)
+                    {
+                        if (await FillAsync(ct).ConfigureAwait(false) == 0)
+                            throw new IOException("connection closed mid-body");
+                        continue;
+                    }
+                    int take = Math.Min(count - got, avail);
+                    Buffer.BlockCopy(_buf, _start, outBuf, got, take);
+                    _start += take;
+                    got += take;
+                }
+                return outBuf;
+            }
+
+            /// <summary>Consumes and discards count bytes (EOF tolerated).</summary>
+            public async Task DiscardAsync(long count, CancellationToken ct)
+            {
+                while (count > 0)
+                {
+                    int avail = _end - _start;
+                    if (avail == 0)
+                    {
+                        if (await FillAsync(ct).ConfigureAwait(false) == 0)
+                            return;
+                        continue;
+                    }
+                    int take = (int)Math.Min(count, avail);
+                    _start += take;
+                    count -= take;
                 }
             }
-            return null;
+        }
+
+        private static int IndexOf(byte[] haystack, int start, int count, byte[] needle)
+        {
+            int last = start + count - needle.Length;
+            for (int i = start; i <= last; i++)
+            {
+                int j = 0;
+                while (j < needle.Length && haystack[i + j] == needle[j]) j++;
+                if (j == needle.Length) return i;
+            }
+            return -1;
+        }
+
+        /// <summary>Streams bytes until the byte pattern is found (pattern consumed, not
+        /// written). Bytes before the match go to sink (null to discard). Leftover bytes
+        /// after the pattern stay buffered in the reader. False on EOF before a match.</summary>
+        private static async Task<bool> ReadUntilAsync(NetBufReader reader, byte[] pattern,
+            Stream sink, long maxBytes, CancellationToken ct)
+        {
+            long total = 0;
+            while (true)
+            {
+                int avail = reader._end - reader._start;
+                int idx = IndexOf(reader._buf, reader._start, avail, pattern);
+                if (idx >= 0)
+                {
+                    int before = idx - reader._start;
+                    if (sink != null && before > 0)
+                        await sink.WriteAsync(reader._buf, reader._start, before, ct).ConfigureAwait(false);
+                    reader._start = idx + pattern.Length;
+                    return true;
+                }
+                // Flush only the prefix that cannot contain a partial pattern
+                int safe = avail - pattern.Length + 1;
+                if (safe > 0)
+                {
+                    if (sink != null)
+                        await sink.WriteAsync(reader._buf, reader._start, safe, ct).ConfigureAwait(false);
+                    total += safe;
+                    reader._start += safe;
+                }
+                if (maxBytes >= 0 && total > maxBytes)
+                    throw new IOException("upload section exceeds size cap");
+                if (await reader.FillAsync(ct).ConfigureAwait(false) == 0)
+                    return false;
+            }
+        }
+
+        private static Dictionary<string, string> ParseHeaders(string head)
+        {
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            string[] lines = head.Split('\n');
+            for (int i = 1; i < lines.Length; i++)
+            {
+                string line = lines[i].TrimEnd('\r');
+                int c = line.IndexOf(':');
+                if (c <= 0) continue;
+                result[line.Substring(0, c).Trim()] = line.Substring(c + 1).Trim();
+            }
+            return result;
+        }
+
+        // ---- Upload (multipart/form-data POST) ----
+
+        /// <summary>
+        /// Streams a multipart/form-data body to disk. Files land in the directory
+        /// named by the "p" form field (share root when empty); names are reduced to
+        /// a bare file name and uniquified. Responds 303 back to the listing.
+        /// </summary>
+        private async Task HandleUploadAsync(NetworkStream ns, NetBufReader reader,
+            Dictionary<string, string> headers, string query, string peer, CancellationToken ct)
+        {
+            long contentLength;
+            string clen;
+            if (!headers.TryGetValue("Content-Length", out clen) ||
+                !long.TryParse(clen, out contentLength) || contentLength <= 0)
+            {
+                await WriteSimpleAsync(ns, 400, "Bad Request", ct).ConfigureAwait(false);
+                return;
+            }
+            if (contentLength > MaxUploadBytes)
+            {
+                await WriteSimpleAsync(ns, 413, "File Too Large", ct).ConfigureAwait(false);
+                return;
+            }
+            string contentType;
+            headers.TryGetValue("Content-Type", out contentType);
+            string boundary = ExtractBoundary(contentType);
+            if (boundary == null)
+            {
+                await WriteSimpleAsync(ns, 400, "Bad Request", ct).ConfigureAwait(false);
+                return;
+            }
+
+            byte[] startDelim = Encoding.ASCII.GetBytes("--" + boundary);
+            byte[] midDelim = Encoding.ASCII.GetBytes("\r\n--" + boundary);
+            byte[] headEnd = { 13, 10, 13, 10 };
+
+            string uploadRel = "";
+            string tokenPart = "";
+            var args = ParseQuery(query);
+            string tq;
+            if (args.TryGetValue("t", out tq)) tokenPart = "&t=" + Uri.EscapeDataString(tq);
+            int files = 0;
+            long filesBytes = 0;
+
+            // Skip the preamble up to the first boundary
+            if (!await ReadUntilAsync(reader, startDelim, null, 65536, ct).ConfigureAwait(false))
+                throw new IOException("upload body ended before first boundary");
+
+            while (true)
+            {
+                // After the boundary: "--" closes, otherwise CRLF starts a part
+                byte[] two = await reader.ReadExactAsync(2, ct).ConfigureAwait(false);
+                if (two[0] == '-' && two[1] == '-') break;
+
+                var partHead = new MemoryStream();
+                if (!await ReadUntilAsync(reader, headEnd, partHead, 32768, ct).ConfigureAwait(false))
+                    throw new IOException("upload part headers truncated");
+                string disposition = Encoding.UTF8.GetString(partHead.ToArray());
+
+                string name = ExtractDispositionValue(disposition, "name");
+                string filename = ExtractDispositionValue(disposition, "filename");
+
+                if (string.IsNullOrEmpty(filename))
+                {
+                    // Form field (e.g. current directory "p")
+                    var field = new MemoryStream();
+                    if (!await ReadUntilAsync(reader, midDelim, field, 65536, ct).ConfigureAwait(false))
+                        throw new IOException("upload field truncated");
+                    if (name == "p")
+                        uploadRel = Encoding.UTF8.GetString(field.ToArray()).Trim();
+                    continue;
+                }
+
+                string bareName = Path.GetFileName(filename.Replace('/', '\\'));
+                if (string.IsNullOrWhiteSpace(bareName) || bareName == "_")
+                {
+                    // No usable name — stream the content to null and continue
+                    if (!await ReadUntilAsync(reader, midDelim, null, contentLength, ct).ConfigureAwait(false))
+                        throw new IOException("upload part truncated");
+                    continue;
+                }
+
+                string dir = ResolveSafe(uploadRel);
+                if (dir == null) dir = _rootFull;
+                string savePath = Utils.GetUniqueSavePath(dir, bareName);
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                using (var fs = new FileStream(savePath, FileMode.Create, FileAccess.Write,
+                    FileShare.None, 65536, FileOptions.SequentialScan))
+                {
+                    if (!await ReadUntilAsync(reader, midDelim, fs, contentLength, ct).ConfigureAwait(false))
+                        throw new IOException("upload part truncated");
+                }
+                sw.Stop();
+                files++;
+                long size = new FileInfo(savePath).Length;
+                filesBytes += size;
+                var handler = OnLog;
+                if (handler != null)
+                    handler("[HTTP] " + peer + " upload: " + bareName + " (" +
+                        Utils.FormatSize(size) + ", " + sw.Elapsed.TotalSeconds.ToString("F1") + "s)");
+            }
+
+            var log = OnLog;
+            if (log != null && files > 1)
+                log("[HTTP] " + peer + " upload done: " + files + " file(s), " + Utils.FormatSize(filesBytes));
+
+            // Back to the listing the uploader came from
+            string loc = "/?p=" + Uri.EscapeDataString(uploadRel) + tokenPart;
+            byte[] resp = Encoding.ASCII.GetBytes(
+                "HTTP/1.1 303 See Other\r\nLocation: " + loc +
+                "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            await ns.WriteAsync(resp, 0, resp.Length, ct).ConfigureAwait(false);
+        }
+
+        /// <summary>Extracts boundary=... from a multipart Content-Type header; strips quotes.</summary>
+        private static string ExtractBoundary(string contentType)
+        {
+            if (contentType == null) return null;
+            int idx = contentType.IndexOf("boundary=", StringComparison.OrdinalIgnoreCase);
+            if (idx < 0) return null;
+            string b = contentType.Substring(idx + 9).Trim();
+            int end = b.IndexOf(';');
+            if (end >= 0) b = b.Substring(0, end);
+            b = b.Trim().Trim('"');
+            return b.Length == 0 ? null : b;
+        }
+
+        /// <summary>Extracts name=/filename= from a Content-Disposition header line.
+        /// No backslash unescaping: browsers send raw names (old IE sends full paths,
+        /// where "\" is a separator to strip), and escaping would corrupt path stripping
+        /// ("..\..\x" would become "....x"). Callers must still strip path segments.</summary>
+        private static string ExtractDispositionValue(string partHead, string key)
+        {
+            int idx = partHead.IndexOf(key + "=\"", StringComparison.OrdinalIgnoreCase);
+            if (idx < 0) return "";
+            int start = idx + key.Length + 2;
+            int end = partHead.IndexOf('"', start);
+            if (end < 0) end = partHead.Length;
+            return partHead.Substring(start, end - start);
         }
 
         private static Dictionary<string, string> ParseQuery(string query)
@@ -302,7 +592,19 @@ namespace TrFileTransfer
             }
             if (entries.Count == 0)
                 sb.Append("<li><span>").Append(L.HttpShareEmpty).Append("</span></li>");
-            sb.Append("</ul><p style=\"text-align:center;color:#aaa;font-size:.75rem\">TrFileTransfer</p></body></html>");
+            sb.Append("</ul>");
+
+            // Upload form — posts into the directory being viewed
+            string formAction = linkQuery.Length > 0 ? "/?" + linkQuery.Substring(1) : "/";
+            sb.Append("<form method=\"post\" action=\"" + HtmlEscape(formAction) +
+                "\" enctype=\"multipart/form-data\" style=\"margin:10px 8px 24px;background:#fff;padding:12px;border-radius:8px;display:flex;gap:8px;flex-wrap:wrap\">");
+            sb.Append("<input type=\"hidden\" name=\"p\" value=\"").Append(HtmlEscape(rawRel)).Append("\">");
+            sb.Append("<input type=\"file\" name=\"file\" multiple required style=\"flex:1;min-width:200px;font-size:.95rem\">");
+            sb.Append("<input type=\"submit\" value=\"").Append(L.HttpShareUploadBtn)
+              .Append("\" style=\"padding:8px 16px;border:0;border-radius:8px;background:#0078d7;color:#fff;font-size:.95rem\">");
+            sb.Append("</form>");
+
+            sb.Append("<p style=\"text-align:center;color:#aaa;font-size:.75rem\">TrFileTransfer</p></body></html>");
 
             await WriteBytesAsync(ns, "200 OK", "text/html; charset=utf-8",
                 Encoding.UTF8.GetBytes(sb.ToString()), ct).ConfigureAwait(false);

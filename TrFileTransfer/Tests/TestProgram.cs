@@ -762,7 +762,7 @@ namespace TrFileTransfer.Tests
                 Assert.Equal("Ready", L.Ready, "Ready EN");
                 Assert.Equal("Listening...", L.Listening, "Listening EN");
                 Assert.Equal("Transfer complete!", L.TransferComplete, "Complete EN");
-                Assert.Equal("Start Server", L.StartServer, "Start EN");
+                Assert.Equal("Start", L.StartServer, "Start EN");
                 Assert.Equal("Cancel", L.CancelBtn, "Cancel EN");
             });
 

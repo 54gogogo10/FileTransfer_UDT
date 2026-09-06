@@ -16,8 +16,8 @@ namespace TrFileTransfer
         public static string Port { get { return IsChinese ? "端口:" : "Port:"; } }
         public static string SaveTo { get { return IsChinese ? "保存到:" : "Save to:"; } }
         public static string Browse { get { return IsChinese ? "浏览..." : "Browse..."; } }
-        public static string StartServer { get { return IsChinese ? "启动服务器" : "Start Server"; } }
-        public static string StopServer { get { return IsChinese ? "停止服务器" : "Stop Server"; } }
+        public static string StartServer { get { return IsChinese ? "启动" : "Start"; } }
+        public static string StopServer { get { return IsChinese ? "停止" : "Stop"; } }
 
         // ---- Client ----
         public static string ClientSettings { get { return IsChinese ? "客户端设置" : "Client Settings"; } }
@@ -345,8 +345,8 @@ namespace TrFileTransfer
         }
         public static string NotifySendDone { get { return IsChinese ? "发送完成" : "Send complete"; } }
         public static string NotifyReceiveDone { get { return IsChinese ? "收到文件" : "File received"; } }
-        public static string OpenSaveDir { get { return IsChinese ? "打开目录" : "Open Folder"; } }
-        public static string RecentFiles { get { return IsChinese ? "最近接收" : "Recent Files"; } }
+        public static string OpenSaveDir { get { return IsChinese ? "目录" : "Folder"; } }
+        public static string RecentFiles { get { return IsChinese ? "最近" : "Recent"; } }
         public static string RecentFilesEmpty { get { return IsChinese ? "还没有收到文件。" : "No files received yet."; } }
         public static string RecentOpen { get { return IsChinese ? "打开位置" : "Open Location"; } }
         public static string MonitorStarted(object path)
@@ -532,7 +532,9 @@ namespace TrFileTransfer
 
         // ---- HTTP share ----
         public static string HttpShareBtn { get { return IsChinese ? "HTTP 共享" : "HTTP Share"; } }
-        public static string HttpShareStop { get { return IsChinese ? "停止共享" : "Stop Share"; } }
+        public static string HttpPortLabel { get { return IsChinese ? "HTTP端口:" : "HTTP port:"; } }
+        public static string HttpShareUploadBtn { get { return IsChinese ? "上传" : "Upload"; } }
+        public static string HttpShareStop { get { return IsChinese ? "停止" : "Stop"; } }
         public static string HttpShareOn(object url)
         {
             return IsChinese
