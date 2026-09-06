@@ -104,6 +104,7 @@ namespace TrFileTransfer.Tests
             RunUpdater(runner);
             RunWire(runner);
             RunSyncBatch(runner);
+            RunPortProbe(runner);
         }
 
         private static void RunFormatSize(TestRunner runner)
@@ -700,6 +701,55 @@ namespace TrFileTransfer.Tests
                 var parsed2 = DiscoveryProtocol.ParseResponse(withoutFlag, withoutFlag.Length, from);
                 Assert.True(parsed2.HasValue && !parsed2.Value.RequiresPairing, "pairing flag clear");
                 Assert.True(parsed2.Value.SupportsTcp && !parsed2.Value.SupportsUdt, "protocols intact");
+            });
+        }
+
+        private static void RunPortProbe(TestRunner runner)
+        {
+            runner.Run("PortProbe_FreePort", () =>
+            {
+                int port = Utils.FindFreePort(20000, false);
+                Assert.True(port > 0, "found a free port");
+                Assert.True(Utils.IsPortFree(port, true, true), "reported free is actually free");
+            });
+
+            runner.Run("PortProbe_OccupiedTcp", () =>
+            {
+                var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+                listener.Start();
+                int port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
+                try
+                {
+                    Assert.False(Utils.IsPortFree(port, true, false), "bound TCP port is not free");
+                    Assert.True(Utils.FindFreePortFrom(port + 1, true, false) != port, "next free port differs");
+                }
+                finally { listener.Stop(); }
+                Assert.True(Utils.IsPortFree(port, true, false), "free again after stop");
+            });
+
+            runner.Run("PortProbe_OccupiedUdp", () =>
+            {
+                var udp = new System.Net.Sockets.UdpClient(0);
+                int port = ((System.Net.IPEndPoint)udp.Client.LocalEndPoint).Port;
+                try
+                {
+                    Assert.False(Utils.IsPortFree(port, false, true), "bound UDP port is not free");
+                }
+                finally { udp.Close(); }
+            });
+
+            runner.Run("PortProbe_ProtocolIndependent", () =>
+            {
+                var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+                listener.Start();
+                int port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
+                try
+                {
+                    // TCP occupied but UDP probe asked only — TCP result must not leak into UDP check
+                    Assert.False(Utils.IsPortFree(port, true, false), "tcp busy");
+                    Assert.True(Utils.IsPortFree(port, false, true), "udp independent of tcp");
+                }
+                finally { listener.Stop(); }
             });
         }
 

@@ -552,5 +552,49 @@ namespace TrFileTransfer
         public static string HttpShareTokenSubmit { get { return IsChinese ? "打开" : "Open"; } }
         public static string HttpShareWrongToken { get { return IsChinese ? "访问码不正确，请重试。" : "Wrong access code, try again."; } }
 
+        // ---- Fan-out (one -> many) ----
+        public static string FanOutBtn { get { return IsChinese ? "群发" : "Fan Out"; } }
+        public static string FanOutTitle { get { return IsChinese ? "群发到多台设备" : "Fan Out to Devices"; } }
+        public static string FanOutSend { get { return IsChinese ? "开始群发" : "Start"; } }
+        public static string FanOutNoSelection { get { return IsChinese ? "请先勾选至少一台设备。" : "Check at least one device first."; } }
+        public static string FanOutIgnoreSrcPort { get { return IsChinese ? "群发模式忽略源端口设置（并行客户端使用随机端口）。" : "Fan-out ignores the source port setting (random ports are used)."; } }
+        public static string FanOutStart(object count)
+        {
+            return IsChinese
+                ? string.Format("正在群发到 {0} 台设备...", count)
+                : string.Format("Fanning out to {0} device(s)...", count);
+        }
+        public static string FanOutDone(object ok, object total)
+        {
+            return IsChinese
+                ? string.Format("群发完成: {0}/{1} 成功。", ok, total)
+                : string.Format("Fan out finished: {0}/{1} succeeded.", ok, total);
+        }
+
+        // ---- Port busy / firewall ----
+        public static string PortBusyOffer(object busy, object alt)
+        {
+            return IsChinese
+                ? string.Format("端口 {0} 已被占用。改用可用端口 {1} 启动？", busy, alt)
+                : string.Format("Port {0} is in use. Start on free port {1} instead?", busy, alt);
+        }
+        public static string PortBusyNoAlt(object busy)
+        {
+            return IsChinese
+                ? string.Format("端口 {0} 已被占用，且未在其后找到可用端口。", busy)
+                : string.Format("Port {0} is in use and no free port was found after it.", busy);
+        }
+        public static string FwHintTitle { get { return IsChinese ? "防火墙提示" : "Firewall Note"; } }
+        public static string FwHintText(object cmd)
+        {
+            return IsChinese
+                ? string.Format("若其他设备无法连接本机，请允许 TrFileTransfer 通过 Windows 防火墙：\n" +
+                    "首次监听时 Windows 会弹出允许提示，请勾选\"专用网络\"和\"公用网络\"。\n\n" +
+                    "也可以用管理员命令直接放行（选中下方命令右键复制）：\n{0}", cmd)
+                : string.Format("If other devices cannot connect, allow TrFileTransfer through Windows Firewall:\n" +
+                    "Windows shows an allow prompt on the first listen — check BOTH \"Private\" and \"Public\".\n\n" +
+                    "Or run this command as administrator (select & copy below):\n{0}", cmd);
+        }
+
     }
 }

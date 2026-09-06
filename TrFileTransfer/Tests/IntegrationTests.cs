@@ -94,6 +94,7 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_FolderSync_UDT", UdtFolderSync, 1);
             runner.Run("Integration_HTTP_ListAndDownload", HttpShareListAndDownload);
             runner.Run("Integration_HTTP_TokenAndTraversal", HttpShareTokenAndTraversal);
+            runner.Run("Integration_FanOut_TwoTargets", FanOutTwoTargets);
         }
 
         private static void TcpSingleFile()
@@ -3079,6 +3080,63 @@ namespace TrFileTransfer.Tests
             {
                 server.Stop();
                 try { Directory.Delete(root, true); } catch { }
+            }
+        }
+
+        /// <summary>Fan-out pattern end-to-end: two independent servers receive the
+        /// same file concurrently from parallel clients (distinct random source ports).</summary>
+        private static void FanOutTwoTargets()
+        {
+            int port1 = FindFreePort();
+            int port2 = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_fan_s_" + Guid.NewGuid().ToString("N"));
+            string recv1 = Path.Combine(TempBase(), "tr_fan_r1_" + Guid.NewGuid().ToString("N"));
+            string recv2 = Path.Combine(TempBase(), "tr_fan_r2_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recv1);
+            Directory.CreateDirectory(recv2);
+            TransferServer s1 = null, s2 = null;
+            try
+            {
+                var content = new byte[200 * 1024];
+                new Random(33).NextBytes(content);
+                var testFile = Path.Combine(sendDir, "fan.bin");
+                File.WriteAllBytes(testFile, content);
+
+                var started = new ManualResetEvent(false);
+                s1 = new TransferServer("127.0.0.1", port1, recv1);
+                s2 = new TransferServer("127.0.0.1", port2, recv2);
+                var done1 = new ManualResetEvent(false);
+                var done2 = new ManualResetEvent(false);
+                s1.OnStarted += () => started.Set();
+                s1.OnFileReceived += (p, sz) => done1.Set();
+                s2.OnFileReceived += (p, sz) => done2.Set();
+                s1.Start();
+                s2.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("Servers did not start within 5s");
+
+                // Parallel clients — the fan-out core (random source ports, pairing, cards)
+                var c1 = new TransferClient("127.0.0.1", port1, testFile);
+                var c2 = new TransferClient("127.0.0.1", port2, testFile);
+                var t1 = c1.SendAsync();
+                var t2 = c2.SendAsync();
+                t1.Wait(30000);
+                t2.Wait(30000);
+
+                if (!done1.WaitOne(5000) || !done2.WaitOne(5000))
+                    throw new Exception("Both targets did not receive the file");
+
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(Path.Combine(recv1, "fan.bin"))), "target 1 content");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(Path.Combine(recv2, "fan.bin"))), "target 2 content");
+            }
+            finally
+            {
+                if (s1 != null) { try { s1.Stop(); } catch { } }
+                if (s2 != null) { try { s2.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recv1, true); } catch { }
+                try { Directory.Delete(recv2, true); } catch { }
             }
         }
     }

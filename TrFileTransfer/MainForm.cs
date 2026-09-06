@@ -65,6 +65,7 @@ namespace TrFileTransfer
         private NumericUpDown _numSpeed;
         private Button _btnQueue;
         private Button _btnScan;
+        private Button _btnFanOut;
         private Button _btnSendText;
         private Label _lblPairingC;
         private TextBox _txtPairing;
@@ -111,6 +112,11 @@ namespace TrFileTransfer
         private int _monitorSrcPort;
         private System.Collections.Generic.List<string> _monitorQueue = new System.Collections.Generic.List<string>();
         private readonly object _monitorLock = new object();
+
+        // Fan-out (one file/folder -> many devices in parallel)
+        private readonly System.Collections.Generic.List<object> _fanOutClients
+            = new System.Collections.Generic.List<object>();
+        private volatile bool _fanOutRunning;
 
         /// <summary>Assembly version for display (major.minor.build).</summary>
         private static string AppVersion
@@ -339,6 +345,9 @@ namespace TrFileTransfer
             _btnScan = new Button { Width = 72, Height = 26, Margin = new Padding(2, 3, 8, 3) };
             UiStyle.Secondary(_btnScan);
             _btnScan.Click += BtnScan_Click;
+            _btnFanOut = new Button { Width = 72, Height = 26, Margin = new Padding(2, 3, 8, 3) };
+            UiStyle.Secondary(_btnFanOut);
+            _btnFanOut.Click += BtnFanOut_Click;
             _btnQueue = new Button { Width = 96, Height = 26, Margin = new Padding(2, 3, 8, 3) };
             UiStyle.Secondary(_btnQueue);
             _btnQueue.Click += BtnQueue_Click;
@@ -352,6 +361,7 @@ namespace TrFileTransfer
             _txtPairing = new TextBox { Width = 58, MaxLength = 12, Margin = new Padding(0, 6, 0, 3) };
             var actionRow = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, BackColor = Color.White, Margin = new Padding(0) };
             actionRow.Controls.Add(_btnScan);
+            actionRow.Controls.Add(_btnFanOut);
             actionRow.Controls.Add(_btnQueue);
             actionRow.Controls.Add(_btnResumeList);
             actionRow.Controls.Add(_btnSendText);
@@ -545,6 +555,7 @@ namespace TrFileTransfer
             _btnCheckUpdate.Text = L.UpdBtn;
             _chkPairing.Text = L.PairingLabel;
             _btnSendText.Text = L.SendTextBtn;
+            _btnFanOut.Text = L.FanOutBtn;
             _lblPairingC.Text = L.PairingClientLabel;
             if (_httpShare == null || !_httpShare.IsRunning)
                 _btnHttpShare.Text = L.HttpShareBtn;
@@ -1023,6 +1034,132 @@ namespace TrFileTransfer
             }
         }
 
+        // ---- Fan-out: one file/folder to many devices in parallel ----
+
+        private void BtnFanOut_Click(object sender, EventArgs e)
+        {
+            if (_chkMonitor.Checked || _monitorCts != null) return;
+            bool isFolder = _chkFolder.Checked;
+            string path = _txtFile.Text.Trim();
+            if (isFolder ? !Directory.Exists(path) : !File.Exists(path))
+            {
+                MessageBox.Show(isFolder ? L.DirNotExist : L.FileNotFound, L.DlgError,
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            using (var dlg = new FanOutDialog(_knownDevices))
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                if (dlg.SelectedDevices.Count == 0) return;
+                StartFanOut(dlg.SelectedDevices, path, isFolder);
+            }
+        }
+
+        /// <summary>Sends the same item to every selected device concurrently, one
+        /// progress card per target. Honors the panel's TCP/UDT selection, speed limit
+        /// and pairing code; the source-port setting is ignored (parallel clients
+        /// cannot share one local port).</summary>
+        private void StartFanOut(System.Collections.Generic.List<DeviceInfo> targets, string path, bool isFolder)
+        {
+            bool isTcp = _rbClientTcp.Checked;
+            int speedLimit = (int)_numSpeed.Value * 1024;
+            string pairing = _txtPairing.Text.Trim();
+            if ((int)_numSrcPort.Value != 0)
+                AddLog(L.FanOutIgnoreSrcPort);
+
+            DisableClientInputs();
+            _btnCancel.Enabled = true;
+            _lblStatusC.Text = L.FanOutStart(targets.Count);
+
+            lock (_fanOutClients) _fanOutClients.Clear();
+            _fanOutRunning = true;
+            int total = targets.Count;
+            int finished = 0;
+            int okCount = 0;
+
+            foreach (var t in targets)
+            {
+                var card = CreateTransferCard(_progressPanelC);
+                Action<Action> onUi = a => { try { this.Invoke(a); } catch (ObjectDisposedException) { } catch (InvalidOperationException) { } };
+
+                if (isTcp)
+                {
+                    var client = ClientFactory.CreateTcp(t.Ip, t.Port, path, 0, speedLimit, pairing);
+                    client.OnLog += msg => onUi(() => AddLog(msg));
+                    client.OnProgress += p => onUi(() => UpdateCardProgress(card, p));
+                    client.OnError += msg => onUi(() =>
+                    {
+                        AddLog(L.ErrorPrefix + msg);
+                        UpdateCardComplete(card);
+                    });
+                    client.OnTransferComplete += () => onUi(() =>
+                    {
+                        UpdateCardComplete(card);
+                        System.Threading.Interlocked.Increment(ref okCount);
+                        RememberDevice(t.Ip, t.Port, false);
+                    });
+                    client.OnStopped += () =>
+                    {
+                        UpdateCardComplete(card);
+                        if (System.Threading.Interlocked.Increment(ref finished) == total)
+                            onUi(() => FinalizeFanOut(okCount, total));
+                    };
+                    lock (_fanOutClients) _fanOutClients.Add(client);
+                    var _ = isFolder ? client.SendFolderAsync(path) : client.SendAsync();
+                }
+                else
+                {
+                    var client = ClientFactory.CreateUdt(t.Ip, t.Port, path, 0, speedLimit, pairing);
+                    client.OnLog += msg => onUi(() => AddLog(msg));
+                    client.OnProgress += p => onUi(() => UpdateCardProgress(card, p));
+                    client.OnError += msg => onUi(() =>
+                    {
+                        AddLog(L.ErrorPrefix + msg);
+                        UpdateCardComplete(card);
+                    });
+                    client.OnTransferComplete += () => onUi(() =>
+                    {
+                        UpdateCardComplete(card);
+                        System.Threading.Interlocked.Increment(ref okCount);
+                        RememberDevice(t.Ip, t.Port, true);
+                    });
+                    client.OnStopped += () =>
+                    {
+                        UpdateCardComplete(card);
+                        if (System.Threading.Interlocked.Increment(ref finished) == total)
+                            onUi(() => FinalizeFanOut(okCount, total));
+                    };
+                    lock (_fanOutClients) _fanOutClients.Add(client);
+                    var _ = isFolder ? client.SendFolderAsync(path) : client.SendAsync();
+                }
+            }
+        }
+
+        private void FinalizeFanOut(int okCount, int total)
+        {
+            _fanOutRunning = false;
+            lock (_fanOutClients) _fanOutClients.Clear();
+            AddLog(L.FanOutDone(okCount, total));
+            if (!_trayExit) Notify(L.NotifySendDone, L.FanOutDone(okCount, total));
+            try { ResetClientUI(); } catch { }
+        }
+
+        private void CancelFanOut()
+        {
+            lock (_fanOutClients)
+            {
+                foreach (var c in _fanOutClients)
+                {
+                    var tcp = c as TransferClient;
+                    if (tcp != null) tcp.Cancel();
+                    var udt = c as TransferUdtClient;
+                    if (udt != null) udt.Cancel();
+                }
+            }
+            _lblStatusC.Text = L.Cancelling;
+        }
+
         private void BtnBrowseFile_Click(object sender, EventArgs e)
         {
             if (_chkFolder.Checked || _chkMonitor.Checked)
@@ -1268,6 +1405,28 @@ namespace TrFileTransfer
                 return;
             }
 
+            // Port availability pre-check: offer the next free port when busy
+            bool needTcp = _chkServerTcp.Checked, needUdp = _chkServerUdt.Checked;
+            if (!Utils.IsPortFree(port, needTcp, needUdp))
+            {
+                int alt = Utils.FindFreePortFrom(port + 1, needTcp, needUdp);
+                if (alt == 0)
+                {
+                    MessageBox.Show(L.PortBusyNoAlt(port), L.DlgError, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+                if (MessageBox.Show(this, L.PortBusyOffer(port, alt), L.DlgError,
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Warning) == DialogResult.Yes)
+                {
+                    port = alt;
+                    _txtPortS.Text = alt.ToString();
+                }
+                else
+                {
+                    return;
+                }
+            }
+
             DisableServerInputs();
             _serverCount = 0;
 
@@ -1429,6 +1588,7 @@ namespace TrFileTransfer
             _numSpeed.Enabled = false;
             _btnQueue.Enabled = false;
             _btnScan.Enabled = false;
+            _btnFanOut.Enabled = false;
             _btnSendText.Enabled = false;
             _txtPairing.Enabled = false;
         }
@@ -1438,6 +1598,18 @@ namespace TrFileTransfer
             _btnStartServer.Enabled = false;
             _btnStopServer.Enabled = true;
             _lblStatusS.Text = L.Listening;
+
+            // One-time firewall guidance — local probes cannot detect external blocks,
+            // so hand the user the diagnosis and the exact allow command up front
+            if (!Config.GetBool("FirewallHintShown", false))
+            {
+                Config.SetBool("FirewallHintShown", true);
+                Config.Save();
+                string cmd = "netsh advfirewall firewall add rule name=\"TrFileTransfer\" dir=in action=allow program=\"" +
+                    Application.ExecutablePath + "\" enable=yes";
+                var dlg = new TextReceivedDialog(L.FwHintText(cmd), L.FwHintTitle);
+                dlg.Show(this);
+            }
         }
 
         private void OnServerStopped()
@@ -1689,6 +1861,11 @@ namespace TrFileTransfer
                 StopMonitoring();
                 return;
             }
+            if (_fanOutRunning)
+            {
+                CancelFanOut();
+                return;
+            }
             if (_client != null)
                 _client.Cancel();
             if (_clientUdt != null)
@@ -1721,6 +1898,7 @@ namespace TrFileTransfer
             _numSpeed.Enabled = true;
             _btnQueue.Enabled = true;
             _btnScan.Enabled = true;
+            _btnFanOut.Enabled = true;
             _btnSendText.Enabled = true;
             _txtPairing.Enabled = true;
         }
@@ -2668,7 +2846,7 @@ namespace TrFileTransfer
             }
         }
 
-        private static string FormatDevice(DeviceInfo d, bool online)
+        internal static string FormatDevice(DeviceInfo d, bool online)
         {
             string prot = (d.SupportsTcp ? "TCP" : "") + (d.SupportsUdt ? (d.SupportsTcp ? "+UDT" : "UDT") : "");
             string tag = online ? "" : "  [" + L.ScanOffline + "]";
@@ -3094,8 +3272,13 @@ namespace TrFileTransfer
         private readonly TextBox _txt;
 
         public TextReceivedDialog(string firstMessage)
+            : this(firstMessage, L.TextReceivedTitle)
         {
-            Text = L.TextReceivedTitle;
+        }
+
+        public TextReceivedDialog(string firstMessage, string title)
+        {
+            Text = title;
             ClientSize = new Size(460, 240);
             MinimumSize = new Size(380, 200);
             StartPosition = FormStartPosition.CenterParent;
@@ -3154,6 +3337,156 @@ namespace TrFileTransfer
         public void AppendMessage(string text)
         {
             _txt.AppendText("\r\n\r\n[" + DateTime.Now.ToString("HH:mm:ss") + "]\r\n" + text);
+        }
+    }
+
+    /// <summary>Multi-select device picker for fan-out: saved devices + live scan,
+    /// checkbox list. Devices with a null IP are section placeholders and cannot be
+    /// selected (guarded in the collect step).</summary>
+    public class FanOutDialog : Form
+    {
+        private CheckedListBox _list;
+        private Button _btnRescan, _btnSend, _btnClose;
+        private readonly System.Collections.Generic.List<DeviceInfo> _items
+            = new System.Collections.Generic.List<DeviceInfo>();
+        private readonly System.Collections.Generic.List<DeviceInfo> _known
+            = new System.Collections.Generic.List<DeviceInfo>();
+
+        public System.Collections.Generic.List<DeviceInfo> SelectedDevices
+            = new System.Collections.Generic.List<DeviceInfo>();
+
+        public FanOutDialog(System.Collections.Generic.IEnumerable<DeviceInfo> knownDevices)
+        {
+            if (knownDevices != null)
+            {
+                foreach (var d in knownDevices) _known.Add(d);
+            }
+            Text = L.FanOutTitle;
+            ClientSize = new Size(540, 400);
+            MinimumSize = new Size(460, 320);
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MaximizeBox = true;
+            MinimizeBox = false;
+            Font = new Font("Segoe UI", 9f);
+
+            var tlp = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(10) };
+            tlp.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Absolute, 38));
+
+            _list = new CheckedListBox { Dock = DockStyle.Fill, IntegralHeight = false, CheckOnClick = true };
+            tlp.Controls.Add(_list, 0, 0);
+
+            var buttons = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.RightToLeft,
+                WrapContents = false,
+                Margin = new Padding(0),
+                Padding = new Padding(0, 6, 0, 0)
+            };
+            _btnClose = new Button { Text = L.CancelBtn, Width = 100 };
+            UiStyle.Secondary(_btnClose);
+            _btnClose.Click += (s, e) => Close();
+            buttons.Controls.Add(_btnClose);
+
+            _btnSend = new Button { Text = L.FanOutSend, Width = 110 };
+            UiStyle.Primary(_btnSend);
+            _btnSend.Click += BtnSend_Click;
+            buttons.Controls.Add(_btnSend);
+
+            _btnRescan = new Button { Text = L.ScanRescan, Width = 100 };
+            UiStyle.Secondary(_btnRescan);
+            _btnRescan.Click += async (s, e) => await ScanAsync();
+            buttons.Controls.Add(_btnRescan);
+
+            tlp.Controls.Add(buttons, 0, 1);
+            Controls.Add(tlp);
+
+            Shown += async (s, e) => await ScanAsync();
+        }
+
+        private async Task ScanAsync()
+        {
+            _btnRescan.Enabled = false;
+            _list.Items.Clear();
+            _items.Clear();
+            _list.Items.Add(L.Scanning);
+            try
+            {
+                int dPort = Config.GetInt("DiscoveryPort", DiscoveryProtocol.DefaultPort);
+                var devices = await DiscoveryClient.Scan(dPort, 2000);
+                _list.Items.Clear();
+                _items.Clear();
+
+                // Known section first (live results merged in), then the rest online
+                bool[] merged = new bool[devices.Length];
+                if (_known.Count > 0)
+                {
+                    _items.Add(new DeviceInfo { Ip = null });
+                    _list.Items.Add(L.ScanKnownTitle, false);
+                    foreach (var d in _known)
+                    {
+                        DeviceInfo shown = d;
+                        for (int j = 0; j < devices.Length; j++)
+                        {
+                            if (!merged[j] && devices[j].Ip == d.Ip && devices[j].Port == d.Port)
+                            {
+                                shown = devices[j];
+                                merged[j] = true;
+                                break;
+                            }
+                        }
+                        _items.Add(shown);
+                        _list.Items.Add(DiscoveryDialog.FormatDevice(shown, true), false);
+                    }
+                }
+
+                _items.Add(new DeviceInfo { Ip = null });
+                _list.Items.Add(L.ScanOnlineTitle, false);
+                bool any = false;
+                for (int i = 0; i < devices.Length; i++)
+                {
+                    if (merged[i]) continue;
+                    _items.Add(devices[i]);
+                    _list.Items.Add(DiscoveryDialog.FormatDevice(devices[i], true), false);
+                    any = true;
+                }
+                if (!any && _known.Count == 0)
+                {
+                    _items.Add(new DeviceInfo { Ip = null });
+                    _list.Items.Add(L.ScanEmpty, false);
+                }
+            }
+            catch (Exception ex)
+            {
+                _list.Items.Clear();
+                _items.Clear();
+                _list.Items.Add(L.ErrorPrefix + ex.Message);
+            }
+            finally
+            {
+                _btnRescan.Enabled = true;
+            }
+        }
+
+        private void BtnSend_Click(object sender, EventArgs e)
+        {
+            SelectedDevices.Clear();
+            for (int i = 0; i < _items.Count && i < _list.Items.Count; i++)
+            {
+                if (_list.GetItemChecked(i) && _items[i].Ip != null)
+                    SelectedDevices.Add(_items[i]);
+            }
+            if (SelectedDevices.Count == 0)
+            {
+                MessageBox.Show(this, L.FanOutNoSelection, L.FanOutTitle,
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            DialogResult = DialogResult.OK;
+            Close();
         }
     }
 }

@@ -287,6 +287,41 @@ namespace TrFileTransfer
             return 0; // fallback: let OS assign ephemeral port
         }
 
+        /// <summary>Whether the port can currently be bound, probing TCP and/or UDP as requested.</summary>
+        public static bool IsPortFree(int port, bool tcp, bool udp)
+        {
+            if (tcp)
+            {
+                try
+                {
+                    var listener = new TcpListener(System.Net.IPAddress.Loopback, port);
+                    listener.Start();
+                    listener.Stop();
+                }
+                catch { return false; }
+            }
+            if (udp)
+            {
+                try
+                {
+                    var probe = new UdpClient(port);
+                    probe.Close();
+                }
+                catch { return false; }
+            }
+            return true;
+        }
+
+        /// <summary>First free port scanning upward from start (inclusive); 0 when none in range.</summary>
+        public static int FindFreePortFrom(int start, bool tcp, bool udp)
+        {
+            for (int p = start; p < start + 128; p++)
+            {
+                if (IsPortFree(p, tcp, udp)) return p;
+            }
+            return 0;
+        }
+
         /// <summary>Returns a unique file/directory path by appending _1, _2, etc. when collisions exist.</summary>
         public static string GetUniqueSavePath(string directory, string name)
         {
