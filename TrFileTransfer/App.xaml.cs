@@ -18,6 +18,11 @@ namespace TrFileTransfer
 
         protected override void OnStartup(StartupEventArgs e)
         {
+            // Repaint the token brushes before any window parses (Config is loaded
+            // again — harmlessly — inside MainWindow)
+            Config.Load();
+            ThemeManager.Initialize();
+
             DispatcherUnhandledException += (s, args) =>
             {
                 HandleUiException(args.Exception);

@@ -39,6 +39,11 @@
     <SolidColorBrush x:Key="Brush.Danger" Color="#FFF87171"/>
     <SolidColorBrush x:Key="Brush.Success" Color="#FF34D399"/>
 
+    <!-- Scrollbars -->
+    <SolidColorBrush x:Key="Brush.ScrollThumb" Color="#FF3A404D"/>
+    <SolidColorBrush x:Key="Brush.ScrollThumbHover" Color="#FF4A5262"/>
+    <SolidColorBrush x:Key="Brush.ScrollThumbDrag" Color="#FF5A6375"/>
+
     <!-- Typography -->
     <FontFamily x:Key="Font.Main">Segoe UI Variable Display, Segoe UI, Microsoft YaHei UI</FontFamily>
     <FontFamily x:Key="Font.Mono">Cascadia Mono, Consolas, Microsoft YaHei UI</FontFamily>

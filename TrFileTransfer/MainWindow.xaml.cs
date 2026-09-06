@@ -91,6 +91,7 @@ namespace TrFileTransfer
             InitializeComponent();
             SetupTrayIcon();
             SetupSectionIcons();
+            UpdateThemeButton();
             WireFieldValidation();
             LoadKnownDevices();
 
@@ -254,6 +255,31 @@ namespace TrFileTransfer
             dlg.ShowDialog();
         }
 
+        // ==================== Theme toggle ====================
+
+        private void BtnTheme_Click(object sender, RoutedEventArgs e)
+        {
+            ThemeManager.Toggle();
+            UpdateThemeButton();
+        }
+
+        /// <summary>Sun glyph in dark mode (switch to light), moon in light mode;
+        /// text fallback on systems without an icon font.</summary>
+        private void UpdateThemeButton()
+        {
+            if (IconFont.Available)
+            {
+                _btnTheme.Content = (ThemeManager.IsDark ? '\uE706' : '\uE708').ToString();
+                _btnTheme.FontFamily = (FontFamily)FindResource("Font.Icon");
+                _btnTheme.FontSize = 14;
+            }
+            else
+            {
+                _btnTheme.Content = L.ThemeBtn(ThemeManager.IsDark);
+            }
+            _btnTheme.ToolTip = L.ThemeToggleTip;
+        }
+
         /// <summary>Marshals the action onto the UI thread; silently dropped once the
         /// window is gone or the dispatcher is shutting down.</summary>
         private void RunOnUi(Action a)
@@ -396,6 +422,7 @@ namespace TrFileTransfer
             _btnExportLog.Content = L.ExportLog;
             _btnCheckUpdate.Content = L.UpdBtn;
             _btnHelp.Content = L.HelpBtn;
+            UpdateThemeButton();
             _chkPairing.Content = L.PairingLabel;
             _btnSendText.Content = L.SendTextBtn;
             _btnFanOut.Content = L.FanOutBtn;
