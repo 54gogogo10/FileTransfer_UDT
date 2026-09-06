@@ -67,7 +67,7 @@
                             <ColumnDefinition Width="Auto"/>
                             <ColumnDefinition Width="*"/>
                             <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="62"/>
+                            <ColumnDefinition Width="70"/>
                             <ColumnDefinition Width="Auto"/>
                             <ColumnDefinition Width="Auto"/>
                         </Grid.ColumnDefinitions>
@@ -120,7 +120,7 @@
                     <!-- Services: HTTP share | pairing -->
                     <StackPanel Grid.Row="4" Orientation="Horizontal">
                         <TextBlock x:Name="_lblHttpPort" Style="{StaticResource FieldLabel}" Margin="0,0,6,0"/>
-                        <local:NumericBox x:Name="_numHttpPort" Width="74" Min="1" Max="65535" VerticalAlignment="Center"/>
+                        <local:NumericBox x:Name="_numHttpPort" Width="84" Min="1" Max="65535" VerticalAlignment="Center"/>
                         <Button x:Name="_btnHttpShare" Style="{StaticResource BtnSecondary}" MinWidth="76"
                                 Margin="8,0,0,0" Click="BtnHttpShare_Click"/>
                         <Rectangle Width="1" Height="18" RadiusX="0.5" RadiusY="0.5"
@@ -161,7 +161,7 @@
                             <ColumnDefinition Width="Auto"/>
                             <ColumnDefinition Width="*"/>
                             <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="62"/>
+                            <ColumnDefinition Width="70"/>
                             <ColumnDefinition Width="Auto"/>
                             <ColumnDefinition Width="Auto"/>
                             <ColumnDefinition Width="Auto"/>
@@ -209,23 +209,23 @@
 
                     <!-- Send parameters: compact field groups (label above control) -->
                     <StackPanel Grid.Row="4" Orientation="Horizontal" Margin="0,0,0,8">
-                        <StackPanel Orientation="Vertical" Margin="0,0,14,0">
+                        <StackPanel Orientation="Vertical" Margin="0,0,10,0">
                             <TextBlock x:Name="_lblSrcPort" Style="{StaticResource FieldLabelSmall}"/>
-                            <local:NumericBox x:Name="_numSrcPort" Width="70" Min="0" Max="65535" Margin="0,4,0,0"/>
+                            <local:NumericBox x:Name="_numSrcPort" Width="84" Min="0" Max="65535" Margin="0,4,0,0"/>
                         </StackPanel>
-                        <StackPanel Orientation="Vertical" Margin="0,0,14,0">
+                        <StackPanel Orientation="Vertical" Margin="0,0,10,0">
                             <TextBlock x:Name="_lblConcurrency" Style="{StaticResource FieldLabelSmall}"/>
-                            <local:NumericBox x:Name="_numConcurrency" Width="62" Min="1" Max="8" Margin="0,4,0,0"/>
+                            <local:NumericBox x:Name="_numConcurrency" Width="70" Min="1" Max="8" Margin="0,4,0,0"/>
                         </StackPanel>
                         <StackPanel Orientation="Vertical" Margin="0,0,0,0">
                             <TextBlock x:Name="_lblSpeed" Style="{StaticResource FieldLabelSmall}"/>
-                            <local:NumericBox x:Name="_numSpeed" Width="86" Min="0" Max="1048576" Margin="0,4,0,0"/>
+                            <local:NumericBox x:Name="_numSpeed" Width="100" Min="0" Max="1048576" Margin="0,4,0,0"/>
                         </StackPanel>
                         <Rectangle Width="1" Height="30" RadiusX="0.5" RadiusY="0.5"
                                    Fill="{StaticResource Brush.CardBorder}" VerticalAlignment="Center" Margin="12,0"/>
                         <StackPanel Orientation="Vertical">
                             <TextBlock x:Name="_lblPairingC" Style="{StaticResource FieldLabelSmall}"/>
-                            <TextBox x:Name="_txtPairing" Width="90" MaxLength="12" Style="{StaticResource TxtInput}"
+                            <TextBox x:Name="_txtPairing" Width="96" MaxLength="12" Style="{StaticResource TxtInput}"
                                      Margin="0,4,0,0"/>
                         </StackPanel>
                     </StackPanel>

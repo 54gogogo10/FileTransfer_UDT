@@ -58,7 +58,7 @@ namespace TrFileTransfer
                 Min = 0,
                 Max = 5,
                 Value = Math.Max(0, Math.Min(5, Config.GetInt("QueueRetries", 1))),
-                Width = 64
+                Width = 70
             };
 
             var leftRow = new StackPanel { Orientation = Orientation.Horizontal };
