@@ -177,6 +177,10 @@
                         <Trigger Property="IsEnabled" Value="False">
                             <Setter TargetName="bd" Property="Opacity" Value="0.45"/>
                         </Trigger>
+                        <!-- Set Tag="invalid" from code to flag a failing field (red border wins over focus/hover) -->
+                        <Trigger Property="Tag" Value="invalid">
+                            <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource Brush.Danger}"/>
+                        </Trigger>
                     </ControlTemplate.Triggers>
                 </ControlTemplate>
             </Setter.Value>

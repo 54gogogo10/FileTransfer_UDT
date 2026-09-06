@@ -33,7 +33,16 @@ namespace TrFileTransfer
 
             _txtUrl = DlgUi.Input();
             _txtUrl.Text = Config.Get("UpdateUrl", MainWindow.DefaultUpdateUrl);
-            _txtUrl.TextChanged += (s, e) => Config.Set("UpdateUrl", _txtUrl.Text.Trim());
+            _txtUrl.TextChanged += (s, e) =>
+            {
+                // Live format check: the updater itself rejects bad URLs at check time
+                string u = _txtUrl.Text.Trim();
+                bool ok = u.Length == 0
+                    || u.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                    || u.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+                _txtUrl.Tag = ok ? null : "invalid";
+                _txtUrl.ToolTip = ok ? null : L.FieldUrlInvalid;
+            };
 
             _chkAuto = new CheckBox
             {

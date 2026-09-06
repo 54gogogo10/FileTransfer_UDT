@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
@@ -9,6 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Threading;
@@ -89,6 +91,7 @@ namespace TrFileTransfer
             InitializeComponent();
             SetupTrayIcon();
             SetupSectionIcons();
+            WireFieldValidation();
             LoadKnownDevices();
 
             Application.Current.SessionEnding += (s, e) => { _trayExit = true; };
@@ -139,6 +142,116 @@ namespace TrFileTransfer
                 tb.Text = glyph.ToString();
                 tb.Visibility = Visibility.Visible;
             }
+        }
+
+        // ==================== Field validation ====================
+        //
+        // Live format validation for the text fields: a failing field gets a red
+        // border (TxtInput template reacts to Tag="invalid") plus a ToolTip. Empty
+        // fields stay neutral — the existing click-time checks remain the hard gate.
+
+        private static readonly char[] InvalidPathChars = Path.GetInvalidPathChars();
+
+        private void WireFieldValidation()
+        {
+            foreach (var box in new[] { _txtPortS, _txtPortC })
+            {
+                box.PreviewTextInput += BlockNonDigits;
+                box.TextChanged += (s, e) => ValidatePortBox((TextBox)s);
+            }
+            _txtServerIp.PreviewTextInput += BlockIpChars;
+            _txtServerIp.TextChanged += (s, e) => ValidateIpLive(_txtServerIp);
+            _txtServerIp.LostFocus += (s, e) => ValidateIpStrict(_txtServerIp);
+            _txtPairing.PreviewTextInput += BlockNonDigits;
+            _txtPairing.TextChanged += (s, e) => ValidateDigitsOnly(_txtPairing);
+            _txtSaveDir.TextChanged += (s, e) => ValidatePathChars(_txtSaveDir);
+            _txtFile.TextChanged += (s, e) => ValidatePathChars(_txtFile);
+        }
+
+        private static void BlockNonDigits(object sender, TextCompositionEventArgs e)
+        {
+            e.Handled = e.Text.Any(c => !char.IsDigit(c));
+        }
+
+        private static void BlockIpChars(object sender, TextCompositionEventArgs e)
+        {
+            e.Handled = e.Text.Any(c => !char.IsDigit(c) && c != '.');
+        }
+
+        /// <summary>Flags (or clears) the red invalid state on a field.</summary>
+        private static void SetFieldError(TextBox box, bool invalid, string message)
+        {
+            box.Tag = invalid ? "invalid" : null;
+            box.ToolTip = invalid ? message : null;
+        }
+
+        private static void ValidatePortBox(TextBox box)
+        {
+            string t = box.Text.Trim();
+            bool ok = t.Length == 0 || (int.TryParse(t, out int v) && v >= 1 && v <= 65535);
+            SetFieldError(box, !ok, ok ? null : L.InvalidPort);
+        }
+
+        private static void ValidateIpLive(TextBox box)
+        {
+            string t = box.Text.Trim();
+            if (t.Length == 0)
+            {
+                SetFieldError(box, false, null);
+                return;
+            }
+            if (t.Any(c => !char.IsDigit(c) && c != '.'))
+            {
+                SetFieldError(box, true, L.FieldIpInvalid);
+                return;
+            }
+            // While typing, only judge complete-looking addresses (3+ dots)
+            bool ok = t.Count(c => c == '.') < 3 || IPAddress.TryParse(t, out IPAddress probe);
+            SetFieldError(box, !ok, ok ? null : L.FieldIpInvalid);
+        }
+
+        private static bool IsValidIpv4(string t)
+        {
+            return IPAddress.TryParse(t, out IPAddress ip) && ip.AddressFamily == AddressFamily.InterNetwork;
+        }
+
+        private static void ValidateIpStrict(TextBox box)
+        {
+            string t = box.Text.Trim();
+            if (t.Length == 0) return;
+            SetFieldError(box, !IsValidIpv4(t), L.FieldIpInvalid);
+        }
+
+        private static void ValidateDigitsOnly(TextBox box)
+        {
+            bool ok = box.Text.All(char.IsDigit);
+            SetFieldError(box, !ok, ok ? null : L.FieldDigitsOnly);
+        }
+
+        private static void ValidatePathChars(TextBox box)
+        {
+            bool ok = box.Text.IndexOfAny(InvalidPathChars) < 0;
+            SetFieldError(box, !ok, ok ? null : L.FieldPathInvalid);
+        }
+
+        /// <summary>True when the client-panel address is a usable IPv4 (shows the red
+        /// field state as a side effect). Empty stays neutral here — callers that
+        /// require a value keep their own empty checks.</summary>
+        private bool ClientIpIsValid()
+        {
+            string t = _txtServerIp.Text.Trim();
+            if (t.Length == 0) return true;
+            bool ok = IsValidIpv4(t);
+            SetFieldError(_txtServerIp, !ok, ok ? null : L.FieldIpInvalid);
+            return ok;
+        }
+
+        // ==================== Help ====================
+
+        private void BtnHelp_Click(object sender, RoutedEventArgs e)
+        {
+            var dlg = new HelpDialog { Owner = this };
+            dlg.ShowDialog();
         }
 
         /// <summary>Marshals the action onto the UI thread; silently dropped once the
@@ -282,6 +395,7 @@ namespace TrFileTransfer
             _hdrLog.Text = L.LogGroup;
             _btnExportLog.Content = L.ExportLog;
             _btnCheckUpdate.Content = L.UpdBtn;
+            _btnHelp.Content = L.HelpBtn;
             _chkPairing.Content = L.PairingLabel;
             _btnSendText.Content = L.SendTextBtn;
             _btnFanOut.Content = L.FanOutBtn;
@@ -709,6 +823,8 @@ namespace TrFileTransfer
                 return null;
             if (string.IsNullOrWhiteSpace(_txtServerIp.Text.Trim()))
                 return null;
+            if (!IsValidIpv4(_txtServerIp.Text.Trim()))
+                return null;
             return new QueuedTask
             {
                 FilePath = path,
@@ -876,9 +992,11 @@ namespace TrFileTransfer
 
             string ip = _txtServerIp.Text.Trim();
             int port;
-            if (ip.Length == 0 || !int.TryParse(_txtPortC.Text.Trim(), out port) || port < 1 || port > 65535)
+            if (ip.Length == 0 || !int.TryParse(_txtPortC.Text.Trim(), out port) || port < 1 || port > 65535
+                || !ClientIpIsValid())
             {
-                MessageBox.Show(this, L.InvalidPort, L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
+                MessageBox.Show(this, ip.Length == 0 || ClientIpIsValid() ? L.InvalidPort : L.FieldIpInvalid,
+                    L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
                 return;
             }
 
@@ -1171,6 +1289,11 @@ namespace TrFileTransfer
             if (string.IsNullOrWhiteSpace(ip))
             {
                 MessageBox.Show(this, L.EnterServerIP, L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+            if (!ClientIpIsValid())
+            {
+                MessageBox.Show(this, L.FieldIpInvalid, L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
                 return;
             }
 

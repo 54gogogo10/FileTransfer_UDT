@@ -598,5 +598,50 @@ namespace TrFileTransfer
                     "Or run this command as administrator (select & copy below):\n{0}", cmd);
         }
 
+        public static string HelpBtn { get { return IsChinese ? "使用说明" : "Guide"; } }
+        public static string FieldIpInvalid { get { return IsChinese ? "IP 格式不正确（需要 IPv4 地址）" : "Invalid IP format (IPv4 expected)"; } }
+        public static string FieldPathInvalid { get { return IsChinese ? "路径包含非法字符" : "Path contains invalid characters"; } }
+        public static string FieldDigitsOnly { get { return IsChinese ? "只能输入数字" : "Digits only"; } }
+        public static string FieldUrlInvalid { get { return IsChinese ? "地址必须以 http:// 或 https:// 开头" : "Address must start with http:// or https://"; } }
+
+        public static string HelpText()
+        {
+            return IsChinese
+                ? "【接收（服务器）】\n" +
+                  "1. 选择\"保存到\"目录，勾选 TCP 和/或 UDT，点击\"启动\"。\n" +
+                  "2. 勾选\"配对码\"后，发送方必须输入相同的 6 位码才能连接。\n" +
+                  "3. \"HTTP 共享\"把保存目录变成网页：手机浏览器可直接浏览、下载与上传。\n\n" +
+                  "【发送（客户端）】\n" +
+                  "1. 填写对方 IP 与端口；同一台电脑自测填 127.0.0.1。\n" +
+                  "2. 选好文件/文件夹点\"发送文件\"，或直接把文件拖进窗口。\n" +
+                  "3. 大文件可把\"并发\"调到 4-8；\"文件夹模式\"支持整目录发送，\n" +
+                  "   勾选\"同步模式\"则只传输与对方差异的部分。\n\n" +
+                  "【实用功能】\n" +
+                  "· 扫描 —— 自动发现同一局域网内运行本程序的设备\n" +
+                  "· 群发 —— 同一文件同时发给多台设备\n" +
+                  "· 发送队列 —— 批量任务串行发送，失败自动重试\n" +
+                  "· 续传 —— 中断后从断点继续；\"完整校验\"逐字节核对\n" +
+                  "· 监控模式 —— 监视目录，出现新文件自动发送\n" +
+                  "· 发文本 —— 向对方发送一条即时消息\n\n" +
+                  "提示：所有设置自动保存；关闭窗口仅最小化到托盘，\n托盘右键菜单可开机自启、检查更新或真正退出。"
+                : "[Receive (server)]\n" +
+                  "1. Pick the \"Save to\" folder, check TCP and/or UDT, press \"Start\".\n" +
+                  "2. With \"Pairing\" enabled the sender must enter the same 6-digit code.\n" +
+                  "3. \"HTTP Share\" turns the folder into a web page — browse, download and upload from a phone.\n\n" +
+                  "[Send (client)]\n" +
+                  "1. Enter the peer IP and port; use 127.0.0.1 to test on one machine.\n" +
+                  "2. Pick a file/folder and press \"Send\", or just drop files onto the window.\n" +
+                  "3. Raise \"Concurrency\" to 4-8 for large files; \"Folder mode\" sends whole folders and\n" +
+                  "   \"Sync mode\" transfers only the differences.\n\n" +
+                  "[Tools]\n" +
+                  "- Scan: discover devices running this app on the LAN\n" +
+                  "- Fan-out: send one file to many devices at once\n" +
+                  "- Queue: batch tasks sent serially with automatic retries\n" +
+                  "- Resume: continue broken transfers; \"Verify hash\" double-checks bytes\n" +
+                  "- Monitor: watch a folder and auto-send new files\n" +
+                  "- Send text: quick instant message to the peer\n\n" +
+                  "Tips: settings save automatically; closing the window hides to tray —\nuse the tray menu for auto-start, updates or a real exit.";
+        }
+
     }
 }

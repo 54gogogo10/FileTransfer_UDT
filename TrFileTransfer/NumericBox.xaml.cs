@@ -1,6 +1,8 @@
 using System;
+using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 
 namespace TrFileTransfer
 {
@@ -22,6 +24,8 @@ namespace TrFileTransfer
         {
             InitializeComponent();
             Txt.Text = "0";
+            // Digits only at the keyboard; pasted junk is caught by the existing clamp
+            Txt.PreviewTextInput += (s, e) => e.Handled = e.Text.Any(c => !char.IsDigit(c));
         }
 
         public int Min
