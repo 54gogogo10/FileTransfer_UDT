@@ -191,14 +191,14 @@ namespace TrFileTransfer
             }
 
             /// <summary>Registers (enable=true, value = quoted exePath) or removes the entry.
-            /// Setting again with a new path overwrites; disabling when absent is a no-op.</summary>
+            /// Setting again with a new path overwrites; disabling when absent is a no-op.
+            /// CreateSubKey so a missing Run key (fresh profile) is created, not skipped.</summary>
             public static void Set(bool enable, string exePath)
             {
                 try
                 {
-                    using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKey, true))
+                    using (var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RunKey))
                     {
-                        if (key == null) return;
                         if (enable)
                             key.SetValue(ValueName, "\"" + exePath + "\"");
                         else if (key.GetValue(ValueName) != null)
