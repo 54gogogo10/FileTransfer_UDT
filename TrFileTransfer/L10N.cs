@@ -601,6 +601,7 @@ namespace TrFileTransfer
         public static string HelpBtn { get { return IsChinese ? "使用说明" : "Guide"; } }
         public static string FanOutAddBtn { get { return IsChinese ? "添加" : "Add"; } }
         public static string FanOutManualTag { get { return "[手动] " ; } }
+        public static string QueueBatchAdd { get { return IsChinese ? "批量添加" : "Add files"; } }
         public static string FieldIpInvalid { get { return IsChinese ? "IP 格式不正确（需要 IPv4 地址）" : "Invalid IP format (IPv4 expected)"; } }
         public static string FieldPathInvalid { get { return IsChinese ? "路径包含非法字符" : "Path contains invalid characters"; } }
         public static string FieldDigitsOnly { get { return IsChinese ? "只能输入数字" : "Digits only"; } }

@@ -16,7 +16,7 @@ namespace TrFileTransfer
         private readonly Func<QueuedTask, Task<bool>> _executor;
         private readonly List<QueuedTask> _tasks = new List<QueuedTask>();
         private readonly ListBox _list = DlgUi.DarkList();
-        private Button _btnAdd, _btnDelete, _btnClear, _btnStart;
+        private Button _btnAdd, _btnBatch, _btnDelete, _btnClear, _btnStart;
         private NumericBox _numRetries;
         private bool _running;
 
@@ -32,7 +32,7 @@ namespace TrFileTransfer
                 foreach (var t in initial)
                     _tasks.Add(t);
             }
-            DlgUi.Init(this, L.QueueTitle, 680, 420, 600, 340);
+            DlgUi.Init(this, L.QueueTitle, 800, 440, 740, 340);
 
             // Drag files/folders onto the dialog (form or the list filling it) to enqueue
             AllowDrop = true;
@@ -42,12 +42,14 @@ namespace TrFileTransfer
             _list.DragEnter += QueueDialog_DragEnter;
             _list.Drop += QueueDialog_DragDrop;
 
-            _btnAdd = DlgUi.SecondaryMin(L.QueueAdd, 100);
-            _btnDelete = DlgUi.SecondaryMin(L.QueueDelete, 100);
+            _btnAdd = DlgUi.SecondaryMin(L.QueueAdd, 88);
+            _btnBatch = DlgUi.SecondaryMin(L.QueueBatchAdd, 88);
+            _btnDelete = DlgUi.SecondaryMin(L.QueueDelete, 88);
             _btnClear = DlgUi.SecondaryMin(L.QueueClear, 100);
             _btnStart = DlgUi.PrimaryMin(L.QueueStart, 100);
             var btnClose = DlgUi.SecondaryMin(L.CancelBtn, 90);
             _btnAdd.Click += BtnAdd_Click;
+            _btnBatch.Click += BtnBatchAdd_Click;
             _btnDelete.Click += BtnDelete_Click;
             _btnClear.Click += BtnClear_Click;
             _btnStart.Click += BtnStart_Click;
@@ -63,6 +65,8 @@ namespace TrFileTransfer
 
             var leftRow = new StackPanel { Orientation = Orientation.Horizontal };
             leftRow.Children.Add(_btnAdd);
+            _btnBatch.Margin = new Thickness(8, 0, 0, 0);
+            leftRow.Children.Add(_btnBatch);
             _btnDelete.Margin = new Thickness(8, 0, 0, 0);
             leftRow.Children.Add(_btnDelete);
 
@@ -115,6 +119,46 @@ namespace TrFileTransfer
             }
             _tasks.Add(task);
             _list.Items.Add(FormatTask(task));
+        }
+
+        /// <summary>Batch-add: pick several files at once in a multi-select dialog;
+        /// each becomes a queue task using the main panel's current settings.</summary>
+        private void BtnBatchAdd_Click(object sender, RoutedEventArgs e)
+        {
+            if (_running || _captureFor == null) return;
+            var dlg = new Microsoft.Win32.OpenFileDialog
+            {
+                Multiselect = true,
+                Title = L.QueueBatchAdd
+            };
+            // Start where the main panel's current file lives, if any
+            var current = _capture();
+            if (current != null)
+            {
+                string dir = Path.GetDirectoryName(current.FilePath);
+                if (Directory.Exists(dir)) dlg.InitialDirectory = dir;
+            }
+            if (dlg.ShowDialog(this) != true) return;
+
+            int added = 0, skipped = 0;
+            foreach (string path in dlg.FileNames)
+            {
+                if (!File.Exists(path)) { skipped++; continue; }
+                var task = _captureFor(path, false);
+                if (task != null)
+                {
+                    _tasks.Add(task);
+                    _list.Items.Add(FormatTask(task));
+                    added++;
+                }
+                else
+                {
+                    skipped++;
+                }
+            }
+            if (added == 0 && skipped > 0)
+                MessageBox.Show(this, L.DragDropSkipped(skipped), L.QueueTitle,
+                    MessageBoxButton.OK, MessageBoxImage.Information);
         }
 
         private void QueueDialog_DragEnter(object sender, DragEventArgs e)
