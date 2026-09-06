@@ -1,0 +1,26 @@
+<UserControl x:Class="TrFileTransfer.NumericBox"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <TextBox x:Name="Txt" Style="{StaticResource TxtInput}" Padding="7,3"
+                 VerticalContentAlignment="Center"
+                 TextChanged="Txt_TextChanged"
+                 LostFocus="Txt_LostFocus"/>
+        <StackPanel Grid.Column="1" Margin="3,0,0,0" Orientation="Vertical">
+            <RepeatButton x:Name="Up" Style="{StaticResource SpinBtn}" Width="18" Height="13"
+                          Delay="400" Interval="80" Click="Up_Click">
+                <Path Data="M0,3 L3.5,0 7,3" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=RepeatButton}}"
+                      StrokeThickness="1.5" Stretch="None"/>
+            </RepeatButton>
+            <RepeatButton x:Name="Down" Style="{StaticResource SpinBtn}" Width="18" Height="13"
+                          Margin="0,2,0,0" Delay="400" Interval="80" Click="Down_Click">
+                <Path Data="M0,0 L3.5,3 7,0" Stroke="{Binding Foreground, RelativeSource={RelativeSource AncestorType=RepeatButton}}"
+                      StrokeThickness="1.5" Stretch="None"/>
+            </RepeatButton>
+        </StackPanel>
+    </Grid>
+</UserControl>

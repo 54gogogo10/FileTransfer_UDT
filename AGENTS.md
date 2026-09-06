@@ -10,7 +10,7 @@ This file provides guidance to AI coding agents (Codex / ZCode / Claude Code) wh
 cd TrFileTransfer && build.bat
 ```
 
-使用 .NET Framework 4.x 自带的 `csc.exe` 编译。引用：`System.dll`、`System.Core.dll`、`System.Windows.Forms.dll`、`System.Drawing.dll`。`udt.dll` 和 `libmcfgthread-2.dll` 通过 `/resource` 嵌入 exe。
+使用 .NET SDK（`dotnet build`，需 SDK 8+）编译 SDK 风格 `TrFileTransfer.csproj`：目标 `net48`（WPF），输出 `bin\Release\net48\TrFileTransfer.exe`。csproj 经 `Microsoft.NETFramework.ReferenceAssemblies` 包（`PrivateAssets=all`，仅编译期、不进运行时）解决本机/CI 无 4.8 targeting pack 的问题；`udt.dll` 和 `libmcfgthread-2.dll` 经 `<EmbeddedResource LogicalName="TrFileTransfer.udt.dll">` 嵌入 exe（**LogicalName 必须与 `TransferUdt.cs` 运行时查找的资源名精确一致**，否则 UDT 静默降级为依赖 exe 旁 DLL）；托盘 `NotifyIcon`/`FolderBrowserDialog`/图标仍引用 System.Windows.Forms/System.Drawing 程序集（net48 WPF 无零依赖替代，仅此两处借用）。
 
 **UDT DLL 编译**（如更新原生代码）：需 MinGW-w64，在 `udt-sdk\udt4\src\` 下执行：
 ```
@@ -22,7 +22,7 @@ g++ -DWIN32 -DNDEBUG -DUDT_EXPORTS -O2 -fno-strict-aliasing -Wall \
 g++ -shared -o udt.dll *.o -lws2_32 -static-libgcc -static-libstdc++
 ```
 
-编译器为 C# 5（内置 `csc.exe` 支持的最高语言版本），生成的 exe 运行在 .NET Framework 4.5+（推荐 4.6.1）。避免 C# 6+ 语法：禁止字符串插值（`$`）、禁止表达式体成员、禁止空条件运算符（`?.`）、禁止异常过滤器（`when`）、禁止数字分隔符。
+**C# 版本边界**：主程序经 Roslyn 以 `LangVersion=latest` 编译，UI 层可用现代 C# 语法；但 `Tests\build.bat` 仍用 .NET 4 自带老 `csc.exe`（C# 5）编译 **14 个逻辑文件**（Config/Shared/L10N/WireProtocol/ConcurrentTransfer/TransferServer/TransferUdt/TransferClient/DeviceDiscovery/ResumeState/ServerResumeStore/FolderResumeState/Updater/HttpShare）——这 14 个文件必须保持 C# 5 语法（禁止字符串插值（`$`）、表达式体成员、空条件运算符（`?.`）、异常过滤器（`when`）、数字分隔符），且不得新增对 System.Windows.Forms/System.Drawing 的引用（测试构建未引用这两个程序集）。新 UI 代码（MainWindow/App/Dialogs/Themes 等）不受 C# 5 限制。生成的 exe 运行在 .NET Framework 4.8+。
 
 ## 测试
 
@@ -45,9 +45,14 @@ TrFileTransfer.Tests.exe
 
 ## 架构
 
-十六个源文件编译为单个 WinForms exe：
-- **Program.cs** — 入口。`[STAThread]` Main 启动 `MainForm`；命名 `Mutex` 保证单实例（二次启动经命名 `EventWaitHandle` 唤醒已有窗口后退出）；`Application.ThreadException` + `AppDomain.UnhandledException` 兜底写入 `%AppData%\TrFileTransfer\logs\crash.log` 并弹友好提示。
-- **MainForm.cs** — GUI。窗口可缩放（TableLayoutPanel 根布局：表头/服务器/客户端为固定行，进度区 SplitContainer 左右分栏与日志区平分剩余空间；进度卡片宽度经 `SyncCardWidths` 随面板自适应）。**卡片式视觉**：`MakeSection` 生成白底卡片（浅灰页面底 #EEF1F5）+ 蓝色竖条加粗节标题（替代 GroupBox）；调色板集中在 `UiStyle`（Accent #2563EB 主按钮、白底描边次按钮、文字/边框/悬停色阶），全部对话框套用。**按钮布局**：服务器面板 4 行（连接/目录/主操作左+管理操作右对齐/服务行：HTTP 端口+共享│配对码），客户端面板参数与操作分离（参数行：源端口/并发/限速│配对码；工具行：扫描/群发/队列/续传│发文本）；日志为深色控制台风格（Consolas 9f，#1E1E1E）。服务器和客户端面板同时显示。协议选择（TCP/UDT）、服务器绑定地址下拉框。**并发控制**：`_numConcurrency`（1-8）。文件夹/监控模式复选框、**完整校验复选框**（续传时启用 0x03 全文件哈希）、**限速输入**（KB/s，0=不限，Config `SpeedLimit`）。动态进度卡片（左右两个 FlowLayoutPanel，TCP/UDT 独立字典按 IPEndPoint 区分，完成 3 秒后移除）。语言下拉框、日志上限 500 条、进度节流 100ms。`WireClientEvents`/`WireUdtClientEvents`/`WireConcurrentEvents` 辅助方法。**发送队列**（`QueueDialog` 串行批量执行，复用抽取的 `StartTransfer` 公共方法；失败自动重试 N 次——Config `QueueRetries`，0-5——列表项显示▶执行中/✓✗结果与耗时）。**续传列表**（`ResumeDialog` 同时列出单文件 `ResumeState` 与文件夹 `FolderResumeState` 会话，中括号 `[文件夹]` 前缀区分；选中后填充客户端面板并设 `_pendingResumeSession`，`StartTransfer` 按 isFolder 分派到 0x03/0x04）。**设备发现**（"扫描"按钮 → `DiscoveryDialog`，服务器启动时 `DiscoveryServer` 在 UDP 端口广播响应）。**完成通知**（托盘 `NotifyIcon` BalloonTip + 提示音，Config `NotifyEnabled`/`NotifySound`）。**接收文件管理**（"打开目录"/"最近接收"按钮 + `OnFileReceived` 事件 + 按日期归档 Config `AutoArchive`）。`StartTransfer` 内部 try/catch 返回 bool，失败不再冒泡崩溃。**拖放批量入队**（拖多个文件/文件夹时逐项入队并直接打开 `QueueDialog`，单个仍填充路径框；`CaptureQueuedTaskFor(path, isFolder)` 从 `CaptureQueuedTask` 抽取复用）。**日志持久化**（`AddLog` 的每条日志同时经 `AppendLogFile` 写入 `%AppData%\TrFileTransfer\logs\yyyy-MM-dd.txt`，失败静默；保留 30 天，每日首次写日志时清理过期文件）。**设备记忆**（传输成功后 `RememberDevice` 记入 Config `KnownDevices`——普通发送与监控模式均记录——格式 `Name|Ip|Port|flags`（分号分隔多条，flags 位1=TCP 位2=UDT），上限 10 条；`DiscoveryDialog` 将在线结果按 Ip+Port 合并进已知列表去重显示）。**托盘常驻**（最小化时 `Hide()`；用户关闭窗口=取消关闭+`SaveConfig`+隐藏+BalloonTip；仅托盘菜单"退出"设置 `_trayExit` 后真正退出，退出时释放 `NotifyIcon` 防止托盘图标残留）。**自动升级**（表头"检查更新"按钮 + 托盘菜单项 → `UpdateDialog`；启动后延迟 3 秒后台静默检查；`ApplyUpdateAndRestart` 经 `Updater.Apply` 换 exe 后重启，详见 Updater.cs 条目）。**配对码**（服务器面板"配对码"复选框 + 每次启动会话随机生成的 6 位码显示；客户端"配对码"输入框经 Config `PairingCode` 持久化，发送前先走 0x05 认证；TCP/UDT/并发分块/监控模式全部路径贯通）。**文本互传**（客户端"发文本"按钮 → `TextSendDialog` 多行输入 → 0x06 发送；服务器端 `OnTextReceived` → 日志 + BalloonTip + 非模态 `TextReceivedDialog`（复制按钮，用户关闭时仅隐藏以累积消息，随主窗口关闭）。**同步模式**（文件夹模式子选项"同步模式"复选框，Config `SyncMode`；勾选后文件夹发送走 0x04 + `DeriveSyncSession` 稳定会话 + keepState，重复发送只传与服务器差异的部分——增量备份语义，本地删除的文件服务器端保留）。**开机自启**（托盘菜单"开机自启"勾选项，`AutoStart` 写 HKCU Run 键，无需管理员）。**跳过此版本**（更新对话框按钮，Config `SkippedVersion`；启动静默检查对 ≤ 该版本的清单不再提示，手动检查不受影响）。**发现配对徽标**（扫描对话框对广播 bit2 显示"[需配对]"，点"使用"后日志提示并聚焦配对码框）。**HTTP 共享**（服务器面板"HTTP 共享"按钮开/停，共享保存目录；配对开启时复用配对码作网页访问码，URL 记入日志；随主窗口关闭停止）。**群发**（客户端"群发"按钮 → `FanOutDialog` 复选多选已知+在线设备 → 并行对每台目标起独立客户端（按面板 TCP/UDT 选择、限速、配对码；忽略源端口），每目标一张进度卡片，完成计数后汇总 `{ok}/{total}` 并通知，取消按钮可整体取消）。**端口占用换口**（启动服务器前预检端口（按所选协议探测 TCP/UDP，`Utils.IsPortFree/FindFreePortFrom`），被占时询问改用其后第一个可用端口）。**防火墙提示**（首次成功启动服务器展示一次（Config `FirewallHintShown`）netsh 放行命令说明，复用 `TextReceivedDialog` 的 title 重载）。
+逻辑层 14 个源文件 + WPF UI 层编译为单个 exe（GUI 已从 WinForms 迁移到 WPF，行为 1:1 移植，传输逻辑零改动）：
+- **App.xaml / App.xaml.cs + AssemblyInfo.cs** — 入口。`OnStartup` 命名 `Mutex` 保证单实例（二次启动经命名 `EventWaitHandle` 唤醒已有窗口后退出）；`DispatcherUnhandledException` + `AppDomain.UnhandledException` 兜底写入 `%AppData%\TrFileTransfer\logs\crash.log` 并弹友好提示；`App.ExePath` 供 AutoStart/Updater/防火墙提示取 exe 路径；`ShutdownMode=OnMainWindowClose`。程序集属性（版本 2.7.0.0，`Updater.CurrentVersion` 读取）在 `AssemblyInfo.cs`（csproj `GenerateAssemblyInfo=false` 避免与源内 attribute 冲突）。
+- **MainWindow.xaml / MainWindow.xaml.cs** — GUI（原 MainForm 的 WPF 1:1 移植；x:Name 自动生成字段，控件事件在 XAML 绑定/构造函数绑定）。窗口可缩放（Grid 根布局：表头/双卡片行固定，进度区左右分栏与日志区平分剩余空间）。**深色主题**：色板 token 集中在 `Themes/Tokens.xaml`（页面底 #17191F、卡片 #1F232C、Accent #2563EB 主按钮；未来加浅色主题只需换 token），控件模板在 `Themes/Controls.xaml`；Win11 启用 DWM 圆角+深色标题栏+Mica 背景（`UiChrome`，属性不支持时静默回退纯色，Win10/Win7 自动降级），分区标题带 Segoe 图标 glyph（`IconFont` 检测到无图标字体如 Win7 时整体隐藏）。**按钮布局**：服务器与客户端两张卡片并排（服务器：绑定地址/端口/协议、保存目录、启动/停止+打开目录/最近、HTTP 端口+共享│配对码；客户端：IP/端口/协议/发送、路径/浏览/取消、选项复选行、参数字段组（标签在输入框上方：源端口/并发/限速│配对码）、工具行：扫描/群发/队列/续传│发文本）；日志为深色控制台（`Font.Mono`：Cascadia Mono→Consolas）。服务器和客户端面板同时显示。协议选择（TCP/UDT）、服务器绑定地址下拉框。**并发控制**：`_numConcurrency`（1-8）。文件夹/监控模式复选框、**完整校验复选框**（续传时启用 0x03 全文件哈希）、**限速输入**（KB/s，0=不限，Config `SpeedLimit`）。动态进度卡片（左右两个 StackPanel，TCP/UDT 独立字典按 IPEndPoint 区分，完成 3 秒后经 DispatcherTimer 移除；卡片淡入 + 进度条 150ms 平滑动画，进度节流 100ms）。语言下拉框、日志上限 500 条、进度节流 100ms。`WireClientEvents`/`WireUdtClientEvents`/`WireConcurrentEvents` 辅助方法。**发送队列**（`QueueDialog` 串行批量执行，复用抽取的 `StartTransfer` 公共方法；失败自动重试 N 次——Config `QueueRetries`，0-5——列表项显示▶执行中/✓✗结果与耗时）。**续传列表**（`ResumeDialog` 同时列出单文件 `ResumeState` 与文件夹 `FolderResumeState` 会话，中括号 `[文件夹]` 前缀区分；选中后填充客户端面板并设 `_pendingResumeSession`，`StartTransfer` 按 isFolder 分派到 0x03/0x04）。**设备发现**（"扫描"按钮 → `DiscoveryDialog`，服务器启动时 `DiscoveryServer` 在 UDP 端口广播响应）。**完成通知**（托盘 `NotifyIcon` BalloonTip + 提示音，Config `NotifyEnabled`/`NotifySound`）。**接收文件管理**（"打开目录"/"最近接收"按钮 + `OnFileReceived` 事件 + 按日期归档 Config `AutoArchive`）。`StartTransfer` 内部 try/catch 返回 bool，失败不再冒泡崩溃。**拖放批量入队**（拖多个文件/文件夹时逐项入队并直接打开 `QueueDialog`，单个仍填充路径框；`CaptureQueuedTaskFor(path, isFolder)` 从 `CaptureQueuedTask` 抽取复用）。**日志持久化**（`AddLog` 的每条日志同时经 `AppendLogFile` 写入 `%AppData%\TrFileTransfer\logs\yyyy-MM-dd.txt`，失败静默；保留 30 天，每日首次写日志时清理过期文件）。**设备记忆**（传输成功后 `RememberDevice` 记入 Config `KnownDevices`——普通发送与监控模式均记录——格式 `Name|Ip|Port|flags`（分号分隔多条，flags 位1=TCP 位2=UDT），上限 10 条；`DiscoveryDialog` 将在线结果按 Ip+Port 合并进已知列表去重显示）。**托盘常驻**（最小化时 `Hide()`；用户关闭窗口=取消关闭+`SaveConfig`+隐藏+BalloonTip；仅托盘菜单"退出"设置 `_trayExit` 后真正退出，退出时释放 `NotifyIcon` 防止托盘图标残留）。**自动升级**（表头"检查更新"按钮 + 托盘菜单项 → `UpdateDialog`；启动后延迟 3 秒后台静默检查；`ApplyUpdateAndRestart` 经 `Updater.Apply` 换 exe 后重启，详见 Updater.cs 条目）。**配对码**（服务器面板"配对码"复选框 + 每次启动会话随机生成的 6 位码显示；客户端"配对码"输入框经 Config `PairingCode` 持久化，发送前先走 0x05 认证；TCP/UDT/并发分块/监控模式全部路径贯通）。**文本互传**（客户端"发文本"按钮 → `TextSendDialog` 多行输入 → 0x06 发送；服务器端 `OnTextReceived` → 日志 + BalloonTip + 非模态 `TextReceivedDialog`（复制按钮，用户关闭时仅隐藏以累积消息，随主窗口关闭）。**同步模式**（文件夹模式子选项"同步模式"复选框，Config `SyncMode`；勾选后文件夹发送走 0x04 + `DeriveSyncSession` 稳定会话 + keepState，重复发送只传与服务器差异的部分——增量备份语义，本地删除的文件服务器端保留）。**开机自启**（托盘菜单"开机自启"勾选项，`AutoStart` 写 HKCU Run 键，无需管理员）。**跳过此版本**（更新对话框按钮，Config `SkippedVersion`；启动静默检查对 ≤ 该版本的清单不再提示，手动检查不受影响）。**发现配对徽标**（扫描对话框对广播 bit2 显示"[需配对]"，点"使用"后日志提示并聚焦配对码框）。**HTTP 共享**（服务器面板"HTTP 共享"按钮开/停，共享保存目录；配对开启时复用配对码作网页访问码，URL 记入日志；随主窗口关闭停止）。**群发**（客户端"群发"按钮 → `FanOutDialog` 复选多选已知+在线设备 → 并行对每台目标起独立客户端（按面板 TCP/UDT 选择、限速、配对码；忽略源端口），每目标一张进度卡片，完成计数后汇总 `{ok}/{total}` 并通知，取消按钮可整体取消）。**端口占用换口**（启动服务器前预检端口（按所选协议探测 TCP/UDP，`Utils.IsPortFree/FindFreePortFrom`），被占时询问改用其后第一个可用端口）。**防火墙提示**（首次成功启动服务器展示一次（Config `FirewallHintShown`）netsh 放行命令说明，复用 `TextReceivedDialog` 的 title 重载）。
+- **Themes/Tokens.xaml + Themes/Controls.xaml** — 深色主题 token（色板/字体族 Font.Main/Font.Mono/Font.Icon）与全套控件样式模板（BtnPrimary/BtnSecondary/BtnDanger、TxtInput、CmbInput、ChkBox、RdoBox、BarModern、ListDark/LogList、细深色 ScrollBar）。改配色只动 Tokens.xaml。
+- **Dialogs/*.cs** — 8 个对话框（Resume/Queue/Discovery/RecentFiles/Update/TextSend/TextReceived/FanOut），代码构建（与原 WinForms 对话框结构对应）并复用 Themes 样式，`DlgUi` 提供窗口初始化（尺寸钳制/深色 chrome）与控件工厂。行为与原版一致：对话框间传数据对象（不再解析格式化字符串）、Discovery/FanOut 分组行用禁用容器而非 Ip=null 占位、TextReceivedDialog 用户关闭仅隐藏、QueueDialog 底部用 DockPanel 防窄窗重叠。
+- **NumericBox.xaml / NumericBox.xaml.cs** — 数值输入控件（WPF 无内建 NumericUpDown 的替代）：Min/Max 钳制 + 上下 spinner，Value 与文本双向同步。
+- **UiChrome.cs / IconFont.cs** — DWM 窗口效果（深色标题栏/圆角/Mica，逐属性静默降级）与 Segoe 图标字体检测（Fluent Icons/MDL2 缺失时隐藏 glyph）。
+- **QueuedTask.cs** — 队列任务 POCO（从原 MainForm.cs 摘出，字段与 `DisplayName` 不变）。
 - **WireProtocol.cs** — **共享线协议核心**（0x00–0x06 全部逻辑唯一实现）。`IWireStream` 统一精确读/写字节流（`TcpWireStream` 包 `NetworkStream`，`UdtWireStream` 包 UDT socket）；`ServerWire`（接收端：0x00/0x01/0x02/0x03/0x04 处理、0x05 配对码认证（`WireAuth.HashCode` 恒时比较，未认证/错码回 0x15 status=1 拒绝，未启用时宽容接受）、0x06 文本接收（≤1MB，无独立响应帧，送达确认与文件语义一致）、`ReceiveFilePayload`、全文件校验、续传协商、文件夹续传扫描 `GetFolderSessionDir`）与 `ClientWire`（发送端：单文件/文件夹/分块/续传/文件夹续传、`SendAuthFrameAsync`（空码即 no-op）、`SendTextAsync`、`SendFilePayload` 双缓冲+令牌桶限速）；`WireCallbacks` 把日志/进度/错误/完成/文本接收事件回传给传输类；`ServerWireContext` 持有分块与续传状态及 `PairingCode`（`Shutdown()` 统一落盘）。0x02 分块返回 `WireOutcome{Success, IsChunked}`，让 TCP（无条件触发 per-client 完成）与 UDT（成功才 ACK）各自保留 ACK 语义。
 - **TransferServer.cs** — TCP 传输薄封装：监听/接受循环/生命周期 + `ServerWireContext` 装配；协议处理全部委托 `ServerWire.HandleClientAsync`。`NoDelay = true`，LongRunning 接受循环。
 - **TransferClient.cs** — TCP 客户端薄封装：`CreateClient()`（源端口绑定，失败抛 `PortBindException`）+ `ConnectAsync()`；发送逻辑委托 `ClientWire`。公开 API：`SendAsync()`/`SendFolderAsync()`/`SendChunkedAsync()`/`SendResumableAsync(sessionId, verifyHash)`。
@@ -77,7 +82,7 @@ GUI 有语言下拉框（English / 中文），设置 `L.IsChinese`。所有本�
 - `L.UdtC_*` — UDT 客户端日志消息
 - 其他 `L.*` 属性 — MainForm UI 字符串
 
-新增日志消息时遵循以上命名约定添加到 `L10N.cs`。禁止使用内联 `L.IsChinese ? "..." : "..."` 三元表达式。语言切换时 `PopulateBindAddresses()` 重新读取网卡并更新第一个下拉项标签。传输过程中语言切换被禁用（下拉框不可用）。
+新增日志消息时遵循以上命名约定添加到 `L10N.cs`。禁止使用内联 `L.IsChinese ? "..." : "..."` 三元表达式。语言切换时 `PopulateBindAddresses()` 重新读取网卡并更新第一个下拉项标签。传输过程中语言切换被禁用（下拉框不可用）。WPF 层沿用显式 `ApplyLanguage()` 刷新模式（`L` 为纯静态、无变更通知）；对话框文案在构造时一次性设置，语言切换不刷新已打开的对话框。
 
 ### 文件名冲突处理
 
@@ -85,7 +90,7 @@ TCP 和 UDT 服务器都使用 `Utils.GetUniqueSavePath`，在基础文件名（
 
 ### 线程安全模式
 
-传输类使用 `volatile bool _isRunning` 标志和 `CancellationTokenSource`。UI 事件处理器通过 `MainForm.cs` 中的 `this.Invoke()` 封送。触发事件前使用局部变量快照模式：`var handler = OnXxx; if (handler != null) handler(...);`。
+传输类使用 `volatile bool _isRunning` 标志和 `CancellationTokenSource`。UI 事件处理器经 `MainWindow` 的 `RunOnUi`/`RunOnUiSync`（Dispatcher 封送，窗口已关闭或 Dispatcher 停止时静默丢弃）。触发事件前使用局部变量快照模式：`var handler = OnXxx; if (handler != null) handler(...);`。
 
 ## TCP 线协议
 
@@ -245,4 +250,4 @@ UDT STREAM 模式通过 `udt_setsockopt` 设置 `UDT_RCVTIMEO` 和 `UDT_SNDTIMEO
 ## 运行时要求
 
 - Windows 7 SP1 或更高版本
-- .NET Framework 4.5 或更高版本（Win7 推荐 4.6.1+）
+- .NET Framework 4.8 或更高版本（Win10 1809+/Win11 内置；Win7 SP1 需手动安装 .NET Framework 4.8）
