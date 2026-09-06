@@ -531,8 +531,8 @@ namespace TrFileTransfer
         public static string UsePairingHint { get { return IsChinese ? "该设备已启用配对码，请先在客户端填写配对码再发送。" : "This device requires a pairing code — fill it in on the client before sending."; } }
 
         // ---- HTTP share ----
-        public static string HttpShareBtn { get { return IsChinese ? "HTTP 共享" : "HTTP Share"; } }
-        public static string HttpPortLabel { get { return IsChinese ? "HTTP端口:" : "HTTP port:"; } }
+        public static string HttpShareBtn { get { return IsChinese ? "共享" : "Share"; } }
+        public static string HttpPortLabel { get { return IsChinese ? "HTTP:" : "HTTP:"; } }
         public static string HttpShareUploadBtn { get { return IsChinese ? "上传" : "Upload"; } }
         public static string HttpShareStop { get { return IsChinese ? "停止" : "Stop"; } }
         public static string HttpShareOn(object url)
