@@ -881,7 +881,7 @@ namespace TrFileTransfer
                 AddLog(L.DragDropSkipped(skipped));
             if (tasks.Count == 0) return;
             AddLog(L.DragDropQueued(tasks.Count));
-            using (var dlg = new QueueDialog(CaptureQueuedTask, ExecuteQueuedTask, tasks))
+            using (var dlg = new QueueDialog(CaptureQueuedTask, ExecuteQueuedTask, tasks, CaptureQueuedTaskFor))
                 dlg.ShowDialog(this);
         }
 
@@ -968,7 +968,7 @@ namespace TrFileTransfer
         private void BtnQueue_Click(object sender, EventArgs e)
         {
             if (_chkMonitor.Checked || _monitorCts != null) return;
-            using (var dlg = new QueueDialog(CaptureQueuedTask, ExecuteQueuedTask))
+            using (var dlg = new QueueDialog(CaptureQueuedTask, ExecuteQueuedTask, null, CaptureQueuedTaskFor))
                 dlg.ShowDialog(this);
         }
 
@@ -2545,6 +2545,7 @@ namespace TrFileTransfer
     public class QueueDialog : Form
     {
         private readonly Func<QueuedTask> _capture;
+        private readonly Func<string, bool, QueuedTask> _captureFor;
         private readonly Func<QueuedTask, Task<bool>> _executor;
         private readonly System.Collections.Generic.List<QueuedTask> _tasks
             = new System.Collections.Generic.List<QueuedTask>();
@@ -2554,9 +2555,11 @@ namespace TrFileTransfer
         private bool _running;
 
         public QueueDialog(Func<QueuedTask> capture, Func<QueuedTask, Task<bool>> executor,
-            System.Collections.Generic.IEnumerable<QueuedTask> initial = null)
+            System.Collections.Generic.IEnumerable<QueuedTask> initial = null,
+            Func<string, bool, QueuedTask> captureFor = null)
         {
             _capture = capture;
+            _captureFor = captureFor;
             _executor = executor;
             if (initial != null)
             {
@@ -2572,6 +2575,10 @@ namespace TrFileTransfer
             MinimizeBox = false;
             Font = new Font("Segoe UI", 9f);
 
+            // Drag files/folders onto the dialog (form or the list filling it) to enqueue
+            AllowDrop = true;
+            DragEnter += QueueDialog_DragEnter;
+            DragDrop += QueueDialog_DragDrop;
             var tlp = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(10) };
             tlp.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             tlp.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
@@ -2580,6 +2587,10 @@ namespace TrFileTransfer
             _list = new ListBox { Dock = DockStyle.Fill, IntegralHeight = false };
             for (int i = 0; i < _tasks.Count; i++)
                 _list.Items.Add(FormatTask(_tasks[i]));
+            // The list fills the client area — it is the drop target users actually hit
+            _list.AllowDrop = true;
+            _list.DragEnter += QueueDialog_DragEnter;
+            _list.DragDrop += QueueDialog_DragDrop;
             tlp.Controls.Add(_list, 0, 0);
 
             var bottom = new TableLayoutPanel { Dock = DockStyle.Fill, Margin = new Padding(0), Padding = new Padding(0, 6, 0, 0), BackColor = Color.Transparent };
@@ -2642,6 +2653,44 @@ namespace TrFileTransfer
             }
             _tasks.Add(task);
             _list.Items.Add(FormatTask(task));
+        }
+
+        private void QueueDialog_DragEnter(object sender, DragEventArgs e)
+        {
+            e.Effect = e.Data.GetDataPresent(DataFormats.FileDrop)
+                ? DragDropEffects.Copy : DragDropEffects.None;
+        }
+
+        private void QueueDialog_DragDrop(object sender, DragEventArgs e)
+        {
+            if (_running || _captureFor == null) return;
+            var files = (string[])e.Data.GetData(DataFormats.FileDrop);
+            if (files == null || files.Length == 0) return;
+
+            int added = 0, skipped = 0;
+            foreach (string path in files)
+            {
+                bool isDir = Directory.Exists(path);
+                if (!isDir && !File.Exists(path))
+                {
+                    skipped++;
+                    continue;
+                }
+                var task = _captureFor(path, isDir);
+                if (task != null)
+                {
+                    _tasks.Add(task);
+                    _list.Items.Add(FormatTask(task));
+                    added++;
+                }
+                else
+                {
+                    skipped++;
+                }
+            }
+            if (skipped > 0)
+                MessageBox.Show(this, L.DragDropSkipped(skipped), L.QueueTitle,
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
         private void BtnDelete_Click(object sender, EventArgs e)
