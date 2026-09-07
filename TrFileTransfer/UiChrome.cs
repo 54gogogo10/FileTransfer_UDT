@@ -79,7 +79,7 @@ namespace TrFileTransfer
                 int round = 2; // DWMWCP_ROUND
                 DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ref round, sizeof(int));
 
-                if (mica)
+                if (mica && ShouldUseMica())
                 {
                     int backdrop = 2; // DWMSBT_MAINWINDOW
                     if (DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, ref backdrop, sizeof(int)) == 0)
@@ -99,6 +99,42 @@ namespace TrFileTransfer
                 }
             }
             catch { }
+        }
+
+        /// <summary>Mica needs the DWM backdrop to actually render; on machines where
+        /// it can't (transparency disabled, remote session / VM with software
+        /// rendering, pre-22H2 builds, high contrast) the extended-frame trick turns
+        /// the window black instead — those environments keep the opaque themed
+        /// background. Config "Mica"=0 forces it off everywhere.</summary>
+        private static bool ShouldUseMica()
+        {
+            try
+            {
+                if (!Config.GetBool("Mica", true)) return false;
+                if (System.Windows.SystemParameters.HighContrast) return false;
+                if (System.Windows.Forms.SystemInformation.TerminalServerSession) return false;
+                // WPF render tier: 0 = software, 1 = DirectX < 9-class, 2 = GPU —
+                // the backdrop blend needs real hardware acceleration
+                if ((System.Windows.Media.RenderCapability.Tier >> 16) < 2) return false;
+                // DWMSBT needs Windows 11 22H2 (build 22621); older builds either
+                // reject the attribute (harmless) or, worse, accept and misrender
+                var build = Microsoft.Win32.Registry.GetValue(
+                    @"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+                    "CurrentBuildNumber", "0") as string;
+                int buildNum;
+                if (!int.TryParse(build, out buildNum) || buildNum < 22621) return false;
+                // Transparency effects off → Mica falls back to a flat color; the
+                // glass-margin hack can then render as black on some drivers
+                var transparency = Microsoft.Win32.Registry.GetValue(
+                    @"HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                    "EnableTransparency", 1);
+                if (transparency is int && (int)transparency == 0) return false;
+                return true;
+            }
+            catch
+            {
+                return false; // any doubt → opaque background, never a black window
+            }
         }
     }
 }
