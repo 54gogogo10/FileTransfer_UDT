@@ -1783,6 +1783,11 @@ namespace TrFileTransfer
 
         private Border CreateTransferCard(StackPanel parent)
         {
+            // Two rows: progress bar on top, status text below — stacking them in
+            // one cell made the text overlap the bar
+            var grid = new Grid();
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             var bar = new ProgressBar
             {
                 Style = (Style)FindResource("BarModern"),
@@ -1791,6 +1796,8 @@ namespace TrFileTransfer
                 Value = 0,
                 Margin = new Thickness(0, 0, 0, 5)
             };
+            Grid.SetRow(bar, 0);
+            grid.Children.Add(bar);
             var lbl = new TextBlock
             {
                 FontSize = 11,
@@ -1798,8 +1805,7 @@ namespace TrFileTransfer
                 TextTrimming = TextTrimming.CharacterEllipsis,
                 Text = ""
             };
-            var grid = new Grid();
-            grid.Children.Add(bar);
+            Grid.SetRow(lbl, 1);
             grid.Children.Add(lbl);
             var border = new Border
             {

@@ -334,7 +334,7 @@
                         <Border x:Name="ring" Width="16" Height="16" CornerRadius="8" BorderThickness="1"
                                 BorderBrush="{DynamicResource Brush.InputBorder}"
                                 Background="{DynamicResource Brush.InputBg}" VerticalAlignment="Center">
-                            <Ellipse x:Name="dot" Width="8" Height="8" Fill="White" Visibility="Collapsed"/>
+                            <Ellipse x:Name="dot" Width="8" Height="8" Fill="{DynamicResource Brush.Accent}" Visibility="Collapsed"/>
                         </Border>
                         <ContentPresenter Margin="6,0,0,0" VerticalAlignment="Center" RecognizesAccessKey="True"/>
                     </StackPanel>
@@ -342,6 +342,7 @@
                         <Trigger Property="IsChecked" Value="True">
                             <Setter TargetName="dot" Property="Visibility" Value="Visible"/>
                             <Setter TargetName="ring" Property="BorderBrush" Value="{DynamicResource Brush.Accent}"/>
+                            <Setter TargetName="ring" Property="BorderThickness" Value="1.5"/>
                         </Trigger>
                         <Trigger Property="IsMouseOver" Value="True">
                             <Setter TargetName="ring" Property="BorderBrush" Value="{DynamicResource Brush.TextDisabled}"/>
@@ -363,7 +364,7 @@
             <Setter.Value>
                 <ControlTemplate TargetType="ProgressBar">
                     <Grid ClipToBounds="True">
-                        <Border CornerRadius="4" Background="{DynamicResource Brush.InputBg}"/>
+                        <Border CornerRadius="4" Background="{DynamicResource Brush.CardBorder}"/>
                         <Border x:Name="PART_Track"/>
                         <Border x:Name="PART_Indicator" CornerRadius="4" Background="{DynamicResource Brush.Accent}"
                                 HorizontalAlignment="Left"/>
