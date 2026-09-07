@@ -124,8 +124,9 @@ namespace TrFileTransfer
             ScheduleStartupUpdateCheck();
         }
 
-        /// <summary>One console+file line describing the rendering environment —
-        /// the daily log file is the only survivor when a machine black-screens.</summary>
+        /// <summary>Rendering environment info goes to the daily log FILE only (not
+        /// the console) — it's the surviving evidence when a machine black-screens,
+        /// but noise on screen.</summary>
         private void LogRenderEnvironment()
         {
             try
@@ -136,7 +137,7 @@ namespace TrFileTransfer
                     "CurrentBuildNumber", "?") ?? "?").ToString();
                 string render = Config.GetBool("SoftwareRender", false) ? "software"
                     : (UiChrome.MicaActive ? "GPU + Mica" : "GPU");
-                AddLog(L.EnvInfo(tier, build, render));
+                AppendLogFile(L.EnvInfo(tier, build, render));
             }
             catch { }
         }
