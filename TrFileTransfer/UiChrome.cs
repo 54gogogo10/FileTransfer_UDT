@@ -37,6 +37,14 @@ namespace TrFileTransfer
 
         private static readonly List<Entry> Entries = new List<Entry>();
         private static bool _hooked;
+        private static bool _micaActive;
+
+        /// <summary>Whether the Mica backdrop actually applied to some window
+        /// (best-effort diagnostics only).</summary>
+        public static bool MicaActive
+        {
+            get { return _micaActive; }
+        }
 
         /// <summary>Call once from the window constructor. Title-bar darkness follows
         /// ThemeManager; when <paramref name="mica"/> is true the window gets a
@@ -94,6 +102,7 @@ namespace TrFileTransfer
                         if (DwmExtendFrameIntoClientArea(hwnd, ref margins) == 0)
                         {
                             window.Background = ThemeManager.MicaBackground();
+                            _micaActive = true;
                         }
                     }
                 }
@@ -101,16 +110,17 @@ namespace TrFileTransfer
             catch { }
         }
 
-        /// <summary>Mica needs the DWM backdrop to actually render; on machines where
-        /// it can't (transparency disabled, remote session / VM with software
-        /// rendering, pre-22H2 builds, high contrast) the extended-frame trick turns
-        /// the window black instead — those environments keep the opaque themed
-        /// background. Config "Mica"=0 forces it off everywhere.</summary>
+        /// <summary>Mica is opt-in (Config "Mica"=1) — the extended-frame glass hack
+        /// renders pitch-black on some machines even when every environment check
+        /// passes, so the safe opaque background is the default. When enabled, the
+        /// checks below still skip environments where it cannot work (transparency
+        /// disabled, remote session / VM with software rendering, pre-22H2 builds,
+        /// high contrast).</summary>
         private static bool ShouldUseMica()
         {
             try
             {
-                if (!Config.GetBool("Mica", true)) return false;
+                if (!Config.GetBool("Mica", false)) return false;
                 if (System.Windows.SystemParameters.HighContrast) return false;
                 if (System.Windows.Forms.SystemInformation.TerminalServerSession) return false;
                 // WPF render tier: 0 = software, 1 = DirectX < 9-class, 2 = GPU —

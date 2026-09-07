@@ -604,6 +604,12 @@ namespace TrFileTransfer
         public static string QueueBatchAdd { get { return IsChinese ? "批量添加" : "Add files"; } }
         public static string ThemeToggleTip { get { return IsChinese ? "切换深色/浅色主题" : "Toggle dark/light theme"; } }
         public static string ThemeBtn(bool dark) { return dark ? (IsChinese ? "浅色" : "Light") : (IsChinese ? "深色" : "Dark"); }
+        public static string EnvInfo(object tier, object build, object render)
+        {
+            return IsChinese
+                ? string.Format("渲染环境：层级 {0}（2=GPU 加速），系统 build {1}，{2}", tier, build, render)
+                : string.Format("Render: tier {0} (2 = GPU), OS build {1}, {2}", tier, build, render);
+        }
         public static string FieldIpInvalid { get { return IsChinese ? "IP 格式不正确（需要 IPv4 地址）" : "Invalid IP format (IPv4 expected)"; } }
         public static string FieldPathInvalid { get { return IsChinese ? "路径包含非法字符" : "Path contains invalid characters"; } }
         public static string FieldDigitsOnly { get { return IsChinese ? "只能输入数字" : "Digits only"; } }

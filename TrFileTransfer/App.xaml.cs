@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Reflection;
 using System.Windows;
+using System.Windows.Media;
 
 namespace TrFileTransfer
 {
@@ -22,6 +23,11 @@ namespace TrFileTransfer
             // again — harmlessly — inside MainWindow)
             Config.Load();
             ThemeManager.Initialize();
+
+            // Escape hatch for machines whose GPU driver black-screens WPF's
+            // hardware path: SoftwareRender=1 renders via CPU (plenty for this UI)
+            if (Config.GetBool("SoftwareRender", false))
+                RenderOptions.ProcessRenderMode = System.Windows.Interop.RenderMode.SoftwareOnly;
 
             DispatcherUnhandledException += (s, args) =>
             {

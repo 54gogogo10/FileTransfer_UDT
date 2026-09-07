@@ -120,7 +120,25 @@ namespace TrFileTransfer
             ApplyLanguage();
             ApplyConfig();
             AddLog(L.StartedVersion(AppVersion));
+            LogRenderEnvironment();
             ScheduleStartupUpdateCheck();
+        }
+
+        /// <summary>One console+file line describing the rendering environment —
+        /// the daily log file is the only survivor when a machine black-screens.</summary>
+        private void LogRenderEnvironment()
+        {
+            try
+            {
+                int tier = System.Windows.Media.RenderCapability.Tier >> 16;
+                string build = (Microsoft.Win32.Registry.GetValue(
+                    @"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+                    "CurrentBuildNumber", "?") ?? "?").ToString();
+                string render = Config.GetBool("SoftwareRender", false) ? "software"
+                    : (UiChrome.MicaActive ? "GPU + Mica" : "GPU");
+                AddLog(L.EnvInfo(tier, build, render));
+            }
+            catch { }
         }
 
 
