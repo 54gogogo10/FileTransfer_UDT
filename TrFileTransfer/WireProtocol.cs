@@ -166,6 +166,24 @@ namespace TrFileTransfer
         public bool Success;
         /// <summary>True when the request was a 0x02 chunk (transports ACK these differently).</summary>
         public bool IsChunked;
+        /// <summary>True when the connection was refused by policy (IP filter, pairing
+        /// code, receive confirmation). UDT answers these with a 0x00 NACK so the
+        /// client fails fast instead of waiting out its ACK timeout.</summary>
+        public bool Rejected;
+        /// <summary>Per-connection receive statistics (null when the transport passed no IP).</summary>
+        public WireSessionStats Session;
+    }
+
+    /// <summary>Receive-side accounting for one client connection (raised as session
+    /// stats when the connection finishes successfully).</summary>
+    public class WireSessionStats
+    {
+        public string Peer;
+        public readonly System.Diagnostics.Stopwatch Watch = System.Diagnostics.Stopwatch.StartNew();
+        public long Bytes;
+        public int Files;
+        public bool Encrypted;
+        public bool Rejected;
     }
 
     /// <summary>State a server keeps across client connections: save location plus chunk/resume tracking.</summary>
@@ -173,14 +191,33 @@ namespace TrFileTransfer
     {
         public string SaveDirectory;
         public int BufferSize = 4194304;
-        /// <summary>When non-empty, clients must present this pairing code (0x05 frame)
+        /// <summary>When non-empty, clients must present this pairing code (0x05/0x07 frame)
         /// before any transfer type is accepted. Empty = open to the LAN.</summary>
         public string PairingCode;
-        public readonly WireCallbacks Cb = new WireCallbacks();
-        public readonly ConcurrentDictionary<string, ChunkTracker> ChunkTrackers
+        /// <summary>When true, an incoming file identical (size + SHA256) to an existing
+        /// one is discarded instead of saved under a _1 suffix.</summary>
+        public bool SkipDuplicateFiles;
+        /// <summary>When true, each client's files land in a per-device subdirectory of
+        /// SaveDirectory (device name from ResolveDeviceName, else the IP).</summary>
+        public bool PerDeviceFolder;
+        /// <summary>Connection gate: returns false to drop the connection before any
+        /// bytes are read. Null = allow all.</summary>
+        public Func<string, bool> IpAllowed;
+        /// <summary>Receive confirmation gate: (ip, name, size or -1, fileCount, isFolder) →
+        /// false refuses the transfer. Null = accept silently.</summary>
+        public Func<string, string, long, int, bool, Task<bool>> ConfirmRequest;
+        /// <summary>Maps a client IP to a friendly device folder name (per-device mode).</summary>
+        public Func<string, string> ResolveDeviceName;
+        public WireCallbacks Cb = new WireCallbacks();
+        // Not readonly: per-connection clones (BeginSession) share the parent's instances
+        public ConcurrentDictionary<string, ChunkTracker> ChunkTrackers
             = new ConcurrentDictionary<string, ChunkTracker>();
-        public readonly ConcurrentDictionary<Guid, ResumeState> ResumeStates
+        public ConcurrentDictionary<Guid, ResumeState> ResumeStates
             = new ConcurrentDictionary<Guid, ResumeState>();
+        /// <summary>Statistics for the CURRENT connection (set by BeginSession).</summary>
+        public WireSessionStats Session;
+        /// <summary>True when BeginSession redirected SaveDirectory into a per-device folder.</summary>
+        public bool PerDeviceApplied;
 
         /// <summary>Persists incomplete resume sessions and disposes trackers (called from server Stop).</summary>
         public void Shutdown()
@@ -225,41 +262,242 @@ namespace TrFileTransfer
             return line;
         }
 
-        /// <summary>Reads the transfer type and dispatches. Throws on connection errors.</summary>
-        public static async Task<WireOutcome> HandleClientAsync(IWireStream s, ServerWireContext ctx, CancellationToken ct)
+        /// <summary>
+        /// Builds the per-connection context: a WireCallbacks wrapper counting received
+        /// bytes/files (session stats), and — when per-device folders are enabled — a
+        /// save directory redirected into a per-device subfolder. The chunk/resume
+        /// dictionaries stay shared with the parent context.
+        /// </summary>
+        public static ServerWireContext BeginSession(ServerWireContext ctx, string clientIp)
         {
+            if (string.IsNullOrEmpty(clientIp)) return ctx;
+            var stats = new WireSessionStats { Peer = clientIp };
+            var scb = new WireCallbacks();
+            scb.Log = ctx.Cb.Log;
+            scb.Progress = ctx.Cb.Progress;
+            scb.Error = ctx.Cb.Error;
+            scb.Complete = ctx.Cb.Complete;
+            scb.TextReceived = ctx.Cb.TextReceived;
+            scb.FileReceived = delegate(string path, long size)
+            {
+                stats.Bytes += size;
+                stats.Files++;
+                ctx.Cb.RaiseFileReceived(path, size);
+            };
+
+            var clone = new ServerWireContext();
+            clone.SaveDirectory = ctx.SaveDirectory;
+            clone.BufferSize = ctx.BufferSize;
+            clone.PairingCode = ctx.PairingCode;
+            clone.SkipDuplicateFiles = ctx.SkipDuplicateFiles;
+            clone.IpAllowed = ctx.IpAllowed;
+            clone.ConfirmRequest = ctx.ConfirmRequest;
+            clone.ResolveDeviceName = ctx.ResolveDeviceName;
+            // Chunk reassembly and resume sessions are process-wide state — every
+            // connection must share the parent's dictionaries
+            clone.ChunkTrackers = ctx.ChunkTrackers;
+            clone.ResumeStates = ctx.ResumeStates;
+            clone.Cb = scb;
+            clone.Session = stats;
+
+            if (ctx.PerDeviceFolder && ctx.ResolveDeviceName != null)
+            {
+                string sub = SanitizeDeviceFolder(ctx.ResolveDeviceName(clientIp), clientIp);
+                if (!string.IsNullOrEmpty(sub))
+                {
+                    clone.SaveDirectory = Path.Combine(ctx.SaveDirectory, sub);
+                    clone.PerDeviceApplied = true;
+                }
+            }
+            return clone;
+        }
+
+        /// <summary>Maps a device name to a safe single-level folder name; falls back
+        /// to the IP when nothing usable remains.</summary>
+        private static string SanitizeDeviceFolder(string raw, string fallbackIp)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) raw = fallbackIp;
+            var sb = new System.Text.StringBuilder();
+            char[] invalid = Path.GetInvalidFileNameChars();
+            for (int i = 0; i < raw.Length; i++)
+            {
+                char c = raw[i];
+                bool bad = false;
+                for (int j = 0; j < invalid.Length; j++)
+                {
+                    if (invalid[j] == c) { bad = true; break; }
+                }
+                sb.Append(bad ? '_' : c);
+            }
+            string s = sb.ToString().Trim();
+            if (s.Length > 60) s = s.Substring(0, 60);
+            return s.Length == 0 ? fallbackIp : s;
+        }
+
+        /// <summary>Reads the transfer type and dispatches. Throws on connection errors.
+        /// clientIp enables the policy gates (IP filter, per-device folders, session stats).</summary>
+        public static async Task<WireOutcome> HandleClientAsync(IWireStream s, ServerWireContext ctx, CancellationToken ct,
+            string clientIp = null)
+        {
+            var outcome = new WireOutcome();
+
+            if (!string.IsNullOrEmpty(clientIp) && ctx.IpAllowed != null && !ctx.IpAllowed(clientIp))
+            {
+                ctx.Cb.RaiseLog(L.S_IpRejected(clientIp));
+                ctx.Cb.RaiseError(L.S_IpRejected(clientIp));
+                outcome.Rejected = true;
+                return outcome;
+            }
+
+            ctx = BeginSession(ctx, clientIp);
+            outcome.Session = ctx.Session;
+
             var typeBuf = new byte[1];
             await s.ReadExactAsync(typeBuf, 0, 1, ct).ConfigureAwait(false);
             byte transferType = typeBuf[0];
 
-            // Optional 0x05 pairing frame before any transfer type
-            if (transferType == 0x05)
+            IWireStream active = s;
+            try
             {
-                if (!await HandleAuthAsync(s, ctx, ct).ConfigureAwait(false))
-                    return new WireOutcome { Success = false };
-                await s.ReadExactAsync(typeBuf, 0, 1, ct).ConfigureAwait(false);
-                transferType = typeBuf[0];
+                // Optional 0x07 encrypted pairing (preferred over 0x05 when the client encrypts)
+                if (transferType == 0x07)
+                {
+                    IWireStream enc = await HandleEncryptedAuthAsync(s, ctx, ct).ConfigureAwait(false);
+                    if (enc == null)
+                        return outcome; // rejected — outcome.Rejected was flagged via Session
+                    active = enc;
+                    await active.ReadExactAsync(typeBuf, 0, 1, ct).ConfigureAwait(false);
+                    transferType = typeBuf[0];
+                }
+                else if (transferType == 0x05)
+                {
+                    if (!await HandleAuthAsync(active, ctx, ct).ConfigureAwait(false))
+                    {
+                        outcome.Rejected = true;
+                        return outcome;
+                    }
+                    await active.ReadExactAsync(typeBuf, 0, 1, ct).ConfigureAwait(false);
+                    transferType = typeBuf[0];
+                }
+                else if (!string.IsNullOrEmpty(ctx.PairingCode))
+                {
+                    // Server requires pairing — reject clients that skip authentication
+                    await SendAuthResponse(active, 1, ct).ConfigureAwait(false);
+                    ctx.Cb.RaiseLog(L.S_AuthRequired);
+                    ctx.Cb.RaiseError(L.S_AuthRequired);
+                    outcome.Rejected = true;
+                    return outcome;
+                }
+
+                // Per-device save root must exist before single-file handlers write into it
+                if (transferType != 0x06 && ctx.PerDeviceApplied)
+                {
+                    try { Directory.CreateDirectory(ctx.SaveDirectory); } catch { }
+                }
+
+                if (transferType == 0x01)
+                    return UpdateOutcome(outcome, await HandleFolderTransfer(active, ctx, ct).ConfigureAwait(false));
+                if (transferType == 0x02)
+                {
+                    outcome.IsChunked = true;
+                    return UpdateOutcome(outcome, await HandleChunkedFile(active, ctx, ct).ConfigureAwait(false));
+                }
+                if (transferType == 0x03)
+                    return UpdateOutcome(outcome, await HandleResumableFile(active, ctx, ct).ConfigureAwait(false));
+                if (transferType == 0x04)
+                    return UpdateOutcome(outcome, await HandleFolderResumableAsync(active, ctx, ct).ConfigureAwait(false));
+                if (transferType == 0x06)
+                    return UpdateOutcome(outcome, await HandleTextMessage(active, ctx, ct).ConfigureAwait(false));
+                return UpdateOutcome(outcome, await HandleFileTransfer(active, ctx, ct).ConfigureAwait(false));
             }
-            else if (!string.IsNullOrEmpty(ctx.PairingCode))
+            finally
             {
-                // Server requires pairing — reject clients that skip authentication
-                await SendAuthResponse(s, 1, ct).ConfigureAwait(false);
-                ctx.Cb.RaiseLog(L.S_AuthRequired);
-                ctx.Cb.RaiseError(L.S_AuthRequired);
-                return new WireOutcome { Success = false };
+                if (ctx.Session != null && ctx.Session.Rejected) outcome.Rejected = true;
+                if (!ReferenceEquals(active, s)) active.Dispose();
+            }
+        }
+
+        private static WireOutcome UpdateOutcome(WireOutcome outcome, bool success)
+        {
+            outcome.Success = success;
+            return outcome;
+        }
+
+        /// <summary>Receive-confirmation gate. Runs the context's ConfirmRequest delegate
+        /// (UI prompt) and refuses the transfer when it answers false.</summary>
+        private static async Task<bool> GateAsync(ServerWireContext ctx, string name, long size, int fileCount, bool isFolder)
+        {
+            var gate = ctx.ConfirmRequest;
+            if (gate == null) return true;
+            string ip = ctx.Session != null ? ctx.Session.Peer : "";
+            bool ok;
+            try
+            {
+                ok = await gate(ip, name, size, fileCount, isFolder).ConfigureAwait(false);
+            }
+            catch
+            {
+                ok = true; // a broken gate must not wedge every transfer
+            }
+            if (ok)
+            {
+                ctx.Cb.RaiseLog(L.S_ConfirmAccepted(name));
+            }
+            else
+            {
+                if (ctx.Session != null) ctx.Session.Rejected = true;
+                ctx.Cb.RaiseLog(L.S_ConfirmDenied(name, ip));
+                ctx.Cb.RaiseError(L.S_ConfirmDenied(name, ip));
+            }
+            return ok;
+        }
+
+        /// <summary>
+        /// Handles the 0x07 encrypted pairing frame: verifies the code hash and, on
+        /// success, answers 0x17 status 0 and wraps the stream for the rest of the
+        /// session. Returns null when the connection was rejected. Returns the raw
+        /// stream when the server has no pairing code (status 2 — both sides continue
+        /// in plaintext on the same connection).
+        /// </summary>
+        private static async Task<IWireStream> HandleEncryptedAuthAsync(IWireStream s, ServerWireContext ctx, CancellationToken ct)
+        {
+            var hashBuf = new byte[32];
+            await s.ReadExactAsync(hashBuf, 0, 32, ct).ConfigureAwait(false);
+            var salt = new byte[SessionCrypto.SaltBytes];
+            await s.ReadExactAsync(salt, 0, salt.Length, ct).ConfigureAwait(false);
+
+            if (string.IsNullOrEmpty(ctx.PairingCode))
+            {
+                await SendEncAuthResponse(s, 2, ct).ConfigureAwait(false);
+                ctx.Cb.RaiseLog(L.S_EncryptUnsupported);
+                return s;
             }
 
-            if (transferType == 0x01)
-                return new WireOutcome { Success = await HandleFolderTransfer(s, ctx, ct).ConfigureAwait(false) };
-            if (transferType == 0x02)
-                return new WireOutcome { IsChunked = true, Success = await HandleChunkedFile(s, ctx, ct).ConfigureAwait(false) };
-            if (transferType == 0x03)
-                return new WireOutcome { Success = await HandleResumableFile(s, ctx, ct).ConfigureAwait(false) };
-            if (transferType == 0x04)
-                return new WireOutcome { Success = await HandleFolderResumableAsync(s, ctx, ct).ConfigureAwait(false) };
-            if (transferType == 0x06)
-                return new WireOutcome { Success = await HandleTextMessage(s, ctx, ct).ConfigureAwait(false) };
-            return new WireOutcome { Success = await HandleFileTransfer(s, ctx, ct).ConfigureAwait(false) };
+            byte[] codeHash = WireAuth.HashCode(ctx.PairingCode);
+            if (!Utils.ConstantTimeEquals(hashBuf, codeHash))
+            {
+                await SendEncAuthResponse(s, 1, ct).ConfigureAwait(false);
+                ctx.Cb.RaiseLog(L.S_AuthFailed);
+                ctx.Cb.RaiseError(L.S_AuthFailed);
+                if (ctx.Session != null) ctx.Session.Rejected = true;
+                return null;
+            }
+
+            await SendEncAuthResponse(s, 0, ct).ConfigureAwait(false);
+            byte[] c2sEnc, c2sMac, s2cEnc, s2cMac;
+            SessionCrypto.DeriveSessionKeys(codeHash, salt, out c2sEnc, out c2sMac, out s2cEnc, out s2cMac);
+            if (ctx.Session != null) ctx.Session.Encrypted = true;
+            ctx.Cb.RaiseLog(L.S_EncryptedOn);
+            // The server sends with the s2c keys and receives with the c2s keys
+            return new EncryptedWireStream(s, s2cEnc, s2cMac, c2sEnc, c2sMac);
+        }
+
+        private static async Task SendEncAuthResponse(IWireStream s, byte status, CancellationToken ct)
+        {
+            var resp = new byte[2]; // type(1) + status(1)
+            resp[0] = 0x17;
+            resp[1] = status;
+            await s.WriteExactAsync(resp, 0, 2, ct).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -395,6 +633,9 @@ namespace TrFileTransfer
             }
             if (manifestTotal != totalBytes) return false;
 
+            if (!await GateAsync(ctx, folderName, totalBytes, fileCount, true).ConfigureAwait(false))
+                return false;
+
             string dir = GetFolderSessionDir(ctx.SaveDirectory, folderName, sessionId);
             Directory.CreateDirectory(dir);
 
@@ -464,6 +705,13 @@ namespace TrFileTransfer
                 string subDir = Path.GetDirectoryName(savePath);
                 if (!string.IsNullOrEmpty(subDir) && !Directory.Exists(subDir))
                     Directory.CreateDirectory(subDir);
+
+                if (!Utils.HasFreeSpace(dir, sizes[i] + Utils.DiskSpaceMargin))
+                {
+                    ctx.Cb.RaiseLog(L.S_DiskFull(relativePaths[i], Utils.FormatSize(sizes[i])));
+                    ctx.Cb.RaiseError(L.S_DiskFull(relativePaths[i], Utils.FormatSize(sizes[i])));
+                    return false;
+                }
 
                 using (var fileStream = new FileStream(savePath, start > 0 ? FileMode.Open : FileMode.Create,
                     FileAccess.Write, FileShare.None, ctx.BufferSize, FileOptions.SequentialScan))
@@ -546,12 +794,16 @@ namespace TrFileTransfer
             await s.ReadExactAsync(nameBuf, 0, nameLen, ct).ConfigureAwait(false);
             string fileName = SafeName(System.Text.Encoding.UTF8.GetString(nameBuf), L.S_ReceivedFile);
 
+            if (!await GateAsync(ctx, fileName, fileSize, 0, false).ConfigureAwait(false))
+                return false;
+
+            string basePath = Path.Combine(ctx.SaveDirectory, fileName);
             string savePath = Utils.GetUniqueSavePath(ctx.SaveDirectory, fileName);
 
             ctx.Cb.RaiseLog(L.S_Receiving(fileName, Utils.FormatSize(fileSize)));
 
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            bool hashOk = await ReceiveFilePayload(s, ctx, savePath, fileSize, fileName, ct).ConfigureAwait(false);
+            bool hashOk = await ReceiveFilePayload(s, ctx, savePath, basePath, fileSize, fileName, ct).ConfigureAwait(false);
             sw.Stop();
 
             if (hashOk)
@@ -560,7 +812,9 @@ namespace TrFileTransfer
                     sw.Elapsed.TotalSeconds,
                     Utils.FormatSize((long)(fileSize / Math.Max(sw.Elapsed.TotalSeconds, 0.001)))));
                 ctx.Cb.RaiseComplete();
-                ctx.Cb.RaiseFileReceived(savePath, fileSize);
+                // Dedup-skip deleted the suffixed copy — report the surviving original
+                string reportedPath = File.Exists(savePath) ? savePath : basePath;
+                ctx.Cb.RaiseFileReceived(reportedPath, fileSize);
             }
             return hashOk;
         }
@@ -581,6 +835,9 @@ namespace TrFileTransfer
             await s.ReadExactAsync(fileCountBuf, 0, 4, ct).ConfigureAwait(false);
             int fileCount = BitConverter.ToInt32(fileCountBuf, 0);
             if (fileCount <= 0) return false;
+
+            if (!await GateAsync(ctx, folderName, -1, fileCount, true).ConfigureAwait(false))
+                return false;
 
             string folderSaveDir = Utils.GetUniqueSavePath(ctx.SaveDirectory, folderName);
             Directory.CreateDirectory(folderSaveDir);
@@ -608,7 +865,7 @@ namespace TrFileTransfer
                 if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                     Directory.CreateDirectory(dir);
 
-                bool hashOk = await ReceiveFilePayload(s, ctx, savePath, fileSize, relativePath, ct).ConfigureAwait(false);
+                bool hashOk = await ReceiveFilePayload(s, ctx, savePath, savePath, fileSize, relativePath, ct).ConfigureAwait(false);
                 if (!hashOk) return false;
                 ctx.Cb.RaiseFileReceived(savePath, fileSize);
 
@@ -655,6 +912,17 @@ namespace TrFileTransfer
             var nameBuf = new byte[nameLen];
             await s.ReadExactAsync(nameBuf, 0, nameLen, ct).ConfigureAwait(false);
             string fileName = SafeName(System.Text.Encoding.UTF8.GetString(nameBuf), L.S_ReceivedFile);
+
+            // The chunk file is preallocated at totalSize — require that much headroom
+            if (!Utils.HasFreeSpace(ctx.SaveDirectory, totalSize + Utils.DiskSpaceMargin))
+            {
+                ctx.Cb.RaiseLog(L.S_DiskFull(fileName, Utils.FormatSize(totalSize)));
+                ctx.Cb.RaiseError(L.S_DiskFull(fileName, Utils.FormatSize(totalSize)));
+                return false;
+            }
+
+            if (!await GateAsync(ctx, fileName, totalSize, 0, false).ConfigureAwait(false))
+                return false;
 
             ChunkTracker tracker = ChunkTracker.GetOrCreate(
                 ctx.ChunkTrackers, fileName, totalSize, ctx.SaveDirectory);
@@ -755,6 +1023,9 @@ namespace TrFileTransfer
                 await s.ReadExactAsync(expectedFullHash, 0, 32, ct).ConfigureAwait(false);
             }
 
+            if (!await GateAsync(ctx, fileName, totalSize, 0, false).ConfigureAwait(false))
+                return false;
+
             // From here on, the session is ours: persist any incomplete state to disk
             // on the way out (connection drop / server restart) and clear it once the
             // transfer completes or is discarded.
@@ -779,6 +1050,30 @@ namespace TrFileTransfer
         private static async Task<bool> HandleResumableCore(IWireStream s, ServerWireContext ctx, CancellationToken ct,
             Guid sessionId, long totalSize, long clientOffset, string fileName, byte[] expectedFullHash)
         {
+            // Dedup shortcut: with skip-duplicates on and a full hash available, an
+            // identical file already on disk answers "already complete" — nothing travels.
+            if (ctx.SkipDuplicateFiles && expectedFullHash != null)
+            {
+                string basePath = Path.Combine(ctx.SaveDirectory, fileName);
+                var existing = new FileInfo(basePath);
+                if (existing.Exists && existing.Length == totalSize
+                    && await VerifyFullHashFile(basePath, expectedFullHash, ct).ConfigureAwait(false))
+                {
+                    await SendResumeResponse(s, totalSize, 2, ct).ConfigureAwait(false);
+                    ctx.Cb.RaiseLog(L.S_DuplicateSkipped(fileName));
+                    ctx.Cb.RaiseFileReceived(basePath, totalSize);
+                    return true;
+                }
+            }
+
+            // The preallocated file needs full size headroom
+            if (!Utils.HasFreeSpace(ctx.SaveDirectory, totalSize + Utils.DiskSpaceMargin))
+            {
+                ctx.Cb.RaiseLog(L.S_DiskFull(fileName, Utils.FormatSize(totalSize)));
+                ctx.Cb.RaiseError(L.S_DiskFull(fileName, Utils.FormatSize(totalSize)));
+                return false;
+            }
+
             ResumeState state = null;
             ctx.ResumeStates.TryGetValue(sessionId, out state);
             byte status;
@@ -1026,10 +1321,19 @@ namespace TrFileTransfer
             catch (UnauthorizedAccessException) { return false; }
         }
 
-        /// <summary>Receives file bytes into savePath and verifies the trailing SHA256. Returns true on match.</summary>
-        private static async Task<bool> ReceiveFilePayload(IWireStream s, ServerWireContext ctx, string savePath, long fileSize,
-            string displayName, CancellationToken ct)
+        /// <summary>Receives file bytes into savePath and verifies the trailing SHA256. Returns true on match.
+        /// basePath is the un-suffixed collision path used by the skip-duplicates check (equal to
+        /// savePath when dedup does not apply). Rejects the file up front when disk space is short.</summary>
+        private static async Task<bool> ReceiveFilePayload(IWireStream s, ServerWireContext ctx, string savePath, string basePath,
+            long fileSize, string displayName, CancellationToken ct)
         {
+            if (!Utils.HasFreeSpace(Path.GetDirectoryName(savePath), fileSize + Utils.DiskSpaceMargin))
+            {
+                ctx.Cb.RaiseLog(L.S_DiskFull(displayName, Utils.FormatSize(fileSize)));
+                ctx.Cb.RaiseError(L.S_DiskFull(displayName, Utils.FormatSize(fileSize)));
+                return false;
+            }
+
             var sw = System.Diagnostics.Stopwatch.StartNew();
             long bytesRead = 0;
             var bufA = new byte[ctx.BufferSize];
@@ -1115,6 +1419,30 @@ namespace TrFileTransfer
                     ctx.Cb.RaiseError(L.S_HashFailed(displayName));
                     return false;
                 }
+
+                // Skip-duplicates: an identical file already on disk wins; the freshly
+                // received copy is discarded. Only reached when the collision suffix
+                // actually renamed this save (basePath != savePath).
+                if (ctx.SkipDuplicateFiles && !string.Equals(savePath, basePath, StringComparison.OrdinalIgnoreCase))
+                {
+                    bool dup = false;
+                    try
+                    {
+                        var fi = new FileInfo(basePath);
+                        dup = fi.Exists && fi.Length == fileSize;
+                    }
+                    catch (IOException) { }
+                    catch (UnauthorizedAccessException) { }
+                    if (dup)
+                        dup = await VerifyFullHashFile(basePath, computedHash, ct).ConfigureAwait(false);
+                    if (dup)
+                    {
+                        try { fileStream.Dispose(); } catch { }
+                        try { File.Delete(savePath); } catch { }
+                        ctx.Cb.RaiseLog(L.S_DuplicateSkipped(displayName));
+                        return true;
+                    }
+                }
             }
             return true;
         }
@@ -1126,6 +1454,19 @@ namespace TrFileTransfer
 
     /// <summary>Sending side of the 0x00-0x03 protocol, shared by TCP and UDT clients.
     /// Connection setup (and its transport-specific logging) stays in the transport classes.</summary>
+    /// <summary>Result of the client-side 0x05/0x07 authentication handshake.</summary>
+    public class AuthResult
+    {
+        /// <summary>The stream to run the protocol on — the raw stream, or an
+        /// EncryptedWireStream wrapping it after a successful 0x07 handshake.</summary>
+        public IWireStream Stream;
+        /// <summary>True when the session is encrypted (0x07 accepted).</summary>
+        public bool Encrypted;
+        /// <summary>True when the peer ignored the 0x07 frame (an older version) —
+        /// the caller must reconnect and retry with the plain 0x05 frame.</summary>
+        public bool NeedPlainFallback;
+    }
+
     public static class ClientWire
     {
         /// <summary>Sends one file (type 0x00).</summary>
@@ -1383,6 +1724,72 @@ namespace TrFileTransfer
                 FileShare.Read, 4194304, FileOptions.SequentialScan))
             using (var sha = System.Security.Cryptography.SHA256.Create())
                 return sha.ComputeHash(fs);
+        }
+
+        /// <summary>
+        /// Client side of the authentication handshake, shared by TCP and UDT.
+        /// With a pairing code and encryption enabled the client sends 0x07
+        /// (code hash + session salt); on 0x17 status 0 the returned stream encrypts
+        /// everything that follows. Status 2 (peer has no pairing code) continues in
+        /// plaintext on the same connection. No valid 0x17 answer means the peer is
+        /// an older version — NeedPlainFallback tells the caller to reconnect and run
+        /// the plain 0x05 frame instead. An explicit status 1 (wrong code) throws.
+        /// </summary>
+        public static async Task<AuthResult> AuthenticateAsync(IWireStream s, string pairingCode, bool tryEncryption,
+            WireCallbacks cb, CancellationToken ct)
+        {
+            if (string.IsNullOrEmpty(pairingCode))
+                return new AuthResult { Stream = s };
+
+            if (!tryEncryption)
+            {
+                await SendAuthFrameAsync(s, pairingCode, cb, ct).ConfigureAwait(false);
+                return new AuthResult { Stream = s };
+            }
+
+            cb.RaiseLog(L.C_Authing);
+            byte[] codeHash = WireAuth.HashCode(pairingCode);
+            var salt = new byte[SessionCrypto.SaltBytes];
+            using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create())
+                rng.GetBytes(salt);
+
+            var frame = new byte[1 + 32 + SessionCrypto.SaltBytes];
+            frame[0] = 0x07;
+            Buffer.BlockCopy(codeHash, 0, frame, 1, 32);
+            Buffer.BlockCopy(salt, 0, frame, 1 + 32, salt.Length);
+            await s.WriteExactAsync(frame, 0, frame.Length, ct).ConfigureAwait(false);
+
+            var resp = new byte[2];
+            try
+            {
+                await s.ReadExactAsync(resp, 0, 2, ct).ConfigureAwait(false);
+            }
+            catch (IOException)
+            {
+                return new AuthResult { Stream = s, NeedPlainFallback = true };
+            }
+            if (resp[0] != 0x17)
+                return new AuthResult { Stream = s, NeedPlainFallback = true };
+
+            if (resp[1] == 1)
+                throw new IOException(L.C_AuthFailed);
+            if (resp[1] == 2)
+            {
+                cb.RaiseLog(L.C_EncryptUnsupported);
+                return new AuthResult { Stream = s };
+            }
+            if (resp[1] != 0)
+                return new AuthResult { Stream = s, NeedPlainFallback = true };
+
+            byte[] c2sEnc, c2sMac, s2cEnc, s2cMac;
+            SessionCrypto.DeriveSessionKeys(codeHash, salt, out c2sEnc, out c2sMac, out s2cEnc, out s2cMac);
+            cb.RaiseLog(L.C_EncryptedOn);
+            // The client sends with the c2s keys and receives with the s2c keys
+            return new AuthResult
+            {
+                Stream = new EncryptedWireStream(s, c2sEnc, c2sMac, s2cEnc, s2cMac),
+                Encrypted = true
+            };
         }
 
         /// <summary>

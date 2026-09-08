@@ -615,6 +615,163 @@ namespace TrFileTransfer
         public static string FieldDigitsOnly { get { return IsChinese ? "只能输入数字" : "Digits only"; } }
         public static string FieldUrlInvalid { get { return IsChinese ? "地址必须以 http:// 或 https:// 开头" : "Address must start with http:// or https://"; } }
 
+        // ---- Encrypted transport (0x07) ----
+        public static string EncryptLabel { get { return IsChinese ? "加密传输" : "Encrypt"; } }
+        public static string C_EncryptedOn { get { return IsChinese ? "已启用加密传输（AES-256）。" : "Encrypted session established (AES-256)."; } }
+        public static string S_EncryptedOn { get { return IsChinese ? "连接已加密（AES-256）。" : "Connection encrypted (AES-256)."; } }
+        public static string C_EncryptFallback
+        {
+            get
+            {
+                return IsChinese
+                    ? "对方版本较旧，不支持加密，已回退普通连接。"
+                    : "Peer is an older version without encryption — falling back to plaintext.";
+            }
+        }
+        public static string C_EncryptUnsupported
+        {
+            get
+            {
+                return IsChinese
+                    ? "对方未启用配对码，无法加密，保持普通连接。"
+                    : "Peer has no pairing code — staying plaintext.";
+            }
+        }
+        public static string S_EncryptUnsupported
+        {
+            get
+            {
+                return IsChinese
+                    ? "对方请求加密，但本机未启用配对码，保持普通连接。"
+                    : "Client asked for encryption but pairing is off — staying plaintext.";
+            }
+        }
+        public static string S_EncStreamCorrupt { get { return IsChinese ? "加密流数据格式错误，连接中断。" : "Encrypted stream corrupted — connection dropped."; } }
+        public static string S_EncTampered { get { return IsChinese ? "数据完整性校验失败（可能被篡改），连接中断。" : "Integrity check failed (data tampered?) — connection dropped."; } }
+
+        // ---- Receive confirmation + IP filter ----
+        public static string S_IpRejected(object ip)
+        {
+            return IsChinese
+                ? string.Format("已拒绝不在过滤规则内的连接: {0}", ip)
+                : string.Format("Connection rejected by IP filter: {0}", ip);
+        }
+        public static string S_ConfirmAccepted(object name)
+        {
+            return IsChinese
+                ? string.Format("已确认接收: {0}", name)
+                : string.Format("Receive confirmed: {0}", name);
+        }
+        public static string S_ConfirmDenied(object name, object ip)
+        {
+            return IsChinese
+                ? string.Format("已拒绝接收 {1} 发来的 {0}", name, ip)
+                : string.Format("Refused {1}'s transfer of {0}", name, ip);
+        }
+        public static string ConfirmTitle { get { return IsChinese ? "接收确认" : "Confirm Receive"; } }
+        public static string ConfirmText(object ip, object name, object size, bool isFolder, int files)
+        {
+            string what;
+            if (isFolder)
+                what = IsChinese
+                    ? string.Format("文件夹 {0}（{1} 个文件）", name, files)
+                    : string.Format("folder {0} ({1} files)", name, files);
+            else
+                what = IsChinese
+                    ? string.Format("文件 {0}（{1}）", name, size)
+                    : string.Format("file {0} ({1})", name, size);
+            return IsChinese
+                ? string.Format("设备 {0} 想发送{1}，是否接受？", ip, what)
+                : string.Format("Device {0} wants to send {1}. Accept?", ip, what);
+        }
+        public static string ConfirmAccept { get { return IsChinese ? "接受" : "Accept"; } }
+        public static string ConfirmDeny { get { return IsChinese ? "拒绝" : "Deny"; } }
+
+        // ---- Disk space pre-check ----
+        public static string S_DiskFull(object name, string sizeStr)
+        {
+            return IsChinese
+                ? string.Format("磁盘空间不足，已停止接收 {0}（需要 {1}）", name, sizeStr)
+                : string.Format("Not enough disk space — refused {0} ({1} needed)", name, sizeStr);
+        }
+
+        // ---- Duplicate files ----
+        public static string S_DuplicateSkipped(object name)
+        {
+            return IsChinese
+                ? string.Format("已存在相同文件，跳过保存: {0}", name)
+                : string.Format("Identical file already exists — skipped: {0}", name);
+        }
+
+        // ---- Auto resume retry ----
+        public static string AutoRetryLabel { get { return IsChinese ? "自动续传" : "Auto-resume"; } }
+        public static string C_AutoRetry(object attempt, object max)
+        {
+            return IsChinese
+                ? string.Format("传输中断，自动从断点重试（第 {0}/{1} 次）...", attempt, max)
+                : string.Format("Transfer interrupted — auto-resuming (attempt {0}/{1})...", attempt, max);
+        }
+        public static string C_RejectedByPeer { get { return IsChinese ? "对方拒绝了本次传输。" : "Transfer rejected by the receiver."; } }
+
+        // ---- Receive options dialog ----
+        public static string RecvOptionsBtn { get { return IsChinese ? "接收选项" : "Options"; } }
+        public static string RecvOptionsTitle { get { return IsChinese ? "接收选项" : "Receive Options"; } }
+        public static string ROConfirmLabel { get { return IsChinese ? "接收前确认:" : "Confirm before receive:"; } }
+        public static string ROConfirmOff { get { return IsChinese ? "关闭" : "Off"; } }
+        public static string ROConfirmUnknown { get { return IsChinese ? "仅未知设备" : "Unknown devices"; } }
+        public static string ROConfirmAll { get { return IsChinese ? "所有连接" : "All connections"; } }
+        public static string ROIpFilterLabel { get { return IsChinese ? "IP 过滤:" : "IP filter:"; } }
+        public static string ROIpOff { get { return IsChinese ? "不过滤" : "No filter"; } }
+        public static string ROIpAllow { get { return IsChinese ? "仅允许列表" : "Allow list only"; } }
+        public static string ROIpDeny { get { return IsChinese ? "拒绝列表" : "Deny list"; } }
+        public static string ROIpHint
+        {
+            get
+            {
+                return IsChinese
+                    ? "分号分隔，支持通配符，如 192.168.1.*;10.0.0.5"
+                    : "Semicolon-separated; wildcards allowed, e.g. 192.168.1.*;10.0.0.5";
+            }
+        }
+        public static string ROPerDevice { get { return IsChinese ? "按设备分目录保存" : "Per-device subfolders"; } }
+        public static string RODuplicateLabel { get { return IsChinese ? "重复文件:" : "Duplicate files:"; } }
+        public static string RODupRename { get { return IsChinese ? "重命名保存" : "Always rename"; } }
+        public static string RODupSkip { get { return IsChinese ? "相同则跳过" : "Skip if identical"; } }
+        public static string RORestartHint
+        {
+            get
+            {
+                return IsChinese
+                    ? "设置已保存；分目录/去重选项在下次启动服务器时生效。"
+                    : "Saved; per-device/dedup options apply on the next server start.";
+            }
+        }
+
+        // ---- Transfer statistics ----
+        public static string StatsBtn { get { return IsChinese ? "统计" : "Stats"; } }
+        public static string StatsTitle { get { return IsChinese ? "传输统计" : "Transfer Stats"; } }
+        public static string StatsToday { get { return IsChinese ? "今日" : "Today"; } }
+        public static string StatsWeek { get { return IsChinese ? "近 7 天" : "Last 7 days"; } }
+        public static string StatsTotal { get { return IsChinese ? "累计" : "All time"; } }
+        public static string StatsCountCol { get { return IsChinese ? "次数" : "Count"; } }
+        public static string StatsDataCol { get { return IsChinese ? "数据量" : "Volume"; } }
+        public static string StatsDeviceCol { get { return IsChinese ? "设备" : "Device"; } }
+        public static string StatsSentCol { get { return IsChinese ? "发送" : "Sent"; } }
+        public static string StatsRecvCol { get { return IsChinese ? "接收" : "Received"; } }
+        public static string StatsEmpty { get { return IsChinese ? "暂无传输记录。" : "No transfers recorded yet."; } }
+
+        // ---- QR code (HTTP share) ----
+        public static string QrTitle { get { return IsChinese ? "HTTP 共享二维码" : "HTTP Share QR Code"; } }
+        public static string QrHint
+        {
+            get
+            {
+                return IsChinese
+                    ? "手机扫码（或输入网址）即可浏览、下载共享目录："
+                    : "Scan with a phone (or type the URL) to browse and download the shared folder:";
+            }
+        }
+
         public static string HelpText()
         {
             return IsChinese
@@ -633,7 +790,11 @@ namespace TrFileTransfer
                   "· 发送队列 —— 批量任务串行发送，失败自动重试\n" +
                   "· 续传 —— 中断后从断点继续；\"完整校验\"逐字节核对\n" +
                   "· 监控模式 —— 监视目录，出现新文件自动发送\n" +
-                  "· 发文本 —— 向对方发送一条即时消息\n\n" +
+                  "· 发文本 —— 向对方发送一条即时消息\n" +
+                  "· 加密 —— 双方都开配对码即自动加密传输（AES-256）\n" +
+                  "· 接收选项 —— 接收前确认、IP 过滤、按设备分目录、\n" +
+                  "  相同文件跳过；\"统计\"查看各设备传输量\n" +
+                  "· HTTP 共享 —— 开启时显示二维码，手机扫码即访\n\n" +
                   "提示：所有设置自动保存；关闭窗口仅最小化到托盘，\n托盘右键菜单可开机自启、检查更新或真正退出。"
                 : "[Receive (server)]\n" +
                   "1. Pick the \"Save to\" folder, check TCP and/or UDT, press \"Start\".\n" +
@@ -650,7 +811,12 @@ namespace TrFileTransfer
                   "- Queue: batch tasks sent serially with automatic retries\n" +
                   "- Resume: continue broken transfers; \"Verify hash\" double-checks bytes\n" +
                   "- Monitor: watch a folder and auto-send new files\n" +
-                  "- Send text: quick instant message to the peer\n\n" +
+                  "- Send text: quick instant message to the peer\n" +
+                  "- Encrypt: with pairing codes on both sides the session is\n" +
+                  "  automatically encrypted (AES-256)\n" +
+                  "- Options: receive confirmation, IP filter, per-device folders,\n" +
+                  "  duplicate skipping; \"Stats\" shows per-device volume\n" +
+                  "- HTTP share shows a QR code when started — scan to open\n\n" +
                   "Tips: settings save automatically; closing the window hides to tray —\nuse the tray menu for auto-start, updates or a real exit.";
         }
 

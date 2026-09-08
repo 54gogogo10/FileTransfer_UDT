@@ -257,6 +257,9 @@ namespace TrFileTransfer
         public event Action<IPEndPoint, TransferProgress> OnClientProgress;
         /// <summary>Fired when a single client's transfer completes.</summary>
         public event Action<IPEndPoint> OnClientTransferComplete;
+        /// <summary>Fired when a client connection finishes successfully, carrying the
+        /// received bytes/files for the transfer statistics.</summary>
+        public event Action<WireSessionStats> OnSessionStats;
 
         /// <summary>Whether the server is currently listening.</summary>
         public bool IsRunning { get { return _isRunning; } }
@@ -267,6 +270,41 @@ namespace TrFileTransfer
         {
             get { return _wire.PairingCode; }
             set { _wire.PairingCode = value; }
+        }
+
+        /// <summary>Discard incoming files identical to one already on disk (see ServerWireContext).</summary>
+        public bool SkipDuplicateFiles
+        {
+            get { return _wire.SkipDuplicateFiles; }
+            set { _wire.SkipDuplicateFiles = value; }
+        }
+
+        /// <summary>Save each client's files under a per-device subdirectory.</summary>
+        public bool PerDeviceFolder
+        {
+            get { return _wire.PerDeviceFolder; }
+            set { _wire.PerDeviceFolder = value; }
+        }
+
+        /// <summary>Connection gate: false drops the connection before any bytes are read.</summary>
+        public Func<string, bool> IpAllowed
+        {
+            get { return _wire.IpAllowed; }
+            set { _wire.IpAllowed = value; }
+        }
+
+        /// <summary>Receive confirmation prompt: (ip, name, size, fileCount, isFolder) → allowed?</summary>
+        public Func<string, string, long, int, bool, Task<bool>> ConfirmRequest
+        {
+            get { return _wire.ConfirmRequest; }
+            set { _wire.ConfirmRequest = value; }
+        }
+
+        /// <summary>Maps a client IP to a friendly device folder name (per-device mode).</summary>
+        public Func<string, string> ResolveDeviceName
+        {
+            get { return _wire.ResolveDeviceName; }
+            set { _wire.ResolveDeviceName = value; }
         }
 
         /// <summary>Creates a UDT server that listens for incoming file transfers.</summary>
@@ -461,7 +499,8 @@ namespace TrFileTransfer
             var ws = new UdtWireStream(clientSocket, true);
             try
             {
-                WireOutcome outcome = await ServerWire.HandleClientAsync(ws, _wire, ct).ConfigureAwait(false);
+                string clientIp = clientEp != null ? clientEp.Address.ToString() : null;
+                WireOutcome outcome = await ServerWire.HandleClientAsync(ws, _wire, ct, clientIp).ConfigureAwait(false);
 
                 if (outcome.IsChunked)
                 {
@@ -471,14 +510,23 @@ namespace TrFileTransfer
                     await Task.Run(() => UdtNative.udt_send(clientSocket, ack2, 1, 0), ct).ConfigureAwait(false);
                     var ccHandler = OnClientTransferComplete;
                     if (ccHandler != null) ccHandler(clientEp);
+                    RaiseSessionStats(outcome);
                 }
                 else if (outcome.Success)
                 {
                     var ccHandler = OnClientTransferComplete;
                     if (ccHandler != null) ccHandler(clientEp);
+                    RaiseSessionStats(outcome);
                     // Application-level ACK only on verified success
                     var ack = new byte[1] { 0x01 };
                     await Task.Run(() => UdtNative.udt_send(clientSocket, ack, 1, 0), ct).ConfigureAwait(false);
+                }
+                else if (outcome.Rejected)
+                {
+                    // Explicit NACK so the client fails fast instead of waiting out its
+                    // ACK timeout (0x00 = refused by policy)
+                    var nack = new byte[1] { 0x00 };
+                    await Task.Run(() => UdtNative.udt_send(clientSocket, nack, 1, 0), ct).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException) { }
@@ -501,6 +549,15 @@ namespace TrFileTransfer
                 ws.Dispose(); // closes the native socket, unblocking pending I/O
                 System.Threading.Interlocked.Decrement(ref _activeClients);
             }
+        }
+
+        private void RaiseSessionStats(WireOutcome outcome)
+        {
+            if (outcome == null || outcome.Session == null) return;
+            if (!outcome.Success) return;
+            if (outcome.Session.Bytes <= 0 && outcome.Session.Files <= 0) return;
+            var handler = OnSessionStats;
+            if (handler != null) handler(outcome.Session);
         }
 
         private void Log(string msg)
@@ -545,9 +602,13 @@ namespace TrFileTransfer
         /// <summary>Whether a transfer is currently in progress.</summary>
         public bool IsRunning { get { return _isRunning; } }
 
-        /// <summary>Pairing code sent as a 0x05 auth frame before any transfer.
+        /// <summary>Pairing code sent as a 0x05/0x07 auth frame before any transfer.
         /// Null/empty sends nothing (compatible with servers that don't require it).</summary>
         public string PairingCode { get; set; }
+
+        /// <summary>When a pairing code is set, try the 0x07 encrypted handshake first
+        /// (falls back to plain 0x05 against older peers). Default from Config "Encrypt".</summary>
+        public bool EncryptionEnabled { get; set; }
 
         /// <summary>Creates a UDT client for sending files or folders.</summary>
         /// <param name="serverIp">Target server IPv4 address.</param>
@@ -574,6 +635,7 @@ namespace TrFileTransfer
             _bufferSize = bufferSize;
             _localPort = localPort;
             _limiter = new SpeedLimiter(maxBytesPerSec);
+            EncryptionEnabled = Config.GetBool("Encrypt", true);
             _cb.Log = Log;
             _cb.Progress = delegate(TransferProgress p)
             {
@@ -648,10 +710,13 @@ namespace TrFileTransfer
                     throw new Exception("UDT library init failed");
                 await transferAction(_cts.Token).ConfigureAwait(false);
                 // Wait for server ACK before closing — confirms data was received
+                // (0x01 = success, 0x00 = refused by receiver policy)
                 var ackBuf = new byte[1];
                 int ackTimeout = 30000;
                 UdtNative.udt_setsockopt(_socket, 0, UdtNative.UDT_RCVTIMEO, ref ackTimeout, 4);
-                await Task.Run(() => UdtNative.udt_recv(_socket, ackBuf, 1, 0), _cts.Token).ConfigureAwait(false);
+                int ackRead = await Task.Run(() => UdtNative.udt_recv(_socket, ackBuf, 1, 0), _cts.Token).ConfigureAwait(false);
+                if (ackRead == 1 && ackBuf[0] == 0)
+                    throw new IOException(L.C_RejectedByPeer);
             }
             catch (OperationCanceledException)
             {
@@ -719,32 +784,65 @@ namespace TrFileTransfer
             await UdtIo.WaitForConnectionReady(_socket, ct);
         }
 
+        /// <summary>
+        /// Connects and runs the auth handshake, wrapping the wire stream for encryption
+        /// when the peer accepts 0x07. Against an older peer (no 0x17 answer) the
+        /// connection is re-established once and the plain 0x05 frame is used instead.
+        /// </summary>
+        private async Task<IWireStream> OpenAndAuthenticateAsync(CancellationToken ct)
+        {
+            bool allowEncrypt = EncryptionEnabled;
+            for (int attempt = 0; ; attempt++)
+            {
+                await UdtConnect(ct).ConfigureAwait(false);
+                var raw = new UdtWireStream(_socket, false);
+                AuthResult auth;
+                try
+                {
+                    // Short receive window: an older peer that does not know 0x07 never
+                    // answers, and waiting out the full 30s timeout would feel broken
+                    UdtNative.SetTimeout(_socket, 8000, 30000);
+                    auth = await ClientWire.AuthenticateAsync(raw, PairingCode, allowEncrypt, _cb, ct).ConfigureAwait(false);
+                    UdtNative.SetTimeout(_socket, 30000, 30000);
+                }
+                catch
+                {
+                    raw.Dispose();
+                    throw;
+                }
+                if (auth.NeedPlainFallback && allowEncrypt && attempt == 0)
+                {
+                    raw.Dispose();
+                    try { UdtNative.udt_close(_socket); } catch { }
+                    _socket = -1;
+                    allowEncrypt = false;
+                    _cb.RaiseLog(L.C_EncryptFallback);
+                    continue;
+                }
+                return auth.Stream;
+            }
+        }
+
         private async Task SendFileInternal(CancellationToken ct)
         {
-            await UdtConnect(ct);
-            using (var ws = new UdtWireStream(_socket, false))
+            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
             {
-                await ClientWire.SendAuthFrameAsync(ws, PairingCode, _cb, ct).ConfigureAwait(false);
                 await ClientWire.SendSingleFileAsync(ws, _filePath, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
         }
 
         private async Task SendFolderInternal(string folderPath, CancellationToken ct)
         {
-            await UdtConnect(ct);
-            using (var ws = new UdtWireStream(_socket, false))
+            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
             {
-                await ClientWire.SendAuthFrameAsync(ws, PairingCode, _cb, ct).ConfigureAwait(false);
                 await ClientWire.SendFolderAsync(ws, folderPath, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
         }
 
         private async Task SendChunkedInternal(long offset, long chunkSize, long totalSize, CancellationToken ct)
         {
-            await UdtConnect(ct);
-            using (var ws = new UdtWireStream(_socket, false))
+            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
             {
-                await ClientWire.SendAuthFrameAsync(ws, PairingCode, _cb, ct).ConfigureAwait(false);
                 await ClientWire.SendChunkAsync(ws, _filePath, offset, chunkSize, totalSize,
                     _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
@@ -752,10 +850,8 @@ namespace TrFileTransfer
 
         private async Task SendFolderResumableInternal(Guid sessionId, CancellationToken ct, bool keepState)
         {
-            await UdtConnect(ct);
-            using (var ws = new UdtWireStream(_socket, false))
+            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
             {
-                await ClientWire.SendAuthFrameAsync(ws, PairingCode, _cb, ct).ConfigureAwait(false);
                 await ClientWire.SendFolderResumableAsync(ws, _filePath, sessionId,
                     _serverIp, _port, true, _bufferSize, _limiter, _cb, ct, keepState).ConfigureAwait(false);
             }
@@ -763,10 +859,8 @@ namespace TrFileTransfer
 
         private async Task SendResumableUdtInternal(Guid sessionId, CancellationToken ct, bool verifyHash)
         {
-            await UdtConnect(ct);
-            using (var ws = new UdtWireStream(_socket, false))
+            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
             {
-                await ClientWire.SendAuthFrameAsync(ws, PairingCode, _cb, ct).ConfigureAwait(false);
                 await ClientWire.SendResumableAsync(ws, _filePath, sessionId, verifyHash,
                     _serverIp, _port, true, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
@@ -774,10 +868,8 @@ namespace TrFileTransfer
 
         private async Task SendTextInternal(string text, CancellationToken ct)
         {
-            await UdtConnect(ct);
-            using (var ws = new UdtWireStream(_socket, false))
+            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
             {
-                await ClientWire.SendAuthFrameAsync(ws, PairingCode, _cb, ct).ConfigureAwait(false);
                 await ClientWire.SendTextAsync(ws, text, _cb, ct).ConfigureAwait(false);
             }
         }

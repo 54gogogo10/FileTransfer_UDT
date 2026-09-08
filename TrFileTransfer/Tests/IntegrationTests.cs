@@ -2826,14 +2826,20 @@ namespace TrFileTransfer.Tests
                 MakeTestFile(testFile, 8192);
                 fx.Start();
 
-                // Old-style client that never authenticates
+                // Old-style client that never authenticates. Whether ITS writes fail
+                // depends on when the server's RST lands, so the deterministic
+                // assertion is server-side: nothing is ever saved.
                 var client = new TransferClient("127.0.0.1", fx.Port, testFile);
-                bool threw = false;
-                try { client.SendAsync().Wait(30000); }
-                catch { threw = true; }
-                Assert.True(threw, "unauthenticated client -> transfer fails");
+                var done = new ManualResetEvent(false);
+                client.OnTransferComplete += () => done.Set();
+                client.OnError += _ => done.Set();
+                client.SendAsync();
+                done.WaitOne(30000);
 
                 Thread.Sleep(300);
+                var deadline = DateTime.UtcNow.AddSeconds(3);
+                while (DateTime.UtcNow < deadline && Directory.GetFiles(fx.RecvDir).Length > 0)
+                    Thread.Sleep(200);
                 Assert.False(File.Exists(Path.Combine(fx.RecvDir, "auth_none.bin")), "no file saved for unauthenticated client");
             }
         }

@@ -58,6 +58,7 @@
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
                     </Grid.RowDefinitions>
 
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
@@ -139,6 +140,14 @@
                                    FontFamily="{StaticResource Font.Mono}" FontWeight="Bold" FontSize="13"
                                    Foreground="{DynamicResource Brush.AccentHover}" Visibility="Collapsed"/>
                     </StackPanel>
+
+                    <!-- Receive options: security gates + stats -->
+                    <StackPanel Grid.Row="5" Orientation="Horizontal" Margin="0,0,0,0">
+                        <Button x:Name="_btnRecvOptions" Style="{StaticResource BtnSecondary}" MinWidth="88"
+                                Click="BtnRecvOptions_Click"/>
+                        <Button x:Name="_btnStats" Style="{StaticResource BtnSecondary}" MinWidth="76"
+                                Margin="8,0,0,0" Click="BtnStats_Click"/>
+                    </StackPanel>
                 </Grid>
             </Border>
 
@@ -146,6 +155,7 @@
             <Border Grid.Column="2" Style="{StaticResource Card}">
                 <Grid>
                     <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="Auto"/>
@@ -251,6 +261,12 @@
                                    Fill="{DynamicResource Brush.CardBorder}" VerticalAlignment="Center" Margin="10,0"/>
                         <Button x:Name="_btnSendText" Style="{StaticResource BtnSecondary}" MinWidth="64"
                                 Click="BtnSendText_Click"/>
+                    </StackPanel>
+
+                    <!-- Security options: encryption (with pairing) + auto resume retry -->
+                    <StackPanel Grid.Row="6" Orientation="Horizontal" Margin="0,8,0,0">
+                        <CheckBox x:Name="_chkEncrypt" Style="{StaticResource ChkBox}" Margin="0,0,16,0"/>
+                        <CheckBox x:Name="_chkAutoRetry" Style="{StaticResource ChkBox}"/>
                     </StackPanel>
                 </Grid>
             </Border>

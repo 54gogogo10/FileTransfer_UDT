@@ -59,6 +59,10 @@ namespace TrFileTransfer
         private int _serverCount;
         private readonly Dictionary<IPEndPoint, Border> _tcpCards = new Dictionary<IPEndPoint, Border>();
         private readonly Dictionary<IPEndPoint, Border> _udtCards = new Dictionary<IPEndPoint, Border>();
+        private readonly StatsStore _stats = new StatsStore(StatsStore.DefaultPath);
+        /// <summary>Receive confirmations already granted this session (ip → granted at),
+        /// so concurrent-chunk and follow-up sends do not re-prompt.</summary>
+        private readonly Dictionary<string, DateTime> _confirmedReceives = new Dictionary<string, DateTime>();
 
         // Monitor mode
         private CancellationTokenSource _monitorCts;
@@ -115,6 +119,12 @@ namespace TrFileTransfer
             _chkVerifyHash.IsChecked = Config.GetBool("VerifyHash", false);
             _chkVerifyHash.Checked += (s, e) => Config.SetBool("VerifyHash", true);
             _chkVerifyHash.Unchecked += (s, e) => Config.SetBool("VerifyHash", false);
+            _chkEncrypt.IsChecked = Config.GetBool("Encrypt", true);
+            _chkEncrypt.Checked += (s, e) => Config.SetBool("Encrypt", true);
+            _chkEncrypt.Unchecked += (s, e) => Config.SetBool("Encrypt", false);
+            _chkAutoRetry.IsChecked = Config.GetBool("AutoRetry", true);
+            _chkAutoRetry.Checked += (s, e) => Config.SetBool("AutoRetry", true);
+            _chkAutoRetry.Unchecked += (s, e) => Config.SetBool("AutoRetry", false);
 
             PopulateBindAddresses();
             ApplyLanguage();
@@ -451,6 +461,10 @@ namespace TrFileTransfer
                 _btnHttpShare.Content = L.HttpShareBtn;
             else
                 _btnHttpShare.Content = L.HttpShareStop;
+            _btnRecvOptions.Content = L.RecvOptionsBtn;
+            _btnStats.Content = L.StatsBtn;
+            _chkEncrypt.Content = L.EncryptLabel;
+            _chkAutoRetry.Content = L.AutoRetryLabel;
 
             PopulateBindAddresses();
         }
@@ -695,6 +709,9 @@ namespace TrFileTransfer
                 _httpShare = share;
                 _btnHttpShare.Content = L.HttpShareStop;
                 AddLog(L.HttpShareOn(share.LanUrl));
+                // QR code next to the plain URL — phones scan instead of typing
+                var qr = new QrDialog(share.LanUrl) { Owner = this };
+                qr.Show();
             }
             catch (Exception ex)
             {
@@ -1110,7 +1127,10 @@ namespace TrFileTransfer
                 return;
             }
 
-            string bindAddr = _cmbBind.SelectedItem as string ?? "0.0.0.0";
+            // The combo stores display strings ("0.0.0.0 (所有接口)") — strip to the bare
+            // address: TCP's TryParse would silently fall back to Any, but UDT's
+            // IPAddress.Parse throws on the decoration
+            string bindAddr = (_cmbBind.SelectedItem as string ?? "0.0.0.0").Split(' ')[0].Trim();
             if (string.IsNullOrWhiteSpace(bindAddr))
                 bindAddr = "0.0.0.0";
 
@@ -1158,6 +1178,7 @@ namespace TrFileTransfer
                 bool tcpStarted = false;
                 var tcpServer = new TransferServer(bindAddr, port, GetArchiveDir(saveDir));
                 tcpServer.PairingCode = pairingCode;
+                ApplyServerOptions(tcpServer);
                 tcpServer.OnLog += msg => RunOnUi(() => AddLog(msg));
                 tcpServer.OnError += msg => RunOnUi(() => _lblStatusS.Text = L.ErrorPrefix + msg);
                 tcpServer.OnFileReceived += (path, size) => RunOnUi(() => OnFileReceived(path, size));
@@ -1201,6 +1222,7 @@ namespace TrFileTransfer
                 bool udtStarted = false;
                 var udtServer = new TransferUdtServer(bindAddr, port, GetArchiveDir(saveDir));
                 udtServer.PairingCode = pairingCode;
+                ApplyServerOptionsUdt(udtServer);
                 udtServer.OnLog += msg => RunOnUi(() => AddLog(msg));
                 udtServer.OnError += msg => RunOnUi(() => _lblStatusS.Text = L.ErrorPrefix + msg);
                 udtServer.OnFileReceived += (path, size) => RunOnUi(() => OnFileReceived(path, size));
@@ -1308,6 +1330,146 @@ namespace TrFileTransfer
             _lblStatusS.Text = L.ServerStopped;
         }
 
+        // ==================== Receive policy (options dialog, IP filter, confirm) ====================
+
+        /// <summary>Reads the receive options from Config into a TCP server. Directory
+        /// layout options (per-device, dedup) are snapshot here, so they apply from the
+        /// next server start; the IP filter and confirmation read Config live per event.</summary>
+        private void ApplyServerOptions(TransferServer server)
+        {
+            server.OnSessionStats += stats => RecordReceived(stats);
+            server.PerDeviceFolder = Config.GetBool("PerDeviceFolder", false);
+            server.SkipDuplicateFiles = Config.Get("DuplicateFiles", "rename") == "skip";
+            server.ResolveDeviceName = ResolveDeviceNameForIp;
+            server.IpAllowed = IpFilterPass;
+            server.ConfirmRequest = AskReceiveConfirmation;
+        }
+
+        private void ApplyServerOptionsUdt(TransferUdtServer server)
+        {
+            server.OnSessionStats += stats => RecordReceived(stats);
+            server.PerDeviceFolder = Config.GetBool("PerDeviceFolder", false);
+            server.SkipDuplicateFiles = Config.Get("DuplicateFiles", "rename") == "skip";
+            server.ResolveDeviceName = ResolveDeviceNameForIp;
+            server.IpAllowed = IpFilterPass;
+            server.ConfirmRequest = AskReceiveConfirmation;
+        }
+
+        /// <summary>IP filter decision — evaluated per connection from Config.</summary>
+        private bool IpFilterPass(string ip)
+        {
+            string mode = Config.Get("IpFilterMode", "off");
+            if (mode == "off" || string.IsNullOrEmpty(ip)) return true;
+            bool listed = IpFilter.Matches(Config.Get("IpFilterList", ""), ip);
+            return mode == "allow" ? listed : !listed;
+        }
+
+        /// <summary>Friendly per-device folder name: the known device's name when we
+        /// have it (sanitized by the wire layer), otherwise the raw IP.</summary>
+        private string ResolveDeviceNameForIp(string ip)
+        {
+            for (int i = 0; i < _knownDevices.Count; i++)
+            {
+                if (_knownDevices[i].Ip == ip && !string.IsNullOrEmpty(_knownDevices[i].Name)
+                    && _knownDevices[i].Name != "?")
+                    return _knownDevices[i].Name;
+            }
+            return ip;
+        }
+
+        /// <summary>Receive confirmation gate (runs on a server thread). Off / known-device
+        /// exemption short-circuit to true; otherwise a prompt shows for 30 s — no answer
+        /// counts as a refusal so the sender is never left hanging.</summary>
+        private Task<bool> AskReceiveConfirmation(string ip, string name, long size, int files, bool isFolder)
+        {
+            string mode = Config.Get("ConfirmReceive", "off");
+            if (mode == "off") return Task.FromResult(true);
+            if (mode == "unknown" && ip.Length > 0)
+            {
+                for (int i = 0; i < _knownDevices.Count; i++)
+                {
+                    if (_knownDevices[i].Ip == ip) return Task.FromResult(true);
+                }
+            }
+
+            DateTime granted;
+            lock (_confirmedReceives)
+            {
+                if (_confirmedReceives.TryGetValue(ip, out granted)
+                    && DateTime.Now - granted < TimeSpan.FromMinutes(10))
+                {
+                    return Task.FromResult(true);
+                }
+            }
+
+            var tcs = new TaskCompletionSource<bool>();
+            RunOnUi(delegate
+            {
+                try
+                {
+                    var dlg = new ConfirmReceiveDialog(ip, name, size, files, isFolder) { Owner = this };
+                    dlg.Closed += (s, e) => tcs.TrySetResult(dlg.Accepted);
+                    dlg.Show();
+                }
+                catch
+                {
+                    tcs.TrySetResult(false);
+                }
+            });
+            // Auto-deny timeout — runs regardless of dialog outcome
+            Task.Delay(TimeSpan.FromSeconds(30)).ContinueWith(t => tcs.TrySetResult(false));
+
+            return tcs.Task.ContinueWith(t =>
+            {
+                if (t.Result)
+                {
+                    lock (_confirmedReceives) { _confirmedReceives[ip] = DateTime.Now; }
+                }
+                return t.Result;
+            });
+        }
+
+        private void RecordReceived(WireSessionStats stats)
+        {
+            _stats.Append(new StatsEntry
+            {
+                When = DateTime.Now,
+                Direction = 'R',
+                Peer = stats.Peer,
+                Bytes = stats.Bytes,
+                Files = stats.Files,
+                Seconds = stats.Watch.Elapsed.TotalSeconds
+            });
+        }
+
+        private void RecordSent(string ip, long bytes, int files, double seconds)
+        {
+            if (bytes <= 0) return;
+            _stats.Append(new StatsEntry
+            {
+                When = DateTime.Now,
+                Direction = 'S',
+                Peer = ip,
+                Bytes = bytes,
+                Files = files,
+                Seconds = seconds
+            });
+        }
+
+        // ==================== Receive options / stats buttons ====================
+
+        private void BtnRecvOptions_Click(object sender, RoutedEventArgs e)
+        {
+            var dlg = new ReceiveOptionsDialog { Owner = this };
+            dlg.ShowDialog();
+        }
+
+        private void BtnStats_Click(object sender, RoutedEventArgs e)
+        {
+            var dlg = new StatsDialog(_stats) { Owner = this };
+            dlg.ShowDialog();
+        }
+
         private void BtnStopServer_Click(object sender, RoutedEventArgs e)
         {
             _serverCount = 0; // reset before stopping so OnStopped handlers see zero
@@ -1412,6 +1574,7 @@ namespace TrFileTransfer
                 }
 
                 DisableClientInputs();
+                var sendWatch = System.Diagnostics.Stopwatch.StartNew();
 
                 if (!isFolder && concurrency > 1)
                 {
@@ -1439,14 +1602,22 @@ namespace TrFileTransfer
                         await _client.SendFolderResumableAsync(syncSession, keepState: true);
                     }
                     else if (isFolder)
-                        await _client.SendFolderAsync(path);
+                    {
+                        await SendPlainWithRetryAsync(true, path,
+                            () => _client.SendFolderAsync(path),
+                            s => _client.SendFolderResumableAsync(s));
+                    }
                     else if (resumeSession.HasValue)
                     {
                         await _client.SendResumableAsync(resumeSession.Value, verifyHash);
                         _pendingResumeSession = null;
                     }
                     else
-                        await _client.SendAsync();
+                    {
+                        await SendPlainWithRetryAsync(false, path,
+                            () => _client.SendAsync(),
+                            s => _client.SendResumableAsync(s, verifyHash));
+                    }
                 }
                 else
                 {
@@ -1464,15 +1635,25 @@ namespace TrFileTransfer
                         await _clientUdt.SendFolderResumableAsync(syncSession, keepState: true);
                     }
                     else if (isFolder)
-                        await _clientUdt.SendFolderAsync(path);
+                    {
+                        await SendPlainWithRetryAsync(true, path,
+                            () => _clientUdt.SendFolderAsync(path),
+                            s => _clientUdt.SendFolderResumableAsync(s));
+                    }
                     else if (resumeSession.HasValue)
                     {
                         await _clientUdt.SendResumableAsync(resumeSession.Value, verifyHash);
                         _pendingResumeSession = null;
                     }
                     else
-                        await _clientUdt.SendAsync();
+                    {
+                        await SendPlainWithRetryAsync(false, path,
+                            () => _clientUdt.SendAsync(),
+                            s => _clientUdt.SendResumableAsync(s, verifyHash));
+                    }
                 }
+                RecordSent(ip, MeasurePathBytes(path, isFolder), isFolder ? 0 : 1,
+                    sendWatch.Elapsed.TotalSeconds);
                 RememberDevice(ip, port, !isTcp);
                 return true;
             }
@@ -1505,6 +1686,80 @@ namespace TrFileTransfer
                 Notify(L.NotifySendDone, L.TransferComplete);
             });
             c.OnStopped += () => RunOnUi(() => UpdateCardComplete(card));
+        }
+
+        /// <summary>
+        /// Runs a plain send with optional transparent resume retries. With auto-resume
+        /// on, single files travel via the 0x03 protocol from the first attempt (cheap,
+        /// and a broken attempt just resumes); folders stay on plain 0x01 until the first
+        /// failure (0x04 needs the full manifest hash pass), then resume in place via a
+        /// stable session id.
+        /// </summary>
+        private async Task SendPlainWithRetryAsync(bool isFolder, string path,
+            Func<Task> plainSend, Func<Guid, Task> resumeSend)
+        {
+            if (_chkAutoRetry.IsChecked != true)
+            {
+                await plainSend();
+                return;
+            }
+
+            bool canResume;
+            if (isFolder)
+            {
+                canResume = true;
+            }
+            else
+            {
+                try { canResume = new FileInfo(path).Length > 0; } // 0-byte files cannot use 0x03
+                catch { canResume = false; }
+            }
+            if (!canResume)
+            {
+                await plainSend();
+                return;
+            }
+
+            var session = Guid.NewGuid();
+            const int MaxAttempts = 3;
+            for (int attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    if (attempt == 1 && isFolder)
+                        await plainSend();
+                    else
+                        await resumeSend(session);
+                    return;
+                }
+                catch (Exception)
+                {
+                    if (attempt >= MaxAttempts) throw;
+                    AddLog(L.C_AutoRetry(attempt, MaxAttempts - 1));
+                    DisableClientInputs(); // the client's error path re-enabled the panel
+                    await Task.Delay(1200 * attempt);
+                }
+            }
+        }
+
+        /// <summary>Total bytes of the item just sent (metadata walk only).</summary>
+        private static long MeasurePathBytes(string path, bool isFolder)
+        {
+            if (!isFolder)
+            {
+                try { return new FileInfo(path).Length; }
+                catch { return 0; }
+            }
+            try
+            {
+                long total = 0;
+                foreach (var f in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
+                {
+                    try { total += new FileInfo(f).Length; } catch { }
+                }
+                return total;
+            }
+            catch { return 0; }
         }
 
         private void WireConcurrentEvents(ConcurrentTransfer c)
@@ -1680,6 +1935,7 @@ namespace TrFileTransfer
                     {
                         UpdateCardComplete(card);
                         Interlocked.Increment(ref okCount);
+                        RecordSent(t.Ip, MeasurePathBytes(path, isFolder), isFolder ? 0 : 1, 0);
                         RememberDevice(t.Ip, t.Port, false);
                     });
                     client.OnStopped += () =>
@@ -1705,6 +1961,7 @@ namespace TrFileTransfer
                     {
                         UpdateCardComplete(card);
                         Interlocked.Increment(ref okCount);
+                        RecordSent(t.Ip, MeasurePathBytes(path, isFolder), isFolder ? 0 : 1, 0);
                         RememberDevice(t.Ip, t.Port, true);
                     });
                     client.OnStopped += () =>
@@ -2057,6 +2314,9 @@ namespace TrFileTransfer
 
             if (success)
             {
+                long bytes = 0;
+                try { bytes = new FileInfo(filePath).Length; } catch { }
+                RecordSent(ip, bytes, 1, 0);
                 string destPath = Utils.GetUniqueSavePath(sentDir, fileName);
                 try { File.Move(filePath, destPath); } catch { }
                 RunOnUi(() =>

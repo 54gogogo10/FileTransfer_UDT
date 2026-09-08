@@ -337,5 +337,55 @@ namespace TrFileTransfer
             }
             return savePath;
         }
+
+        /// <summary>Headroom required on top of each incoming file (write cache, metadata, safety).</summary>
+        public const long DiskSpaceMargin = 64 * 1024 * 1024;
+
+        /// <summary>Whether the drive holding the directory has at least requiredBytes free.
+        /// Returns true when availability cannot be determined — a broken probe must not
+        /// block every transfer.</summary>
+        public static bool HasFreeSpace(string directory, long requiredBytes)
+        {
+            try
+            {
+                string root = Path.GetPathRoot(Path.GetFullPath(directory));
+                if (string.IsNullOrEmpty(root)) return true;
+                return new DriveInfo(root).AvailableFreeSpace >= requiredBytes;
+            }
+            catch
+            {
+                return true;
+            }
+        }
+    }
+
+    /// <summary>
+    /// IP filter list matching for the server receive gate. Entries are separated by
+    /// ';' or ','; each is an exact IPv4 address or a prefix ending in '*'
+    /// (e.g. "192.168.1.*"). "*" alone matches everything.
+    /// </summary>
+    public static class IpFilter
+    {
+        public static bool Matches(string listDefinition, string ip)
+        {
+            if (string.IsNullOrWhiteSpace(listDefinition) || string.IsNullOrEmpty(ip)) return false;
+            string[] parts = listDefinition.Split(new char[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < parts.Length; i++)
+            {
+                string entry = parts[i].Trim();
+                if (entry.Length == 0) continue;
+                if (entry == "*") return true;
+                if (entry[entry.Length - 1] == '*')
+                {
+                    string prefix = entry.Substring(0, entry.Length - 1);
+                    if (ip.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return true;
+                }
+                else if (string.Equals(entry, ip, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
     }
 }

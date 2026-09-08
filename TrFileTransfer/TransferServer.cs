@@ -42,6 +42,9 @@ namespace TrFileTransfer
         public event Action<IPEndPoint, TransferProgress> OnClientProgress;
         /// <summary>Fired when a single client's transfer completes.</summary>
         public event Action<IPEndPoint> OnClientTransferComplete;
+        /// <summary>Fired when a client connection finishes successfully, carrying the
+        /// received bytes/files for the transfer statistics.</summary>
+        public event Action<WireSessionStats> OnSessionStats;
 
         /// <summary>Whether the server is currently listening.</summary>
         public bool IsRunning { get { return _isRunning; } }
@@ -90,6 +93,41 @@ namespace TrFileTransfer
         {
             get { return _wire.PairingCode; }
             set { _wire.PairingCode = value; }
+        }
+
+        /// <summary>Discard incoming files identical to one already on disk (see ServerWireContext).</summary>
+        public bool SkipDuplicateFiles
+        {
+            get { return _wire.SkipDuplicateFiles; }
+            set { _wire.SkipDuplicateFiles = value; }
+        }
+
+        /// <summary>Save each client's files under a per-device subdirectory.</summary>
+        public bool PerDeviceFolder
+        {
+            get { return _wire.PerDeviceFolder; }
+            set { _wire.PerDeviceFolder = value; }
+        }
+
+        /// <summary>Connection gate: false drops the connection before any bytes are read.</summary>
+        public Func<string, bool> IpAllowed
+        {
+            get { return _wire.IpAllowed; }
+            set { _wire.IpAllowed = value; }
+        }
+
+        /// <summary>Receive confirmation prompt: (ip, name, size, fileCount, isFolder) → allowed?</summary>
+        public Func<string, string, long, int, bool, Task<bool>> ConfirmRequest
+        {
+            get { return _wire.ConfirmRequest; }
+            set { _wire.ConfirmRequest = value; }
+        }
+
+        /// <summary>Maps a client IP to a friendly device folder name (per-device mode).</summary>
+        public Func<string, string> ResolveDeviceName
+        {
+            get { return _wire.ResolveDeviceName; }
+            set { _wire.ResolveDeviceName = value; }
         }
 
         /// <summary>Starts listening for incoming connections. Fires OnStarted on success.</summary>
@@ -192,13 +230,25 @@ namespace TrFileTransfer
             };
             OnProgress += clientProgress;
 
+            string clientIp = clientEp != null ? clientEp.Address.ToString() : null;
+
             using (client)
             {
                 try
                 {
+                    WireOutcome outcome;
                     using (var ws = new TcpWireStream(client.GetStream(), L.S_ConnClosedUnexpectedly))
                     {
-                        await ServerWire.HandleClientAsync(ws, _wire, ct).ConfigureAwait(false);
+                        outcome = await ServerWire.HandleClientAsync(ws, _wire, ct, clientIp).ConfigureAwait(false);
+                    }
+
+                    RaiseSessionStats(outcome);
+
+                    if (outcome.Rejected)
+                    {
+                        // Close with an immediate RST so the sender's next write fails
+                        // instead of draining into a socket nobody reads
+                        try { client.LingerState = new System.Net.Sockets.LingerOption(true, 0); } catch { }
                     }
 
                     var ccHandler = OnClientTransferComplete;
@@ -223,6 +273,15 @@ namespace TrFileTransfer
                     OnProgress -= clientProgress;
                 }
             }
+        }
+
+        private void RaiseSessionStats(WireOutcome outcome)
+        {
+            if (outcome == null || outcome.Session == null) return;
+            if (!outcome.Success) return;
+            if (outcome.Session.Bytes <= 0 && outcome.Session.Files <= 0) return;
+            var handler = OnSessionStats;
+            if (handler != null) handler(outcome.Session);
         }
 
         private void Log(string msg)

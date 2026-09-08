@@ -800,10 +800,12 @@ namespace TrFileTransfer.Tests
 
             Console.WriteLine("--- Unit Tests ---");
             UnitTests.RunAll(runner);
+            FeatureTests.RunUnit(runner);
 
             Console.WriteLine();
             Console.WriteLine("--- Integration Tests ---");
             IntegrationTests.RunAll(runner);
+            FeatureTests.RunIntegration(runner);
 
             runner.PrintSummary();
             return runner.Failed > 0 ? 1 : 0;
