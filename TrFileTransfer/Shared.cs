@@ -113,8 +113,10 @@ namespace TrFileTransfer
                 _maxBytesPerSec = maxBytesPerSec;
             }
 
-            /// <summary>Records a chunk of bytes sent and sleeps as needed to stay within the limit.</summary>
-            public void Throttle(int bytes)
+            /// <summary>Records a chunk of bytes sent and delays as needed to stay within
+            /// the limit. Asynchronous so throttled sends never block a thread-pool thread
+            /// (a 4 MB chunk at a low limit can mean seconds of waiting).</summary>
+            public async System.Threading.Tasks.Task ThrottleAsync(int bytes, System.Threading.CancellationToken ct)
             {
                 if (_maxBytesPerSec <= 0) return;
                 _totalSent += bytes;
@@ -125,7 +127,7 @@ namespace TrFileTransfer
                 {
                     int ms = (int)(deficit * 1000.0);
                     if (ms > 0)
-                        System.Threading.Thread.Sleep(ms);
+                        await System.Threading.Tasks.Task.Delay(ms, ct).ConfigureAwait(false);
                 }
             }
         }
@@ -153,14 +155,57 @@ namespace TrFileTransfer
         {
             public const int ClientBufferSize = 4194304;
 
-            public static TransferClient CreateTcp(string serverIp, int port, string filePath, int srcPort, int speedLimit)
+            public static TransferClient CreateTcp(string serverIp, int port, string filePath, int srcPort, int speedLimit, string pairingCode = null)
             {
-                return new TransferClient(serverIp, port, filePath, srcPort, ClientBufferSize, speedLimit);
+                var client = new TransferClient(serverIp, port, filePath, srcPort, ClientBufferSize, speedLimit);
+                client.PairingCode = pairingCode;
+                return client;
             }
 
-            public static TransferUdtClient CreateUdt(string serverIp, int port, string filePath, int srcPort, int speedLimit)
+            public static TransferUdtClient CreateUdt(string serverIp, int port, string filePath, int srcPort, int speedLimit, string pairingCode = null)
             {
-                return new TransferUdtClient(serverIp, port, filePath, srcPort, ClientBufferSize, speedLimit);
+                var client = new TransferUdtClient(serverIp, port, filePath, srcPort, ClientBufferSize, speedLimit);
+                client.PairingCode = pairingCode;
+                return client;
+            }
+        }
+
+        /// <summary>
+        /// HKCU Run-key auto start — survives reboots without admin rights. The exe path
+        /// is passed explicitly so this class carries no WinForms dependency.
+        /// </summary>
+        public static class AutoStart
+        {
+            private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+            private const string ValueName = "TrFileTransfer";
+
+            /// <summary>Whether a TrFileTransfer value exists under HKCU ...\Run.</summary>
+            public static bool IsEnabled()
+            {
+                try
+                {
+                    using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKey))
+                        return key != null && key.GetValue(ValueName) != null;
+                }
+                catch { return false; }
+            }
+
+            /// <summary>Registers (enable=true, value = quoted exePath) or removes the entry.
+            /// Setting again with a new path overwrites; disabling when absent is a no-op.
+            /// CreateSubKey so a missing Run key (fresh profile) is created, not skipped.</summary>
+            public static void Set(bool enable, string exePath)
+            {
+                try
+                {
+                    using (var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RunKey))
+                    {
+                        if (enable)
+                            key.SetValue(ValueName, "\"" + exePath + "\"");
+                        else if (key.GetValue(ValueName) != null)
+                            key.DeleteValue(ValueName);
+                    }
+                }
+                catch { }
             }
         }
 
@@ -242,6 +287,41 @@ namespace TrFileTransfer
             return 0; // fallback: let OS assign ephemeral port
         }
 
+        /// <summary>Whether the port can currently be bound, probing TCP and/or UDP as requested.</summary>
+        public static bool IsPortFree(int port, bool tcp, bool udp)
+        {
+            if (tcp)
+            {
+                try
+                {
+                    var listener = new TcpListener(System.Net.IPAddress.Loopback, port);
+                    listener.Start();
+                    listener.Stop();
+                }
+                catch { return false; }
+            }
+            if (udp)
+            {
+                try
+                {
+                    var probe = new UdpClient(port);
+                    probe.Close();
+                }
+                catch { return false; }
+            }
+            return true;
+        }
+
+        /// <summary>First free port scanning upward from start (inclusive); 0 when none in range.</summary>
+        public static int FindFreePortFrom(int start, bool tcp, bool udp)
+        {
+            for (int p = start; p < start + 128; p++)
+            {
+                if (IsPortFree(p, tcp, udp)) return p;
+            }
+            return 0;
+        }
+
         /// <summary>Returns a unique file/directory path by appending _1, _2, etc. when collisions exist.</summary>
         public static string GetUniqueSavePath(string directory, string name)
         {
@@ -256,6 +336,56 @@ namespace TrFileTransfer
                 counter++;
             }
             return savePath;
+        }
+
+        /// <summary>Headroom required on top of each incoming file (write cache, metadata, safety).</summary>
+        public const long DiskSpaceMargin = 64 * 1024 * 1024;
+
+        /// <summary>Whether the drive holding the directory has at least requiredBytes free.
+        /// Returns true when availability cannot be determined — a broken probe must not
+        /// block every transfer.</summary>
+        public static bool HasFreeSpace(string directory, long requiredBytes)
+        {
+            try
+            {
+                string root = Path.GetPathRoot(Path.GetFullPath(directory));
+                if (string.IsNullOrEmpty(root)) return true;
+                return new DriveInfo(root).AvailableFreeSpace >= requiredBytes;
+            }
+            catch
+            {
+                return true;
+            }
+        }
+    }
+
+    /// <summary>
+    /// IP filter list matching for the server receive gate. Entries are separated by
+    /// ';' or ','; each is an exact IPv4 address or a prefix ending in '*'
+    /// (e.g. "192.168.1.*"). "*" alone matches everything.
+    /// </summary>
+    public static class IpFilter
+    {
+        public static bool Matches(string listDefinition, string ip)
+        {
+            if (string.IsNullOrWhiteSpace(listDefinition) || string.IsNullOrEmpty(ip)) return false;
+            string[] parts = listDefinition.Split(new char[] { ';', ',' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < parts.Length; i++)
+            {
+                string entry = parts[i].Trim();
+                if (entry.Length == 0) continue;
+                if (entry == "*") return true;
+                if (entry[entry.Length - 1] == '*')
+                {
+                    string prefix = entry.Substring(0, entry.Length - 1);
+                    if (ip.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return true;
+                }
+                else if (string.Equals(entry, ip, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            return false;
         }
     }
 }

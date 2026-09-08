@@ -1,0 +1,17 @@
+CXX = g++
+
+CCFLAGS = -DWIN32 -DNDEBUG -DUDT_EXPORTS -O2 -fno-strict-aliasing -Wall -Wextra -finline-functions -fvisibility=hidden
+
+OBJS = api.o buffer.o cache.o ccc.o channel.o common.o core.o epoll.o list.o md5.o packet.o queue.o window.o
+
+all: udt.dll
+
+%.o: %.cpp %.h udt.h
+	$(CXX) $(CCFLAGS) -c $< -o $@
+
+udt.dll: $(OBJS)
+	$(CXX) -shared -o $@ $^ -lws2_32 -static-libgcc -static-libstdc++
+	@echo "=== udt.dll built successfully ==="
+
+clean:
+	rm -f *.o udt.dll

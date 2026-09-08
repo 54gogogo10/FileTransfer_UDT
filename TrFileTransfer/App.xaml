@@ -1,0 +1,9 @@
+<Application x:Class="TrFileTransfer.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             ShutdownMode="OnMainWindowClose">
+    <!-- Theme dictionaries (Tokens + Controls) are merged at runtime by
+         ThemeManager.Initialize so every brush is an unfrozen mutable clone
+         BEFORE any template parses — that is what makes live dark/light
+         switching possible. -->
+</Application>

@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <LangVersion>latest</LangVersion>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 仅编译期引用 net48 引用程序集（本机/CI 均无 4.8 targeting pack），不进运行时 -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <!-- 仅用 WinForms 的 NotifyIcon/FolderBrowserDialog 与 System.Drawing 的图标（net48 WPF 无零依赖替代） -->
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Drawing" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 测试构建（Tests/build.bat，老 csc）单独编译 Tests 下的文件，此处必须排除 -->
+    <Compile Remove="Tests\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 原生 DLL 嵌入：LogicalName 必须与 TransferUdt.cs 运行时查找的资源名精确一致 -->
+    <None Remove="udt.dll" />
+    <None Remove="libmcfgthread-2.dll" />
+    <EmbeddedResource Include="udt.dll" Condition="Exists('udt.dll')" LogicalName="TrFileTransfer.udt.dll" />
+    <EmbeddedResource Include="libmcfgthread-2.dll" Condition="Exists('libmcfgthread-2.dll')" LogicalName="TrFileTransfer.libmcfgthread-2.dll" />
+  </ItemGroup>
+
+</Project>

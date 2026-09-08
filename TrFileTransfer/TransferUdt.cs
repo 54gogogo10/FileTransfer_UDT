@@ -245,6 +245,8 @@ namespace TrFileTransfer
         public event Action OnTransferComplete;
         /// <summary>Fired when a file has been fully received and saved (path, size).</summary>
         public event Action<string, long> OnFileReceived;
+        /// <summary>Fired when a 0x06 text message has been received.</summary>
+        public event Action<string> OnTextReceived;
         /// <summary>Fired when the server starts listening.</summary>
         public event Action OnStarted;
         /// <summary>Fired when the server stops.</summary>
@@ -255,9 +257,55 @@ namespace TrFileTransfer
         public event Action<IPEndPoint, TransferProgress> OnClientProgress;
         /// <summary>Fired when a single client's transfer completes.</summary>
         public event Action<IPEndPoint> OnClientTransferComplete;
+        /// <summary>Fired when a client connection finishes successfully, carrying the
+        /// received bytes/files for the transfer statistics.</summary>
+        public event Action<WireSessionStats> OnSessionStats;
 
         /// <summary>Whether the server is currently listening.</summary>
         public bool IsRunning { get { return _isRunning; } }
+
+        /// <summary>When non-empty, clients must present this pairing code (0x05) before
+        /// any transfer is accepted. Set before Start().</summary>
+        public string PairingCode
+        {
+            get { return _wire.PairingCode; }
+            set { _wire.PairingCode = value; }
+        }
+
+        /// <summary>Discard incoming files identical to one already on disk (see ServerWireContext).</summary>
+        public bool SkipDuplicateFiles
+        {
+            get { return _wire.SkipDuplicateFiles; }
+            set { _wire.SkipDuplicateFiles = value; }
+        }
+
+        /// <summary>Save each client's files under a per-device subdirectory.</summary>
+        public bool PerDeviceFolder
+        {
+            get { return _wire.PerDeviceFolder; }
+            set { _wire.PerDeviceFolder = value; }
+        }
+
+        /// <summary>Connection gate: false drops the connection before any bytes are read.</summary>
+        public Func<string, bool> IpAllowed
+        {
+            get { return _wire.IpAllowed; }
+            set { _wire.IpAllowed = value; }
+        }
+
+        /// <summary>Receive confirmation prompt: (ip, name, size, fileCount, isFolder) → allowed?</summary>
+        public Func<string, string, long, int, bool, Task<bool>> ConfirmRequest
+        {
+            get { return _wire.ConfirmRequest; }
+            set { _wire.ConfirmRequest = value; }
+        }
+
+        /// <summary>Maps a client IP to a friendly device folder name (per-device mode).</summary>
+        public Func<string, string> ResolveDeviceName
+        {
+            get { return _wire.ResolveDeviceName; }
+            set { _wire.ResolveDeviceName = value; }
+        }
 
         /// <summary>Creates a UDT server that listens for incoming file transfers.</summary>
         /// <param name="bindAddress">IPv4 address to bind to, or "0.0.0.0" for all interfaces.</param>
@@ -285,6 +333,10 @@ namespace TrFileTransfer
             _wire.Cb.FileReceived = delegate(string path, long size)
             {
                 var h = OnFileReceived; if (h != null) h(path, size);
+            };
+            _wire.Cb.TextReceived = delegate(string text)
+            {
+                var h = OnTextReceived; if (h != null) h(text);
             };
         }
 
@@ -409,10 +461,13 @@ namespace TrFileTransfer
                     UdtNative.udt_setsockopt(clientSocket, 0, UdtNative.UDT_SNDBUF, ref bufSize, 4);
                     UdtNative.udt_setsockopt(clientSocket, 0, UdtNative.UDT_RCVBUF, ref bufSize, 4);
                     lock (_clientSockets) { _clientSockets.Add(clientSocket); }
-                    // sin_addr/sin_port are uint/ushort in network byte order.
-                    // Must cast to unsigned before NetworkToHostOrder to avoid sign extension.
+                    // sin_port needs a 16-bit NetworkToHostOrder byteswap. sin_addr must
+                    // NOT be swapped: the struct's uint already little-endian-reads the
+                    // network-order bytes into exactly the layout IPAddress(long) expects
+                    // on Windows (cf. IPAddress.Loopback == 0x0100007F) — swapping it
+                    // renders the address reversed (e.g. 1.0.0.127).
                     var clientEp = new IPEndPoint(
-                        new IPAddress((long)(uint)IPAddress.NetworkToHostOrder((int)addr.sin_addr)),
+                        new IPAddress((long)addr.sin_addr),
                         (int)(ushort)IPAddress.NetworkToHostOrder((short)addr.sin_port));
                     Log(L.S_ClientConnected(clientEp));
                     var _ = HandleClient(clientSocket, ct, clientEp);
@@ -444,7 +499,8 @@ namespace TrFileTransfer
             var ws = new UdtWireStream(clientSocket, true);
             try
             {
-                WireOutcome outcome = await ServerWire.HandleClientAsync(ws, _wire, ct).ConfigureAwait(false);
+                string clientIp = clientEp != null ? clientEp.Address.ToString() : null;
+                WireOutcome outcome = await ServerWire.HandleClientAsync(ws, _wire, ct, clientIp).ConfigureAwait(false);
 
                 if (outcome.IsChunked)
                 {
@@ -454,14 +510,23 @@ namespace TrFileTransfer
                     await Task.Run(() => UdtNative.udt_send(clientSocket, ack2, 1, 0), ct).ConfigureAwait(false);
                     var ccHandler = OnClientTransferComplete;
                     if (ccHandler != null) ccHandler(clientEp);
+                    RaiseSessionStats(outcome);
                 }
                 else if (outcome.Success)
                 {
                     var ccHandler = OnClientTransferComplete;
                     if (ccHandler != null) ccHandler(clientEp);
+                    RaiseSessionStats(outcome);
                     // Application-level ACK only on verified success
                     var ack = new byte[1] { 0x01 };
                     await Task.Run(() => UdtNative.udt_send(clientSocket, ack, 1, 0), ct).ConfigureAwait(false);
+                }
+                else if (outcome.Rejected)
+                {
+                    // Explicit NACK so the client fails fast instead of waiting out its
+                    // ACK timeout (0x00 = refused by policy)
+                    var nack = new byte[1] { 0x00 };
+                    await Task.Run(() => UdtNative.udt_send(clientSocket, nack, 1, 0), ct).ConfigureAwait(false);
                 }
             }
             catch (OperationCanceledException) { }
@@ -484,6 +549,15 @@ namespace TrFileTransfer
                 ws.Dispose(); // closes the native socket, unblocking pending I/O
                 System.Threading.Interlocked.Decrement(ref _activeClients);
             }
+        }
+
+        private void RaiseSessionStats(WireOutcome outcome)
+        {
+            if (outcome == null || outcome.Session == null) return;
+            if (!outcome.Success) return;
+            if (outcome.Session.Bytes <= 0 && outcome.Session.Files <= 0) return;
+            var handler = OnSessionStats;
+            if (handler != null) handler(outcome.Session);
         }
 
         private void Log(string msg)
@@ -528,6 +602,14 @@ namespace TrFileTransfer
         /// <summary>Whether a transfer is currently in progress.</summary>
         public bool IsRunning { get { return _isRunning; } }
 
+        /// <summary>Pairing code sent as a 0x05/0x07 auth frame before any transfer.
+        /// Null/empty sends nothing (compatible with servers that don't require it).</summary>
+        public string PairingCode { get; set; }
+
+        /// <summary>When a pairing code is set, try the 0x07 encrypted handshake first
+        /// (falls back to plain 0x05 against older peers). Default from Config "Encrypt".</summary>
+        public bool EncryptionEnabled { get; set; }
+
         /// <summary>Creates a UDT client for sending files or folders.</summary>
         /// <param name="serverIp">Target server IPv4 address.</param>
         /// <param name="port">Target server port.</param>
@@ -553,6 +635,7 @@ namespace TrFileTransfer
             _bufferSize = bufferSize;
             _localPort = localPort;
             _limiter = new SpeedLimiter(maxBytesPerSec);
+            EncryptionEnabled = Config.GetBool("Encrypt", true);
             _cb.Log = Log;
             _cb.Progress = delegate(TransferProgress p)
             {
@@ -590,10 +673,12 @@ namespace TrFileTransfer
         /// <summary>Sends a folder with resume support (type 0x04). Interrupted sessions
         /// continue from where the server's files on disk left off.</summary>
         /// <param name="existingSessionId">Session to resume, or null for a new session.</param>
-        public async Task<Guid> SendFolderResumableAsync(Guid? existingSessionId = null)
+        /// <param name="keepState">Sync mode — keep the session state after completion so
+        /// repeat runs send only differences.</param>
+        public async Task<Guid> SendFolderResumableAsync(Guid? existingSessionId = null, bool keepState = false)
         {
             var sessionId = existingSessionId ?? Guid.NewGuid();
-            await RunUdtTransfer(ct => SendFolderResumableInternal(sessionId, ct));
+            await RunUdtTransfer(ct => SendFolderResumableInternal(sessionId, ct, keepState));
             return sessionId;
         }
 
@@ -602,6 +687,12 @@ namespace TrFileTransfer
             var sessionId = existingSessionId ?? Guid.NewGuid();
             await RunUdtTransfer(ct => SendResumableUdtInternal(sessionId, ct, verifyHash));
             return sessionId;
+        }
+
+        /// <summary>Sends a UTF-8 text message (type 0x06) over UDT.</summary>
+        public async Task SendTextAsync(string text)
+        {
+            await RunUdtTransfer(ct => SendTextInternal(text, ct));
         }
 
         private async Task RunUdtTransfer(Func<CancellationToken, Task> transferAction)
@@ -615,13 +706,17 @@ namespace TrFileTransfer
             try
             {
                 UdtDll.EnsureExtracted();
-                UdtNative.UdtStartup();
+                if (!UdtNative.UdtStartup())
+                    throw new Exception("UDT library init failed");
                 await transferAction(_cts.Token).ConfigureAwait(false);
                 // Wait for server ACK before closing — confirms data was received
+                // (0x01 = success, 0x00 = refused by receiver policy)
                 var ackBuf = new byte[1];
                 int ackTimeout = 30000;
                 UdtNative.udt_setsockopt(_socket, 0, UdtNative.UDT_RCVTIMEO, ref ackTimeout, 4);
-                await Task.Run(() => UdtNative.udt_recv(_socket, ackBuf, 1, 0), _cts.Token).ConfigureAwait(false);
+                int ackRead = await Task.Run(() => UdtNative.udt_recv(_socket, ackBuf, 1, 0), _cts.Token).ConfigureAwait(false);
+                if (ackRead == 1 && ackBuf[0] == 0)
+                    throw new IOException(L.C_RejectedByPeer);
             }
             catch (OperationCanceledException)
             {
@@ -689,10 +784,48 @@ namespace TrFileTransfer
             await UdtIo.WaitForConnectionReady(_socket, ct);
         }
 
+        /// <summary>
+        /// Connects and runs the auth handshake, wrapping the wire stream for encryption
+        /// when the peer accepts 0x07. Against an older peer (no 0x17 answer) the
+        /// connection is re-established once and the plain 0x05 frame is used instead.
+        /// </summary>
+        private async Task<IWireStream> OpenAndAuthenticateAsync(CancellationToken ct)
+        {
+            bool allowEncrypt = EncryptionEnabled;
+            for (int attempt = 0; ; attempt++)
+            {
+                await UdtConnect(ct).ConfigureAwait(false);
+                var raw = new UdtWireStream(_socket, false);
+                AuthResult auth;
+                try
+                {
+                    // Short receive window: an older peer that does not know 0x07 never
+                    // answers, and waiting out the full 30s timeout would feel broken
+                    UdtNative.SetTimeout(_socket, 8000, 30000);
+                    auth = await ClientWire.AuthenticateAsync(raw, PairingCode, allowEncrypt, _cb, ct).ConfigureAwait(false);
+                    UdtNative.SetTimeout(_socket, 30000, 30000);
+                }
+                catch
+                {
+                    raw.Dispose();
+                    throw;
+                }
+                if (auth.NeedPlainFallback && allowEncrypt && attempt == 0)
+                {
+                    raw.Dispose();
+                    try { UdtNative.udt_close(_socket); } catch { }
+                    _socket = -1;
+                    allowEncrypt = false;
+                    _cb.RaiseLog(L.C_EncryptFallback);
+                    continue;
+                }
+                return auth.Stream;
+            }
+        }
+
         private async Task SendFileInternal(CancellationToken ct)
         {
-            await UdtConnect(ct);
-            using (var ws = new UdtWireStream(_socket, false))
+            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
             {
                 await ClientWire.SendSingleFileAsync(ws, _filePath, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
@@ -700,8 +833,7 @@ namespace TrFileTransfer
 
         private async Task SendFolderInternal(string folderPath, CancellationToken ct)
         {
-            await UdtConnect(ct);
-            using (var ws = new UdtWireStream(_socket, false))
+            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
             {
                 await ClientWire.SendFolderAsync(ws, folderPath, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
@@ -709,31 +841,36 @@ namespace TrFileTransfer
 
         private async Task SendChunkedInternal(long offset, long chunkSize, long totalSize, CancellationToken ct)
         {
-            await UdtConnect(ct);
-            using (var ws = new UdtWireStream(_socket, false))
+            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
             {
                 await ClientWire.SendChunkAsync(ws, _filePath, offset, chunkSize, totalSize,
                     _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
         }
 
-        private async Task SendFolderResumableInternal(Guid sessionId, CancellationToken ct)
+        private async Task SendFolderResumableInternal(Guid sessionId, CancellationToken ct, bool keepState)
         {
-            await UdtConnect(ct);
-            using (var ws = new UdtWireStream(_socket, false))
+            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
             {
                 await ClientWire.SendFolderResumableAsync(ws, _filePath, sessionId,
-                    _serverIp, _port, true, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
+                    _serverIp, _port, true, _bufferSize, _limiter, _cb, ct, keepState).ConfigureAwait(false);
             }
         }
 
         private async Task SendResumableUdtInternal(Guid sessionId, CancellationToken ct, bool verifyHash)
         {
-            await UdtConnect(ct);
-            using (var ws = new UdtWireStream(_socket, false))
+            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
             {
                 await ClientWire.SendResumableAsync(ws, _filePath, sessionId, verifyHash,
                     _serverIp, _port, true, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
+            }
+        }
+
+        private async Task SendTextInternal(string text, CancellationToken ct)
+        {
+            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
+            {
+                await ClientWire.SendTextAsync(ws, text, _cb, ct).ConfigureAwait(false);
             }
         }
 
@@ -749,30 +886,37 @@ namespace TrFileTransfer
 
     internal static class UdtIo
     {
-        /// <summary>Last native UDT error description (set on the thread that called udt_recv/udt_send).</summary>
-        public static string LastError;
-
         public static async Task<int> UdtReadExactAsync(int socket, byte[] buffer, int offset, int count, CancellationToken ct)
         {
             int totalRead = 0;
             while (totalRead < count)
             {
-                int read = await UdtReadAsync(socket, buffer, offset + totalRead, count - totalRead, ct);
+                // The error description is captured inside the Task.Run lambda and read
+                // after the await — per call, instead of a static field that races
+                // between concurrent transfers and mislabels this connection.
+                var error = new string[1];
+                int read = await UdtReadCoreAsync(socket, buffer, offset + totalRead, count - totalRead, ct, error);
                 if (read <= 0)
-                    throw new IOException(L.S_ConnClosedUnexpectedly + (LastError != null ? " [" + LastError + "]" : ""));
+                    throw new IOException(L.S_ConnClosedUnexpectedly + (error[0] != null ? " [" + error[0] + "]" : ""));
                 totalRead += read;
             }
             return totalRead;
         }
 
-        public static async Task<int> UdtReadAsync(int socket, byte[] buffer, int offset, int count, CancellationToken ct)
+        public static Task<int> UdtReadAsync(int socket, byte[] buffer, int offset, int count, CancellationToken ct)
+        {
+            return UdtReadCoreAsync(socket, buffer, offset, count, ct, new string[1]);
+        }
+
+        private static async Task<int> UdtReadCoreAsync(int socket, byte[] buffer, int offset, int count,
+            CancellationToken ct, string[] error)
         {
             // Short reads: if offset != 0, need a temp buffer or slice
             byte[] target = offset == 0 ? buffer : new byte[count];
             int result = await Task.Run(() =>
             {
                 int r = UdtNative.udt_recv(socket, target, count, 0);
-                LastError = r <= 0 ? UdtNative.GetErrorDesc() : null;
+                if (r <= 0) error[0] = UdtNative.GetErrorDesc();
                 return r;
             }, ct);
             if (result > 0 && offset != 0)
@@ -796,17 +940,15 @@ namespace TrFileTransfer
                     sendBuf = new byte[remaining];
                     Buffer.BlockCopy(buffer, offset + totalSent, sendBuf, 0, remaining);
                 }
+                string error = null;
                 int sent = await Task.Run(() =>
                 {
                     int s = UdtNative.udt_send(socket, sendBuf, remaining, 0);
-                    LastError = s < 0 ? UdtNative.GetErrorDesc() : null;
+                    if (s < 0) error = UdtNative.GetErrorDesc();
                     return s;
                 }, ct);
                 if (sent < 0)
-                {
-                    string err = LastError ?? "unknown";
-                    throw new IOException("UDT send failed: " + err);
-                }
+                    throw new IOException("UDT send failed: " + (error ?? "unknown"));
                 totalSent += sent;
             }
         }
