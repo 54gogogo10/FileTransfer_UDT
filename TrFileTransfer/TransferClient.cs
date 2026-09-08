@@ -37,6 +37,14 @@ namespace TrFileTransfer
         /// <summary>Whether a transfer is currently in progress.</summary>
         public bool IsRunning { get { return _isRunning; } }
 
+        /// <summary>Pairing code sent as a 0x05 auth frame before any transfer.
+        /// Null/empty sends nothing (compatible with servers that don't require it).</summary>
+        public string PairingCode { get; set; }
+
+        /// <summary>When a pairing code is set, try the 0x07 encrypted handshake first
+        /// (falls back to plain 0x05 against older peers). Default from Config "Encrypt".</summary>
+        public bool EncryptionEnabled { get; set; }
+
         /// <summary>
         /// Creates a TCP client for sending files or folders.
         /// </summary>
@@ -64,6 +72,7 @@ namespace TrFileTransfer
             _bufferSize = bufferSize;
             _localPort = localPort;
             _limiter = new SpeedLimiter(maxBytesPerSec);
+            EncryptionEnabled = Config.GetBool("Encrypt", true);
             _cb.Log = Log;
             _cb.Progress = delegate(TransferProgress p)
             {
@@ -101,10 +110,12 @@ namespace TrFileTransfer
         /// <summary>Sends a folder with resume support (type 0x04). Interrupted sessions
         /// continue from where the server's files on disk left off.</summary>
         /// <param name="existingSessionId">Session to resume, or null for a new session.</param>
-        public async Task<Guid> SendFolderResumableAsync(Guid? existingSessionId = null)
+        /// <param name="keepState">Sync mode — keep the session state after completion so
+        /// repeat runs send only differences.</param>
+        public async Task<Guid> SendFolderResumableAsync(Guid? existingSessionId = null, bool keepState = false)
         {
             var sessionId = existingSessionId ?? Guid.NewGuid();
-            await RunTransfer(ct => SendFolderResumableInternal(sessionId, ct));
+            await RunTransfer(ct => SendFolderResumableInternal(sessionId, ct, keepState));
             return sessionId;
         }
 
@@ -117,6 +128,12 @@ namespace TrFileTransfer
             var sessionId = existingSessionId ?? Guid.NewGuid();
             await RunTransfer(ct => SendResumableInternal(sessionId, ct, verifyHash));
             return sessionId;
+        }
+
+        /// <summary>Sends a UTF-8 text message (type 0x06) over TCP.</summary>
+        public async Task SendTextAsync(string text)
+        {
+            await RunTransfer(ct => SendTextInternal(text, ct));
         }
 
         private async Task RunTransfer(Func<CancellationToken, Task> transferAction)
@@ -196,9 +213,41 @@ namespace TrFileTransfer
             }
         }
 
+        /// <summary>
+        /// Connects and runs the auth handshake, wrapping the wire stream for encryption
+        /// when the peer accepts 0x07. Against an older peer (no 0x17 answer) the
+        /// connection is re-established once and the plain 0x05 frame is used instead.
+        /// </summary>
+        private async Task<IWireStream> OpenAndAuthenticateAsync(CancellationToken ct)
+        {
+            bool allowEncrypt = EncryptionEnabled;
+            for (int attempt = 0; ; attempt++)
+            {
+                TcpWireStream raw = await ConnectAsync(ct).ConfigureAwait(false);
+                AuthResult auth;
+                try
+                {
+                    auth = await ClientWire.AuthenticateAsync(raw, PairingCode, allowEncrypt, _cb, ct).ConfigureAwait(false);
+                }
+                catch
+                {
+                    raw.Dispose();
+                    throw;
+                }
+                if (auth.NeedPlainFallback && allowEncrypt && attempt == 0)
+                {
+                    raw.Dispose();
+                    allowEncrypt = false;
+                    _cb.RaiseLog(L.C_EncryptFallback);
+                    continue;
+                }
+                return auth.Stream;
+            }
+        }
+
         private async Task SendFileInternal(CancellationToken ct)
         {
-            using (var ws = await ConnectAsync(ct).ConfigureAwait(false))
+            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
             {
                 await ClientWire.SendSingleFileAsync(ws, _filePath, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
@@ -206,7 +255,7 @@ namespace TrFileTransfer
 
         private async Task SendFolderInternal(string folderPath, CancellationToken ct)
         {
-            using (var ws = await ConnectAsync(ct).ConfigureAwait(false))
+            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
             {
                 await ClientWire.SendFolderAsync(ws, folderPath, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
@@ -214,28 +263,36 @@ namespace TrFileTransfer
 
         private async Task SendChunkedInternal(long offset, long chunkSize, long totalSize, CancellationToken ct)
         {
-            using (var ws = await ConnectAsync(ct).ConfigureAwait(false))
+            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
             {
                 await ClientWire.SendChunkAsync(ws, _filePath, offset, chunkSize, totalSize,
                     _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
         }
 
-        private async Task SendFolderResumableInternal(Guid sessionId, CancellationToken ct)
+        private async Task SendFolderResumableInternal(Guid sessionId, CancellationToken ct, bool keepState)
         {
-            using (var ws = await ConnectAsync(ct).ConfigureAwait(false))
+            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
             {
                 await ClientWire.SendFolderResumableAsync(ws, _filePath, sessionId,
-                    _serverIp, _port, false, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
+                    _serverIp, _port, false, _bufferSize, _limiter, _cb, ct, keepState).ConfigureAwait(false);
             }
         }
 
         private async Task SendResumableInternal(Guid sessionId, CancellationToken ct, bool verifyHash)
         {
-            using (var ws = await ConnectAsync(ct).ConfigureAwait(false))
+            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
             {
                 await ClientWire.SendResumableAsync(ws, _filePath, sessionId, verifyHash,
                     _serverIp, _port, false, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
+            }
+        }
+
+        private async Task SendTextInternal(string text, CancellationToken ct)
+        {
+            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
+            {
+                await ClientWire.SendTextAsync(ws, text, _cb, ct).ConfigureAwait(false);
             }
         }
 

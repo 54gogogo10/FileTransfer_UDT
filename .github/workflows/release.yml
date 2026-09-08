@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build app (TrFileTransfer.exe)
+        shell: cmd
+        run: cd TrFileTransfer && build.bat
+
+      - name: Build tests
+        shell: cmd
+        run: cd TrFileTransfer\Tests && build.bat
+
+      - name: Stage UDT DLLs for tests
+        shell: cmd
+        run: copy /Y TrFileTransfer\udt.dll TrFileTransfer\Tests\ && copy /Y TrFileTransfer\libmcfgthread-2.dll TrFileTransfer\Tests\
+
+      - name: Run tests
+        shell: cmd
+        run: cd TrFileTransfer\Tests && TrFileTransfer.Tests.exe
+
+      # The updater refuses releases without a .sha256 sidecar — this file is mandatory
+      - name: Build sha256 sidecar
+        shell: pwsh
+        run: |
+          $sha = (Get-FileHash TrFileTransfer\TrFileTransfer.exe -Algorithm SHA256).Hash.ToLower()
+          "$sha  TrFileTransfer.exe" | Out-File -Encoding ascii -NoNewline TrFileTransfer\TrFileTransfer.exe.sha256
+          Write-Output "sidecar: $sha"
+
+      # Guard against a tag that does not match the built version (updater compares them)
+      - name: Verify tag matches assembly version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $ver = (Get-Item TrFileTransfer\TrFileTransfer.exe).VersionInfo.FileVersion
+          if ($tag -ne $ver) { throw "tag v$tag != assembly version $ver" }
+
+      - name: Create release and upload assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $existing = gh release view $tag --repo ${{ github.repository }} 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Output "release $tag already exists — uploading assets to it"
+          } else {
+            gh release create $tag --repo ${{ github.repository }} --title "TrFileTransfer $tag" --generate-notes
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+          }
+          gh release upload $tag --repo ${{ github.repository }} --clobber TrFileTransfer\TrFileTransfer.exe TrFileTransfer\TrFileTransfer.exe.sha256
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
+          gh release view $tag --repo ${{ github.repository }} --json url --jq .url

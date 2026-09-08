@@ -10,3 +10,4 @@ bin/
 obj/
 .claude/
 *.xml
+TrFileTransfer.exe.config

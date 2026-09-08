@@ -1,0 +1,360 @@
+<Window x:Class="TrFileTransfer.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:TrFileTransfer"
+        Title="TrFileTransfer"
+        Background="{DynamicResource Brush.Window}"
+        FontFamily="{StaticResource Font.Main}" FontSize="12"
+        UseLayoutRounding="True" TextOptions.TextFormattingMode="Display"
+        AllowDrop="True" ShowInTaskbar="True">
+    <Grid Margin="14,10,14,12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="38"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="12"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="12"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <!-- ==================== Header ==================== -->
+        <Grid Grid.Row="0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock x:Name="_lblHeader" Text="" FontSize="17" FontWeight="Bold"
+                       Foreground="{DynamicResource Brush.TextPrimary}" VerticalAlignment="Center"/>
+            <ComboBox x:Name="_cmbLang" Grid.Column="1" Width="92" Style="{StaticResource CmbInput}"
+                      VerticalAlignment="Center" SelectionChanged="CmbLang_SelectedIndexChanged"/>
+            <Button x:Name="_btnTheme" Grid.Column="2" MinWidth="44" Margin="8,0,0,0"
+                    Style="{StaticResource BtnSecondary}" Click="BtnTheme_Click"
+                    VerticalAlignment="Center"/>
+            <Button x:Name="_btnHelp" Grid.Column="3" MinWidth="88" Margin="8,0,0,0"
+                    Style="{StaticResource BtnSecondary}" Click="BtnHelp_Click"
+                    VerticalAlignment="Center"/>
+            <Button x:Name="_btnCheckUpdate" Grid.Column="4" MinWidth="104" Margin="8,0,0,0"
+                    Style="{StaticResource BtnSecondary}" Click="BtnCheckUpdate_Click"
+                    VerticalAlignment="Center"/>
+        </Grid>
+
+        <!-- ==================== Server + client cards ==================== -->
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="14"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <!-- Server card -->
+            <Border Grid.Column="0" Style="{StaticResource Card}">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                        <Rectangle Width="3" Height="14" RadiusX="1.5" RadiusY="1.5"
+                                   Fill="{DynamicResource Brush.Accent}" VerticalAlignment="Center"/>
+                        <TextBlock x:Name="_icoServer" FontFamily="{StaticResource Font.Icon}" FontSize="13"
+                                   Foreground="{DynamicResource Brush.AccentHover}" VerticalAlignment="Center"
+                                   Margin="10,0,0,0" Visibility="Collapsed"/>
+                        <TextBlock x:Name="_hdrServer" Style="{StaticResource SectionTitle}" Margin="7,0,0,0"/>
+                    </StackPanel>
+
+                    <!-- Bind / port / protocols -->
+                    <Grid Grid.Row="1" Margin="0,0,0,8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="70"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock x:Name="_lblBind" Style="{StaticResource FieldLabel}" Margin="0,0,6,0"/>
+                        <ComboBox x:Name="_cmbBind" Grid.Column="1" Style="{StaticResource CmbInput}"
+                                  VerticalAlignment="Center"/>
+                        <TextBlock x:Name="_lblPortS" Grid.Column="2" Style="{StaticResource FieldLabel}" Margin="8,0,6,0"/>
+                        <TextBox x:Name="_txtPortS" Grid.Column="3" Style="{StaticResource TxtInput}"
+                                 VerticalAlignment="Center"/>
+                        <CheckBox x:Name="_chkServerTcp" Grid.Column="4" Style="{StaticResource ChkBox}"
+                                  Content="TCP" Margin="10,0,0,0" VerticalAlignment="Center"/>
+                        <CheckBox x:Name="_chkServerUdt" Grid.Column="5" Style="{StaticResource ChkBox}"
+                                  Content="UDT" Margin="10,0,0,0" VerticalAlignment="Center"/>
+                    </Grid>
+
+                    <!-- Save dir -->
+                    <Grid Grid.Row="2" Margin="0,0,0,8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock x:Name="_lblSaveDir" Style="{StaticResource FieldLabel}" Margin="0,0,6,0"/>
+                        <TextBox x:Name="_txtSaveDir" Grid.Column="1" Style="{StaticResource TxtInput}"
+                                 VerticalAlignment="Center"/>
+                        <Button x:Name="_btnBrowseDir" Grid.Column="2" Style="{StaticResource BtnSecondary}"
+                                MinWidth="64" Margin="8,0,0,0" Click="BtnBrowseDir_Click"/>
+                    </Grid>
+
+                    <!-- Actions: start/stop left, open/recent right -->
+                    <Grid Grid.Row="3" Margin="0,0,0,8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Orientation="Horizontal">
+                            <Button x:Name="_btnStartServer" Style="{StaticResource BtnPrimary}" MinWidth="88"
+                                    Click="BtnStartServer_Click"/>
+                            <Button x:Name="_btnStopServer" Style="{StaticResource BtnSecondary}" MinWidth="88"
+                                    Margin="8,0,0,0" IsEnabled="False" Click="BtnStopServer_Click"/>
+                        </StackPanel>
+                        <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right">
+                            <Button x:Name="_btnOpenDir" Style="{StaticResource BtnSecondary}" MinWidth="76"
+                                    Click="BtnOpenDir_Click"/>
+                            <Button x:Name="_btnRecent" Style="{StaticResource BtnSecondary}" MinWidth="76"
+                                    Margin="8,0,0,0" Click="BtnRecent_Click"/>
+                        </StackPanel>
+                    </Grid>
+
+                    <!-- Services: HTTP share | pairing -->
+                    <StackPanel Grid.Row="4" Orientation="Horizontal">
+                        <TextBlock x:Name="_lblHttpPort" Style="{StaticResource FieldLabel}" Margin="0,0,6,0"/>
+                        <local:NumericBox x:Name="_numHttpPort" Width="84" Min="1" Max="65535" VerticalAlignment="Center"/>
+                        <Button x:Name="_btnHttpShare" Style="{StaticResource BtnSecondary}" MinWidth="76"
+                                Margin="8,0,0,0" Click="BtnHttpShare_Click"/>
+                        <Rectangle Width="1" Height="18" RadiusX="0.5" RadiusY="0.5"
+                                   Fill="{DynamicResource Brush.CardBorder}" VerticalAlignment="Center" Margin="12,0"/>
+                        <CheckBox x:Name="_chkPairing" Style="{StaticResource ChkBox}" Margin="0,0,0,0"
+                                  Checked="ChkPairing_CheckedChanged" Unchecked="ChkPairing_CheckedChanged"/>
+                        <TextBlock x:Name="_lblPairingCode" Margin="8,0,0,0" VerticalAlignment="Center"
+                                   FontFamily="{StaticResource Font.Mono}" FontWeight="Bold" FontSize="13"
+                                   Foreground="{DynamicResource Brush.AccentHover}" Visibility="Collapsed"/>
+                    </StackPanel>
+
+                    <!-- Receive options: security gates + stats -->
+                    <StackPanel Grid.Row="5" Orientation="Horizontal" Margin="0,0,0,0">
+                        <Button x:Name="_btnRecvOptions" Style="{StaticResource BtnSecondary}" MinWidth="88"
+                                Click="BtnRecvOptions_Click"/>
+                        <Button x:Name="_btnStats" Style="{StaticResource BtnSecondary}" MinWidth="76"
+                                Margin="8,0,0,0" Click="BtnStats_Click"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <!-- Client card -->
+            <Border Grid.Column="2" Style="{StaticResource Card}">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
+                        <Rectangle Width="3" Height="14" RadiusX="1.5" RadiusY="1.5"
+                                   Fill="{DynamicResource Brush.Accent}" VerticalAlignment="Center"/>
+                        <TextBlock x:Name="_icoClient" FontFamily="{StaticResource Font.Icon}" FontSize="13"
+                                   Foreground="{DynamicResource Brush.AccentHover}" VerticalAlignment="Center"
+                                   Margin="10,0,0,0" Visibility="Collapsed"/>
+                        <TextBlock x:Name="_hdrClient" Style="{StaticResource SectionTitle}" Margin="7,0,0,0"/>
+                    </StackPanel>
+
+                    <!-- IP / port / protocol / send -->
+                    <Grid Grid.Row="1" Margin="0,0,0,8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="70"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock x:Name="_lblServerIp" Style="{StaticResource FieldLabel}" Margin="0,0,6,0"/>
+                        <TextBox x:Name="_txtServerIp" Grid.Column="1" Style="{StaticResource TxtInput}"
+                                 VerticalAlignment="Center"/>
+                        <TextBlock x:Name="_lblPortC" Grid.Column="2" Style="{StaticResource FieldLabel}" Margin="8,0,6,0"/>
+                        <TextBox x:Name="_txtPortC" Grid.Column="3" Style="{StaticResource TxtInput}"
+                                 VerticalAlignment="Center"/>
+                        <RadioButton x:Name="_rbClientTcp" Grid.Column="4" Style="{StaticResource RdoBox}"
+                                     Content="TCP" Margin="10,0,0,0" VerticalAlignment="Center"/>
+                        <RadioButton x:Name="_rbClientUdt" Grid.Column="5" Style="{StaticResource RdoBox}"
+                                     Content="UDT" Margin="10,0,0,0" VerticalAlignment="Center"/>
+                        <Button x:Name="_btnSend" Grid.Column="6" Style="{StaticResource BtnPrimary}" MinWidth="76"
+                                Margin="10,0,0,0" Click="BtnSend_Click"/>
+                    </Grid>
+
+                    <!-- Path / browse / cancel -->
+                    <Grid Grid.Row="2" Margin="0,0,0,8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <TextBlock x:Name="_lblFile" Style="{StaticResource FieldLabel}" Margin="0,0,6,0"/>
+                        <TextBox x:Name="_txtFile" Grid.Column="1" Style="{StaticResource TxtInput}"
+                                 VerticalAlignment="Center"/>
+                        <Button x:Name="_btnBrowseFile" Grid.Column="2" Style="{StaticResource BtnSecondary}"
+                                MinWidth="64" Margin="8,0,0,0" Click="BtnBrowseFile_Click"/>
+                        <Button x:Name="_btnCancel" Grid.Column="3" Style="{StaticResource BtnSecondary}"
+                                MinWidth="76" Margin="8,0,0,0" IsEnabled="False" Click="BtnCancel_Click"/>
+                    </Grid>
+
+                    <!-- Options -->
+                    <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,0,0,8">
+                        <CheckBox x:Name="_chkMonitor" Style="{StaticResource ChkBox}" Margin="0,0,16,0"
+                                  Checked="ChkMonitor_CheckedChanged" Unchecked="ChkMonitor_CheckedChanged"/>
+                        <CheckBox x:Name="_chkFolder" Style="{StaticResource ChkBox}" Margin="0,0,16,0"
+                                  Checked="ChkFolder_CheckedChanged" Unchecked="ChkFolder_CheckedChanged"/>
+                        <CheckBox x:Name="_chkSync" Style="{StaticResource ChkBox}" Margin="0,0,16,0"/>
+                        <CheckBox x:Name="_chkVerifyHash" Style="{StaticResource ChkBox}"/>
+                    </StackPanel>
+
+                    <!-- Send parameters: compact field groups (label above control) -->
+                    <StackPanel Grid.Row="4" Orientation="Horizontal" Margin="0,0,0,8">
+                        <StackPanel Orientation="Vertical" Margin="0,0,10,0">
+                            <TextBlock x:Name="_lblSrcPort" Style="{StaticResource FieldLabelSmall}"/>
+                            <local:NumericBox x:Name="_numSrcPort" Width="84" Min="0" Max="65535" Margin="0,4,0,0"/>
+                        </StackPanel>
+                        <StackPanel Orientation="Vertical" Margin="0,0,10,0">
+                            <TextBlock x:Name="_lblConcurrency" Style="{StaticResource FieldLabelSmall}"/>
+                            <local:NumericBox x:Name="_numConcurrency" Width="70" Min="1" Max="8" Margin="0,4,0,0"/>
+                        </StackPanel>
+                        <StackPanel Orientation="Vertical" Margin="0,0,0,0">
+                            <TextBlock x:Name="_lblSpeed" Style="{StaticResource FieldLabelSmall}"/>
+                            <local:NumericBox x:Name="_numSpeed" Width="100" Min="0" Max="1048576" Margin="0,4,0,0"/>
+                        </StackPanel>
+                        <Rectangle Width="1" Height="30" RadiusX="0.5" RadiusY="0.5"
+                                   Fill="{DynamicResource Brush.CardBorder}" VerticalAlignment="Center" Margin="12,0"/>
+                        <StackPanel Orientation="Vertical">
+                            <TextBlock x:Name="_lblPairingC" Style="{StaticResource FieldLabelSmall}"/>
+                            <TextBox x:Name="_txtPairing" Width="96" MaxLength="12" Style="{StaticResource TxtInput}"
+                                     Margin="0,4,0,0"/>
+                        </StackPanel>
+                    </StackPanel>
+
+                    <!-- Tools: discovery & batch helpers; text send sits with the actions -->
+                    <StackPanel Grid.Row="5" Orientation="Horizontal">
+                        <Button x:Name="_btnScan" Style="{StaticResource BtnSecondary}" MinWidth="64" Click="BtnScan_Click"/>
+                        <Button x:Name="_btnFanOut" Style="{StaticResource BtnSecondary}" MinWidth="64"
+                                Margin="8,0,0,0" Click="BtnFanOut_Click"/>
+                        <Button x:Name="_btnQueue" Style="{StaticResource BtnSecondary}" MinWidth="80"
+                                Margin="8,0,0,0" Click="BtnQueue_Click"/>
+                        <Button x:Name="_btnResumeList" Style="{StaticResource BtnSecondary}" MinWidth="64"
+                                Margin="8,0,0,0" Click="BtnResumeList_Click"/>
+                        <Rectangle Width="1" Height="18" RadiusX="0.5" RadiusY="0.5"
+                                   Fill="{DynamicResource Brush.CardBorder}" VerticalAlignment="Center" Margin="10,0"/>
+                        <Button x:Name="_btnSendText" Style="{StaticResource BtnSecondary}" MinWidth="64"
+                                Click="BtnSendText_Click"/>
+                    </StackPanel>
+
+                    <!-- Security options: encryption (with pairing) + auto resume retry -->
+                    <StackPanel Grid.Row="6" Orientation="Horizontal" Margin="0,8,0,0">
+                        <CheckBox x:Name="_chkEncrypt" Style="{StaticResource ChkBox}" Margin="0,0,16,0"/>
+                        <CheckBox x:Name="_chkAutoRetry" Style="{StaticResource ChkBox}"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+        </Grid>
+
+        <!-- ==================== Progress: server | client ==================== -->
+        <Grid Grid.Row="3">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="14"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <Border Style="{StaticResource Card}">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <Rectangle Width="3" Height="14" RadiusX="1.5" RadiusY="1.5"
+                                   Fill="{DynamicResource Brush.Accent}" VerticalAlignment="Center"/>
+                        <TextBlock x:Name="_icoProgressS" FontFamily="{StaticResource Font.Icon}" FontSize="13"
+                                   Foreground="{DynamicResource Brush.AccentHover}" VerticalAlignment="Center"
+                                   Margin="10,0,0,0" Visibility="Collapsed"/>
+                        <TextBlock x:Name="_hdrProgressS" Style="{StaticResource SectionTitle}" Margin="7,0,0,0"/>
+                    </StackPanel>
+                    <Border Grid.Row="1" Background="{DynamicResource Brush.CardInner}" CornerRadius="6"
+                            Padding="6" MinHeight="64">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto">
+                            <StackPanel x:Name="_progressPanelS"/>
+                        </ScrollViewer>
+                    </Border>
+                    <TextBlock x:Name="_lblStatusS" Grid.Row="2" Style="{StaticResource StatusText}"
+                               Margin="2,8,0,0"/>
+                </Grid>
+            </Border>
+
+            <Border Grid.Column="2" Style="{StaticResource Card}">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <Rectangle Width="3" Height="14" RadiusX="1.5" RadiusY="1.5"
+                                   Fill="{DynamicResource Brush.Accent}" VerticalAlignment="Center"/>
+                        <TextBlock x:Name="_icoProgressC" FontFamily="{StaticResource Font.Icon}" FontSize="13"
+                                   Foreground="{DynamicResource Brush.AccentHover}" VerticalAlignment="Center"
+                                   Margin="10,0,0,0" Visibility="Collapsed"/>
+                        <TextBlock x:Name="_hdrProgressC" Style="{StaticResource SectionTitle}" Margin="7,0,0,0"/>
+                    </StackPanel>
+                    <Border Grid.Row="1" Background="{DynamicResource Brush.CardInner}" CornerRadius="6"
+                            Padding="6" MinHeight="64">
+                        <ScrollViewer VerticalScrollBarVisibility="Auto">
+                            <StackPanel x:Name="_progressPanelC"/>
+                        </ScrollViewer>
+                    </Border>
+                    <TextBlock x:Name="_lblStatusC" Grid.Row="2" Style="{StaticResource StatusText}"
+                               Margin="2,8,0,0"/>
+                </Grid>
+            </Border>
+        </Grid>
+
+        <!-- ==================== Log console ==================== -->
+        <Border Grid.Row="5" Style="{StaticResource Card}">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                    <Rectangle Width="3" Height="14" RadiusX="1.5" RadiusY="1.5"
+                               Fill="{DynamicResource Brush.Accent}" VerticalAlignment="Center"/>
+                    <TextBlock x:Name="_icoLog" FontFamily="{StaticResource Font.Icon}" FontSize="13"
+                                   Foreground="{DynamicResource Brush.AccentHover}" VerticalAlignment="Center"
+                                   Margin="10,0,0,0" Visibility="Collapsed"/>
+                        <TextBlock x:Name="_hdrLog" Style="{StaticResource SectionTitle}" Margin="7,0,0,0"/>
+                </StackPanel>
+                <ListBox x:Name="_lstLog" Grid.Row="1" Style="{StaticResource LogList}" Margin="0,0,0,8"/>
+                <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right">
+                    <Button x:Name="_btnExportLog" Style="{StaticResource BtnSecondary}" MinWidth="104"
+                            Click="BtnExportLog_Click"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

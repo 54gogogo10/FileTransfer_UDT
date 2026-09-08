@@ -28,6 +28,9 @@ namespace TrFileTransfer
         public event Action<string> OnError;
         public event Action OnTransferComplete;
 
+        /// <summary>Pairing code forwarded to every chunk connection (0x05 auth frame).</summary>
+        public string PairingCode { get; set; }
+
         public ConcurrentTransfer(string serverIp, int port, string filePath,
             int concurrency, bool isTcp, int srcPort = 0, int maxBytesPerSec = 0)
         {
@@ -176,11 +179,13 @@ namespace TrFileTransfer
                         if (_isUdt)
                         {
                             var client = new TransferUdtClient(_serverIp, _port, _filePath, localPort, 4194304, perConn);
+                            client.PairingCode = PairingCode;
                             await client.SendChunkedAsync(offset, size, totalSize);
                         }
                         else
                         {
                             var client = new TransferClient(_serverIp, _port, _filePath, localPort, 4194304, perConn);
+                            client.PairingCode = PairingCode;
                             await client.SendChunkedAsync(offset, size, totalSize);
                         }
                         break;
@@ -221,11 +226,13 @@ namespace TrFileTransfer
                     if (_isUdt)
                     {
                         var client = new TransferUdtClient(_serverIp, _port, filePath, localPort, 4194304, perConn);
+                        client.PairingCode = PairingCode;
                         await client.SendAsync();
                     }
                     else
                     {
                         var client = new TransferClient(_serverIp, _port, filePath, localPort, 4194304, perConn);
+                        client.PairingCode = PairingCode;
                         await client.SendAsync();
                     }
                     return;

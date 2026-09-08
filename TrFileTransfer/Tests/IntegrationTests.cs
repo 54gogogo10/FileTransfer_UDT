@@ -74,6 +74,29 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_UDT_SingleFile", UdtSingleFile, 1);
             runner.Run("Integration_UDT_LargeSingle", UdtLargeSingle, 1);
             runner.Run("Integration_UDT_LargeConcur", UdtLargeConcur, 1);
+            runner.Run("Integration_Update_CheckAndDownload", UpdateCheckAndDownload);
+            runner.Run("Integration_Update_DownloadHashMismatch", UpdateDownloadHashMismatch);
+            runner.Run("Integration_Update_Manifest404", UpdateCheckHttp404);
+            runner.Run("Integration_Update_ManifestInvalid", UpdateCheckInvalidManifest);
+            runner.Run("Integration_Update_NotNewer", UpdateNotNewer);
+            runner.Run("Integration_Update_GitHub_FullFlow", UpdateGitHubFullFlow);
+            runner.Run("Integration_Update_GitHub_BadSidecar", UpdateGitHubBadSidecar);
+            runner.Run("Integration_Update_GitHub_MissingSidecar", UpdateGitHubMissingSidecar);
+            runner.Run("Integration_Text_TCP", TcpTextMessage);
+            runner.Run("Integration_Text_TCP_Large", TcpTextLarge);
+            runner.Run("Integration_Auth_TCP_CorrectCode", TcpAuthCorrectCode);
+            runner.Run("Integration_Auth_TCP_WrongCode", TcpAuthWrongCode);
+            runner.Run("Integration_Auth_TCP_NoCode", TcpAuthNoCode);
+            runner.Run("Integration_Auth_TCP_Lenient", TcpAuthLenient);
+            runner.Run("Integration_Text_UDT", UdtTextMessage, 1);
+            runner.Run("Integration_Auth_UDT", UdtAuthCorrectCode, 1);
+            runner.Run("Integration_FolderSync_TCP", TcpFolderSync);
+            runner.Run("Integration_FolderSync_UDT", UdtFolderSync, 1);
+            runner.Run("Integration_HTTP_ListAndDownload", HttpShareListAndDownload);
+            runner.Run("Integration_HTTP_TokenAndTraversal", HttpShareTokenAndTraversal);
+            runner.Run("Integration_FanOut_TwoTargets", FanOutTwoTargets);
+            runner.Run("Integration_HTTP_Upload", HttpShareUpload);
+            runner.Run("Integration_HTTP_UploadTokenAndTraversalName", HttpShareUploadTokenAndTraversalName);
         }
 
         private static void TcpSingleFile()
@@ -1041,10 +1064,13 @@ namespace TrFileTransfer.Tests
         {
             int dPort = FindFreePort();
             int dPort2 = FindFreePort();
+            int dPort3 = FindFreePort();
             var server = new DiscoveryServer(dPort);
             server.Start("test-host", 8080, true, false);
             var server2 = new DiscoveryServer(dPort2);
             server2.Start("dual-host", 9090, true, true);
+            var server3 = new DiscoveryServer(dPort3);
+            server3.Start("locked-host", 7070, true, false, true);
             try
             {
                 var devices = DiscoveryClient.Scan(dPort, 3000, "127.0.0.1").Result;
@@ -1053,6 +1079,7 @@ namespace TrFileTransfer.Tests
                 Assert.Equal(8080, devices[0].Port, "device port");
                 Assert.True(devices[0].SupportsTcp, "tcp flag set");
                 Assert.False(devices[0].SupportsUdt, "udt flag clear");
+                Assert.False(devices[0].RequiresPairing, "pairing flag clear");
 
                 // Dual-protocol server: both flags set in the response bitmap
                 var devices2 = DiscoveryClient.Scan(dPort2, 3000, "127.0.0.1").Result;
@@ -1060,11 +1087,144 @@ namespace TrFileTransfer.Tests
                 Assert.Equal("dual-host", devices2[0].Name, "dual device name");
                 Assert.True(devices2[0].SupportsTcp, "dual tcp flag set");
                 Assert.True(devices2[0].SupportsUdt, "dual udt flag set");
+
+                // Server with pairing enabled advertises the pairing bit
+                var devices3 = DiscoveryClient.Scan(dPort3, 3000, "127.0.0.1").Result;
+                Assert.True(devices3.Length >= 1, "discovered pairing device");
+                Assert.Equal("locked-host", devices3[0].Name, "pairing device name");
+                Assert.True(devices3[0].RequiresPairing, "pairing flag set");
             }
             finally
             {
                 server.Stop();
                 server2.Stop();
+                server3.Stop();
+            }
+        }
+
+        /// <summary>
+        /// Sync mode end-to-end (TCP): three passes over the same derived session —
+        /// initial full send, no-op resend (server reports already complete), and a
+        /// third pass where only the newly added file travels.
+        /// </summary>
+        private static void TcpFolderSync()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_sync_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_sync_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            Guid sessionId = Guid.Empty;
+            TransferServer server = null;
+            try
+            {
+                var contentA = new byte[40 * 1024];
+                new Random(7).NextBytes(contentA);
+                File.WriteAllBytes(Path.Combine(sendDir, "a.bin"), contentA);
+
+                var started = new ManualResetEvent(false);
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => started.Set();
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+
+                sessionId = FolderResumeState.DeriveSyncSession(sendDir, "127.0.0.1", port, false);
+                string sessionDir = ServerWire.GetFolderSessionDir(recvDir, Path.GetFileName(sendDir), sessionId);
+
+                // Pass 1: initial sync sends everything
+                var client1 = new TransferClient("127.0.0.1", port, sendDir);
+                client1.SendFolderResumableAsync(sessionId, keepState: true).Wait(30000);
+                Thread.Sleep(300);
+                Assert.True(File.Exists(Path.Combine(sessionDir, "a.bin")), "a.bin after pass 1");
+                Assert.True(Utils.ConstantTimeEquals(contentA, File.ReadAllBytes(Path.Combine(sessionDir, "a.bin"))), "a.bin content after pass 1");
+
+                // Pass 2: nothing changed → status 2, nothing sent
+                var logs2 = new System.Collections.Generic.List<string>();
+                var client2 = new TransferClient("127.0.0.1", port, sendDir);
+                client2.OnLog += msg => logs2.Add(msg);
+                client2.SendFolderResumableAsync(sessionId, keepState: true).Wait(30000);
+                Thread.Sleep(300);
+                Assert.True(logs2.Exists(m => m.Contains("already fully received")), "pass 2: server reports already complete");
+
+                // Pass 3: add b.bin → a.bin skipped, only b.bin travels
+                var contentB = new byte[20 * 1024];
+                new Random(9).NextBytes(contentB);
+                File.WriteAllBytes(Path.Combine(sendDir, "b.bin"), contentB);
+                var logs3 = new System.Collections.Generic.List<string>();
+                var client3 = new TransferClient("127.0.0.1", port, sendDir);
+                client3.OnLog += msg => logs3.Add(msg);
+                client3.SendFolderResumableAsync(sessionId, keepState: true).Wait(30000);
+                Thread.Sleep(300);
+                Assert.True(logs3.Exists(m => m.Contains("starting at file 2/2")), "pass 3: resumed at file 2/2 (a.bin skipped)");
+                Assert.True(File.Exists(Path.Combine(sessionDir, "b.bin")), "b.bin after pass 3");
+                Assert.True(Utils.ConstantTimeEquals(contentB, File.ReadAllBytes(Path.Combine(sessionDir, "b.bin"))), "b.bin content");
+                Assert.True(Utils.ConstantTimeEquals(contentA, File.ReadAllBytes(Path.Combine(sessionDir, "a.bin"))), "a.bin unchanged by pass 3");
+
+                // Sync state survives completion and stays out of the resume dialog
+                var st = FolderResumeState.Load(sessionId);
+                Assert.True(st != null && st.IsSync, "sync state kept after completion");
+                Assert.False(FolderResumeState.ListAll().Exists(x => x.SessionId == sessionId), "sync state hidden from resume list");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+                if (sessionId != Guid.Empty) FolderResumeState.Delete(sessionId);
+            }
+        }
+
+        private static void UdtFolderSync()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_usync_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_usync_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            Guid sessionId = Guid.Empty;
+            TransferUdtServer server = null;
+            try
+            {
+                var contentA = new byte[24 * 1024];
+                new Random(11).NextBytes(contentA);
+                File.WriteAllBytes(Path.Combine(sendDir, "a.bin"), contentA);
+
+                var started = new ManualResetEvent(false);
+                server = new TransferUdtServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => started.Set();
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("UDT server did not start within 5s");
+
+                sessionId = FolderResumeState.DeriveSyncSession(sendDir, "127.0.0.1", port, true);
+                string sessionDir = ServerWire.GetFolderSessionDir(recvDir, Path.GetFileName(sendDir), sessionId);
+
+                var client1 = new TransferUdtClient("127.0.0.1", port, sendDir);
+                client1.SendFolderResumableAsync(sessionId, keepState: true).Wait(60000);
+                Thread.Sleep(300);
+                Assert.True(File.Exists(Path.Combine(sessionDir, "a.bin")), "a.bin after UDT pass 1");
+
+                // Pass 2: add b.bin → only b.bin travels
+                var contentB = new byte[16 * 1024];
+                new Random(13).NextBytes(contentB);
+                File.WriteAllBytes(Path.Combine(sendDir, "b.bin"), contentB);
+                var logs2 = new System.Collections.Generic.List<string>();
+                var client2 = new TransferUdtClient("127.0.0.1", port, sendDir);
+                client2.OnLog += msg => logs2.Add(msg);
+                client2.SendFolderResumableAsync(sessionId, keepState: true).Wait(60000);
+                Thread.Sleep(300);
+                Assert.True(logs2.Exists(m => m.Contains("starting at file 2/2")), "UDT pass 2: resumed at file 2/2");
+                Assert.True(File.Exists(Path.Combine(sessionDir, "b.bin")), "b.bin after UDT pass 2");
+                Assert.True(Utils.ConstantTimeEquals(contentB, File.ReadAllBytes(Path.Combine(sessionDir, "b.bin"))), "b.bin content");
+                Assert.True(Utils.ConstantTimeEquals(contentA, File.ReadAllBytes(Path.Combine(sessionDir, "a.bin"))), "a.bin unchanged");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+                if (sessionId != Guid.Empty) FolderResumeState.Delete(sessionId);
             }
         }
 
@@ -2206,6 +2366,955 @@ namespace TrFileTransfer.Tests
                 if (udtServer != null) { try { udtServer.Stop(); } catch { } }
                 try { Directory.Delete(sendDir, true); } catch { }
                 try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        // ---- Auto update (Updater vs a minimal local HTTP server) ----
+
+        /// <summary>Tiny blocking HTTP/1.1 file server on 127.0.0.1 — no HttpListener ACL
+        /// requirements, so it works under plain users and CI.</summary>
+        private sealed class MiniHttpServer : IDisposable
+        {
+            private readonly TcpListener _listener;
+            private readonly System.Collections.Generic.Dictionary<string, byte[]> _files =
+                new System.Collections.Generic.Dictionary<string, byte[]>();
+            private readonly Thread _thread;
+            private volatile bool _running = true;
+
+            public int Port { get; private set; }
+
+            public MiniHttpServer()
+            {
+                _listener = new TcpListener(System.Net.IPAddress.Loopback, 0);
+                _listener.Start();
+                Port = ((System.Net.IPEndPoint)_listener.LocalEndpoint).Port;
+                _thread = new Thread(Loop);
+                _thread.IsBackground = true;
+                _thread.Start();
+            }
+
+            public void SetFile(string path, byte[] data) { _files[path] = data; }
+
+            public string BaseUrl { get { return "http://127.0.0.1:" + Port; } }
+
+            private void Loop()
+            {
+                while (_running)
+                {
+                    TcpClient client;
+                    try { client = _listener.AcceptTcpClient(); }
+                    catch { break; }
+                    ThreadPool.QueueUserWorkItem(delegate { Handle(client); });
+                }
+            }
+
+            private void Handle(TcpClient client)
+            {
+                try
+                {
+                    client.ReceiveTimeout = 5000;
+                    client.SendTimeout = 5000;
+                    using (client)
+                    using (NetworkStream ns = client.GetStream())
+                    {
+                        string requestLine = ReadRequestLine(ns);
+                        string path = null;
+                        if (requestLine != null && requestLine.StartsWith("GET ", StringComparison.OrdinalIgnoreCase))
+                        {
+                            path = requestLine.Substring(4);
+                            int sp = path.IndexOf(' ');
+                            if (sp > 0) path = path.Substring(0, sp);
+                            int q = path.IndexOf('?');
+                            if (q >= 0) path = path.Substring(0, q);
+                        }
+
+                        byte[] body = null;
+                        bool found = path != null && _files.TryGetValue(path, out body);
+                        if (!found) body = System.Text.Encoding.UTF8.GetBytes("not found");
+                        byte[] head = System.Text.Encoding.ASCII.GetBytes(
+                            "HTTP/1.1 " + (found ? "200 OK" : "404 Not Found") + "\r\n" +
+                            "Content-Type: application/octet-stream\r\n" +
+                            "Content-Length: " + body.Length + "\r\n" +
+                            "Connection: close\r\n\r\n");
+                        ns.Write(head, 0, head.Length);
+                        ns.Write(body, 0, body.Length);
+                    }
+                }
+                catch { }
+            }
+
+            private static string ReadRequestLine(NetworkStream ns)
+            {
+                // First line of the request is enough (Connection: close, body-less GET).
+                var buf = new byte[8192];
+                var all = new System.Text.StringBuilder();
+                while (all.Length < 16384)
+                {
+                    int n = ns.Read(buf, 0, buf.Length);
+                    if (n <= 0) break;
+                    all.Append(System.Text.Encoding.ASCII.GetString(buf, 0, n));
+                    string s = all.ToString();
+                    int nl = s.IndexOf("\r\n", StringComparison.Ordinal);
+                    if (nl > 0) return s.Substring(0, nl);
+                    if (nl == 0) return null;
+                }
+                return null;
+            }
+
+            public void Dispose()
+            {
+                _running = false;
+                try { _listener.Stop(); } catch { }
+            }
+        }
+
+        private static void UpdateCheckAndDownload()
+        {
+            var server = new MiniHttpServer();
+            string dir = Path.Combine(TempBase(), "tr_upd_it_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            try
+            {
+                byte[] payload = new byte[100000];
+                for (int i = 0; i < payload.Length; i++) payload[i] = (byte)(i * 31 + 7);
+                string payloadPath = Path.Combine(dir, "payload.bin");
+                File.WriteAllBytes(payloadPath, payload);
+                string sha = Updater.ComputeSha256Hex(payloadPath);
+
+                string manifest = "version=9.9.9.9\r\n" +
+                    "url=" + server.BaseUrl + "/app.exe\r\n" +
+                    "sha256=" + sha + "\r\n" +
+                    "notes=integration test build\r\n";
+                server.SetFile("/manifest.txt", System.Text.Encoding.UTF8.GetBytes(manifest));
+                server.SetFile("/app.exe", payload);
+
+                UpdateManifest m = Updater.CheckAsync(server.BaseUrl + "/manifest.txt", 10000).Result;
+                Assert.True(m != null, "manifest fetched and parsed");
+                Assert.Equal(new Version(9, 9, 9, 9), m.Version, "version");
+                Assert.Equal(server.BaseUrl + "/app.exe", m.Url, "url");
+                Assert.Equal(sha, m.Sha256Hex, "sha256");
+                Assert.Equal("integration test build", m.Notes, "notes");
+                Assert.True(m.IsNewerThan(new Version(2, 1, 0, 0)), "newer than current release");
+
+                string dest = Path.Combine(dir, "downloaded.exe");
+                long lastRead = -1, lastTotal = -1;
+                Updater.DownloadAsync(m, dest, (r, t) => { lastRead = r; lastTotal = t; }, 15000).Wait();
+                Assert.True(File.Exists(dest), "downloaded file exists");
+                byte[] got = File.ReadAllBytes(dest);
+                Assert.Equal(payload.Length, got.Length, "downloaded length");
+                Assert.True(Utils.ConstantTimeEquals(payload, got), "downloaded bytes identical");
+                Assert.Equal((long)payload.Length, lastRead, "progress reported final read");
+                Assert.Equal((long)payload.Length, lastTotal, "progress reported total");
+            }
+            finally
+            {
+                server.Dispose();
+                try { Directory.Delete(dir, true); } catch { }
+            }
+        }
+
+        private static void UpdateDownloadHashMismatch()
+        {
+            var server = new MiniHttpServer();
+            string dir = Path.Combine(TempBase(), "tr_upd_hm_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            try
+            {
+                byte[] payload = System.Text.Encoding.UTF8.GetBytes("this is not the file you are hashing");
+                server.SetFile("/app.exe", payload);
+                string badSha = new string('0', 64);
+                string manifest = "version=9.9.9.9\r\n" +
+                    "url=" + server.BaseUrl + "/app.exe\r\n" +
+                    "sha256=" + badSha + "\r\n";
+                server.SetFile("/manifest.txt", System.Text.Encoding.UTF8.GetBytes(manifest));
+
+                UpdateManifest m = Updater.CheckAsync(server.BaseUrl + "/manifest.txt", 10000).Result;
+                string dest = Path.Combine(dir, "bad.exe");
+                Exception inner = null;
+                try { Updater.DownloadAsync(m, dest, null, 15000).Wait(); }
+                catch (AggregateException agg) { inner = agg.InnerException; }
+                Assert.True(inner is System.IO.InvalidDataException, "hash mismatch -> InvalidDataException, got: " + (inner == null ? "none" : inner.GetType().Name));
+                Assert.False(File.Exists(dest), "dest removed on mismatch");
+                Assert.False(File.Exists(dest + ".part"), "partial removed on mismatch");
+            }
+            finally
+            {
+                server.Dispose();
+                try { Directory.Delete(dir, true); } catch { }
+            }
+        }
+
+        private static void UpdateCheckHttp404()
+        {
+            var server = new MiniHttpServer();
+            try
+            {
+                Exception inner = null;
+                try { Updater.CheckAsync(server.BaseUrl + "/missing.txt", 10000).Wait(); }
+                catch (AggregateException agg) { inner = agg.InnerException; }
+                Assert.True(inner != null, "404 -> exception");
+                Assert.True(inner is System.Net.WebException, "404 -> WebException, got: " + inner.GetType().Name);
+            }
+            finally { server.Dispose(); }
+        }
+
+        private static void UpdateCheckInvalidManifest()
+        {
+            var server = new MiniHttpServer();
+            try
+            {
+                server.SetFile("/manifest.txt", System.Text.Encoding.UTF8.GetBytes("hello world\nno key value pairs here\n"));
+                Exception inner = null;
+                try { Updater.CheckAsync(server.BaseUrl + "/manifest.txt", 10000).Wait(); }
+                catch (AggregateException agg) { inner = agg.InnerException; }
+                Assert.True(inner is System.IO.InvalidDataException, "garbage manifest -> InvalidDataException, got: " + (inner == null ? "none" : inner.GetType().Name));
+            }
+            finally { server.Dispose(); }
+        }
+
+        private static void UpdateNotNewer()
+        {
+            var server = new MiniHttpServer();
+            try
+            {
+                string manifest = "version=1.0.0.0\r\n" +
+                    "url=" + server.BaseUrl + "/app.exe\r\n" +
+                    "sha256=" + new string('a', 64) + "\r\n";
+                server.SetFile("/manifest.txt", System.Text.Encoding.UTF8.GetBytes(manifest));
+
+                UpdateManifest m = Updater.CheckAsync(server.BaseUrl + "/manifest.txt", 10000).Result;
+                Assert.True(m != null, "manifest parsed");
+                Assert.False(m.IsNewerThan(new Version(2, 1, 0, 0)), "older version is not newer");
+            }
+            finally { server.Dispose(); }
+        }
+
+        /// <summary>Builds a GitHub /releases/latest-style JSON document around the
+        /// given server (asset URLs point at the same local server).</summary>
+        private static string GitHubReleaseJson(MiniHttpServer server, string tag, string notes)
+        {
+            return "{" +
+                "\"url\":\"https://api.github.com/repos/o/r/releases/1\"," +
+                "\"tag_name\":\"" + tag + "\"," +
+                "\"name\":\"" + tag + "\"," +
+                "\"body\":\"" + notes + "\"," +
+                "\"draft\":false," +
+                "\"assets\":[" +
+                "{\"name\":\"TrFileTransfer.exe\",\"browser_download_url\":\"" + server.BaseUrl + "/TrFileTransfer.exe\"}," +
+                "{\"name\":\"TrFileTransfer.exe.sha256\",\"browser_download_url\":\"" + server.BaseUrl + "/TrFileTransfer.exe.sha256\"}" +
+                "]}";
+        }
+
+        private static void UpdateGitHubFullFlow()
+        {
+            var server = new MiniHttpServer();
+            string dir = Path.Combine(TempBase(), "tr_upd_gh_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            try
+            {
+                byte[] payload = new byte[50000];
+                for (int i = 0; i < payload.Length; i++) payload[i] = (byte)(i * 7 + 3);
+                string payloadPath = Path.Combine(dir, "payload.bin");
+                File.WriteAllBytes(payloadPath, payload);
+                string sha = Updater.ComputeSha256Hex(payloadPath);
+
+                server.SetFile("/repos/o/r/releases/latest",
+                    System.Text.Encoding.UTF8.GetBytes(GitHubReleaseJson(server, "v9.9.9.9", "v\\u4e34\\u65f6\\u8bf4\\u660e")));
+                server.SetFile("/TrFileTransfer.exe", payload);
+                server.SetFile("/TrFileTransfer.exe.sha256", System.Text.Encoding.UTF8.GetBytes(sha + "\n"));
+
+                UpdateManifest m = Updater.CheckGitHubAsync(server.BaseUrl + "/repos/o/r/releases/latest", 10000).Result;
+                Assert.True(m != null, "manifest built");
+                Assert.Equal(new Version(9, 9, 9, 9), m.Version, "version from tag");
+                Assert.Equal(server.BaseUrl + "/TrFileTransfer.exe", m.Url, "exe asset url");
+                Assert.Equal(sha, m.Sha256Hex, "sha from sidecar");
+                Assert.Equal("v临时说明", m.Notes, "body with unicode escapes");
+                Assert.True(m.IsNewerThan(new Version(2, 1, 0, 0)), "newer than current");
+
+                string dest = Path.Combine(dir, "gh.exe");
+                Updater.DownloadAsync(m, dest, null, 15000).Wait();
+                byte[] got = File.ReadAllBytes(dest);
+                Assert.True(Utils.ConstantTimeEquals(payload, got), "downloaded bytes identical");
+            }
+            finally
+            {
+                server.Dispose();
+                try { Directory.Delete(dir, true); } catch { }
+            }
+        }
+
+        private static void UpdateGitHubBadSidecar()
+        {
+            var server = new MiniHttpServer();
+            try
+            {
+                server.SetFile("/repos/o/r/releases/latest",
+                    System.Text.Encoding.UTF8.GetBytes(GitHubReleaseJson(server, "v9.9.9.9", "")));
+                server.SetFile("/TrFileTransfer.exe", new byte[] { 1, 2, 3 });
+                server.SetFile("/TrFileTransfer.exe.sha256", System.Text.Encoding.UTF8.GetBytes("this-is-not-a-hash"));
+                Exception inner = null;
+                try { Updater.CheckGitHubAsync(server.BaseUrl + "/repos/o/r/releases/latest", 10000).Wait(); }
+                catch (AggregateException agg) { inner = agg.InnerException; }
+                Assert.True(inner is System.IO.InvalidDataException,
+                    "malformed sidecar -> InvalidDataException, got: " + (inner == null ? "none" : inner.GetType().Name));
+            }
+            finally { server.Dispose(); }
+        }
+
+        private static void UpdateGitHubMissingSidecar()
+        {
+            var server = new MiniHttpServer();
+            try
+            {
+                server.SetFile("/repos/o/r/releases/latest",
+                    System.Text.Encoding.UTF8.GetBytes(GitHubReleaseJson(server, "v9.9.9.9", "")));
+                server.SetFile("/TrFileTransfer.exe", new byte[] { 1, 2, 3 });
+                // no /TrFileTransfer.exe.sha256 -> 404
+                Exception inner = null;
+                try { Updater.CheckGitHubAsync(server.BaseUrl + "/repos/o/r/releases/latest", 10000).Wait(); }
+                catch (AggregateException agg) { inner = agg.InnerException; }
+                Assert.True(inner is System.Net.WebException,
+                    "missing sidecar -> WebException, got: " + (inner == null ? "none" : inner.GetType().Name));
+            }
+            finally { server.Dispose(); }
+        }
+
+        // ---- Pairing auth (0x05) and text messages (0x06) ----
+
+        /// <summary>Common scaffold: starts a TCP server on a free port and returns its pieces.</summary>
+        private sealed class TcpServerFixture : IDisposable
+        {
+            public TransferServer Server;
+            public int Port;
+            public string SendDir;
+            public string RecvDir;
+            public readonly ManualResetEvent Started = new ManualResetEvent(false);
+
+            public TcpServerFixture()
+            {
+                Port = FindFreePort();
+                SendDir = Path.Combine(TempBase(), "tr_auth_send_" + Guid.NewGuid().ToString("N"));
+                RecvDir = Path.Combine(TempBase(), "tr_auth_recv_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(SendDir);
+                Directory.CreateDirectory(RecvDir);
+                Server = new TransferServer("127.0.0.1", Port, RecvDir);
+                Server.OnStarted += () => Started.Set();
+            }
+
+            public void Start()
+            {
+                Server.Start();
+                if (!Started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+            }
+
+            public void Dispose()
+            {
+                try { Server.Stop(); } catch { }
+                try { Directory.Delete(SendDir, true); } catch { }
+                try { Directory.Delete(RecvDir, true); } catch { }
+            }
+        }
+
+        private static byte[] MakeTestFile(string path, int size)
+        {
+            var content = new byte[size];
+            new Random(size).NextBytes(content);
+            File.WriteAllBytes(path, content);
+            return content;
+        }
+
+        private static void TcpTextMessage()
+        {
+            using (var fx = new TcpServerFixture())
+            {
+                string text = "你好，TrFileTransfer!\nLine2\tTab END";
+                string received = null;
+                var gotText = new ManualResetEvent(false);
+                fx.Server.OnTextReceived += t => { received = t; gotText.Set(); };
+                fx.Start();
+
+                var client = new TransferClient("127.0.0.1", fx.Port, "", 0, 4194304, 0);
+                client.SendTextAsync(text).Wait(30000);
+
+                if (!gotText.WaitOne(5000))
+                    throw new Exception("Text message was not received");
+                Assert.Equal(text, received, "text content matches");
+            }
+        }
+
+        private static void TcpTextLarge()
+        {
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < 20000; i++)
+                sb.Append("文本内容ABC123你好世界"); // 36 UTF-8 bytes per unit → ~720 KB
+            string text = sb.ToString();
+
+            using (var fx = new TcpServerFixture())
+            {
+                string received = null;
+                var gotText = new ManualResetEvent(false);
+                fx.Server.OnTextReceived += t => { received = t; gotText.Set(); };
+                fx.Start();
+
+                var client = new TransferClient("127.0.0.1", fx.Port, "", 0, 4194304, 0);
+                client.SendTextAsync(text).Wait(30000);
+
+                if (!gotText.WaitOne(10000))
+                    throw new Exception("Large text was not received");
+                Assert.Equal(text.Length, received.Length, "large text length matches");
+                Assert.Equal(text, received, "large text content matches");
+            }
+        }
+
+        private static void TcpAuthCorrectCode()
+        {
+            using (var fx = new TcpServerFixture())
+            {
+                fx.Server.PairingCode = "135790";
+                var testFile = Path.Combine(fx.SendDir, "auth_ok.bin");
+                byte[] content = MakeTestFile(testFile, 64 * 1024);
+
+                var serverDone = new ManualResetEvent(false);
+                bool serverOk = false;
+                fx.Server.OnTransferComplete += () => { serverOk = true; serverDone.Set(); };
+                fx.Server.OnError += _ => serverDone.Set();
+                fx.Start();
+
+                var client = new TransferClient("127.0.0.1", fx.Port, testFile);
+                client.PairingCode = "135790";
+                client.SendAsync().Wait(30000);
+
+                if (!serverDone.WaitOne(30000))
+                    throw new Exception("Server did not complete within 30s");
+                if (!serverOk)
+                    throw new Exception("Server rejected a correct pairing code");
+
+                Thread.Sleep(300);
+                var received = File.ReadAllBytes(Path.Combine(fx.RecvDir, "auth_ok.bin"));
+                Assert.True(Utils.ConstantTimeEquals(content, received), "file content matches");
+            }
+        }
+
+        private static void TcpAuthWrongCode()
+        {
+            using (var fx = new TcpServerFixture())
+            {
+                fx.Server.PairingCode = "135790";
+                var testFile = Path.Combine(fx.SendDir, "auth_bad.bin");
+                MakeTestFile(testFile, 8192);
+                fx.Start();
+
+                var client = new TransferClient("127.0.0.1", fx.Port, testFile);
+                client.PairingCode = "000000";
+                bool threw = false;
+                try { client.SendAsync().Wait(30000); }
+                catch { threw = true; }
+                Assert.True(threw, "wrong pairing code -> transfer fails");
+
+                Thread.Sleep(300);
+                Assert.False(File.Exists(Path.Combine(fx.RecvDir, "auth_bad.bin")), "no file saved on rejected code");
+            }
+        }
+
+        private static void TcpAuthNoCode()
+        {
+            using (var fx = new TcpServerFixture())
+            {
+                fx.Server.PairingCode = "135790";
+                var testFile = Path.Combine(fx.SendDir, "auth_none.bin");
+                MakeTestFile(testFile, 8192);
+                fx.Start();
+
+                // Old-style client that never authenticates. Whether ITS writes fail
+                // depends on when the server's RST lands, so the deterministic
+                // assertion is server-side: nothing is ever saved.
+                var client = new TransferClient("127.0.0.1", fx.Port, testFile);
+                var done = new ManualResetEvent(false);
+                client.OnTransferComplete += () => done.Set();
+                client.OnError += _ => done.Set();
+                client.SendAsync();
+                done.WaitOne(30000);
+
+                Thread.Sleep(300);
+                var deadline = DateTime.UtcNow.AddSeconds(3);
+                while (DateTime.UtcNow < deadline && Directory.GetFiles(fx.RecvDir).Length > 0)
+                    Thread.Sleep(200);
+                Assert.False(File.Exists(Path.Combine(fx.RecvDir, "auth_none.bin")), "no file saved for unauthenticated client");
+            }
+        }
+
+        private static void TcpAuthLenient()
+        {
+            using (var fx = new TcpServerFixture())
+            {
+                // Server without pairing accepts a client that still sends its code
+                var testFile = Path.Combine(fx.SendDir, "auth_lenient.bin");
+                byte[] content = MakeTestFile(testFile, 16 * 1024);
+
+                var serverDone = new ManualResetEvent(false);
+                bool serverOk = false;
+                fx.Server.OnTransferComplete += () => { serverOk = true; serverDone.Set(); };
+                fx.Server.OnError += _ => serverDone.Set();
+                fx.Start();
+
+                var client = new TransferClient("127.0.0.1", fx.Port, testFile);
+                client.PairingCode = "246888";
+                client.SendAsync().Wait(30000);
+
+                if (!serverDone.WaitOne(30000))
+                    throw new Exception("Server did not complete within 30s");
+                if (!serverOk)
+                    throw new Exception("Server rejected a client against an open server");
+
+                Thread.Sleep(300);
+                var received = File.ReadAllBytes(Path.Combine(fx.RecvDir, "auth_lenient.bin"));
+                Assert.True(Utils.ConstantTimeEquals(content, received), "file content matches");
+            }
+        }
+
+        private static void UdtTextMessage()
+        {
+            int port = FindFreePort();
+            string recvDir = Path.Combine(TempBase(), "tr_udt_text_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(recvDir);
+            TransferUdtServer server = null;
+            try
+            {
+                string text = "UDT 文本消息\nsecond line 中文";
+                string received = null;
+                var gotText = new ManualResetEvent(false);
+                var started = new ManualResetEvent(false);
+
+                server = new TransferUdtServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => started.Set();
+                server.OnTextReceived += t => { received = t; gotText.Set(); };
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("UDT server did not start within 5s");
+
+                var client = new TransferUdtClient("127.0.0.1", port, "", 0, 4194304, 0);
+                client.SendTextAsync(text).Wait(60000);
+
+                if (!gotText.WaitOne(10000))
+                    throw new Exception("UDT text was not received");
+                Assert.Equal(text, received, "UDT text content matches");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        private static void UdtAuthCorrectCode()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_udt_auth_send_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_udt_auth_recv_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdtServer server = null;
+            try
+            {
+                var testFile = Path.Combine(sendDir, "udt_auth.bin");
+                byte[] content = MakeTestFile(testFile, 32 * 1024);
+
+                var started = new ManualResetEvent(false);
+                var done = new ManualResetEvent(false);
+                server = new TransferUdtServer("127.0.0.1", port, recvDir);
+                server.PairingCode = "654321";
+                server.OnStarted += () => started.Set();
+                server.OnFileReceived += (p, s) => done.Set();
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("UDT server did not start within 5s");
+
+                var client = new TransferUdtClient("127.0.0.1", port, testFile, 0, 4194304, 0);
+                client.PairingCode = "654321";
+                client.SendAsync().Wait(60000);
+
+                if (!done.WaitOne(60000))
+                    throw new Exception("UDT file with pairing was not received");
+
+                Thread.Sleep(300);
+                var received = File.ReadAllBytes(Path.Combine(recvDir, "udt_auth.bin"));
+                Assert.True(Utils.ConstantTimeEquals(content, received), "UDT file content matches");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        // ---- HTTP share (browser listing/download) ----
+
+        /// <summary>GET helper returning (status, body bytes, headers).</summary>
+        private static System.Tuple<int, byte[], System.Net.WebHeaderCollection> HttpGet(string url)
+        {
+            var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+            req.Method = "GET";
+            req.Timeout = 10000;
+            req.ReadWriteTimeout = 10000;
+            req.Proxy = null;
+            try
+            {
+                using (var resp = (System.Net.HttpWebResponse)req.GetResponse())
+                using (var ms = new MemoryStream())
+                {
+                    resp.GetResponseStream().CopyTo(ms);
+                    return System.Tuple.Create((int)resp.StatusCode, ms.ToArray(), resp.Headers);
+                }
+            }
+            catch (System.Net.WebException ex)
+            {
+                var resp = ex.Response as System.Net.HttpWebResponse;
+                if (resp == null) throw;
+                using (resp)
+                using (var ms = new MemoryStream())
+                {
+                    resp.GetResponseStream().CopyTo(ms);
+                    return System.Tuple.Create((int)resp.StatusCode, ms.ToArray(), resp.Headers);
+                }
+            }
+        }
+
+        private static void HttpShareListAndDownload()
+        {
+            int port = FindFreePort();
+            string root = Path.Combine(TempBase(), "tr_http_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            var server = new HttpShareServer();
+            try
+            {
+                var contentA = new byte[300 * 1024];
+                new Random(21).NextBytes(contentA);
+                File.WriteAllBytes(Path.Combine(root, "a 文件.bin"), contentA);
+                Directory.CreateDirectory(Path.Combine(root, "sub"));
+                byte[] contentB = System.Text.Encoding.UTF8.GetBytes("hello from subdir");
+                File.WriteAllBytes(Path.Combine(root, "sub", "b.txt"), contentB);
+
+                server.Start(root, port, null);
+                string baseUrl = "http://127.0.0.1:" + port + "/";
+
+                // Root listing shows both entries
+                var list = HttpGet(baseUrl);
+                Assert.Equal(200, list.Item1, "root listing 200");
+                string html = System.Text.Encoding.UTF8.GetString(list.Item2);
+                Assert.True(html.Contains("a 文件.bin") || html.Contains(Uri.EscapeDataString("a 文件.bin").Replace("+", "%20")) || html.Contains("a %E6%96%87%E4%BB%B6.bin"),
+                    "listing contains file name");
+                Assert.True(html.Contains("sub"), "listing contains subdir");
+
+                // Download with a non-ASCII name; content and length must match
+                var dl = HttpGet(baseUrl + "?f=" + Uri.EscapeDataString("a 文件.bin"));
+                Assert.Equal(200, dl.Item1, "download 200");
+                Assert.Equal(contentA.Length, dl.Item2.Length, "download length");
+                Assert.True(Utils.ConstantTimeEquals(contentA, dl.Item2), "download bytes identical");
+                Assert.Equal(contentA.Length.ToString(), dl.Item3["Content-Length"], "Content-Length header");
+
+                // Subdirectory navigation and download
+                var subList = HttpGet(baseUrl + "?p=" + Uri.EscapeDataString("sub"));
+                Assert.Equal(200, subList.Item1, "subdir listing 200");
+                Assert.True(System.Text.Encoding.UTF8.GetString(subList.Item2).Contains("b.txt"), "subdir listing shows b.txt");
+                var dlB = HttpGet(baseUrl + "?f=" + Uri.EscapeDataString("sub/b.txt"));
+                Assert.Equal(200, dlB.Item1, "subdir download 200");
+                Assert.True(Utils.ConstantTimeEquals(contentB, dlB.Item2), "subdir download bytes");
+
+                // Missing file -> 404
+                var missing = HttpGet(baseUrl + "?f=does_not_exist.bin");
+                Assert.Equal(404, missing.Item1, "missing file 404");
+            }
+            finally
+            {
+                server.Stop();
+                try { Directory.Delete(root, true); } catch { }
+            }
+        }
+
+        private static void HttpShareTokenAndTraversal()
+        {
+            int port = FindFreePort();
+            string root = Path.Combine(TempBase(), "tr_http_tk_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            var server = new HttpShareServer();
+            try
+            {
+                byte[] content = System.Text.Encoding.UTF8.GetBytes("top secret payload");
+                File.WriteAllBytes(Path.Combine(root, "secret.bin"), content);
+                // A file OUTSIDE the share root that traversal must never reach
+                string outsideDir = Path.Combine(TempBase(), "tr_http_out_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(outsideDir);
+                File.WriteAllBytes(Path.Combine(outsideDir, "escaped.txt"), new byte[] { 1 });
+
+                server.Start(root, port, "135790");
+                string baseUrl = "http://127.0.0.1:" + port + "/";
+
+                // No/wrong token -> token form, never the listing
+                var noTok = HttpGet(baseUrl);
+                Assert.Equal(200, noTok.Item1, "token gate 200");
+                string html = System.Text.Encoding.UTF8.GetString(noTok.Item2);
+                Assert.True(html.Contains("name=\"t\""), "token form served");
+                Assert.False(html.Contains("secret.bin"), "no listing without token");
+
+                var badTok = HttpGet(baseUrl + "?t=000000");
+                Assert.True(System.Text.Encoding.UTF8.GetString(badTok.Item2).Contains("name=\"t\""), "wrong token -> form");
+
+                // Correct token -> listing visible
+                var okTok = HttpGet(baseUrl + "?t=135790");
+                Assert.True(System.Text.Encoding.UTF8.GetString(okTok.Item2).Contains("secret.bin"), "correct token -> listing");
+
+                // Download needs the token too
+                var dlNoTok = HttpGet(baseUrl + "?f=secret.bin");
+                Assert.True(System.Text.Encoding.UTF8.GetString(dlNoTok.Item2).Contains("name=\"t\""), "download without token -> form");
+                var dlOk = HttpGet(baseUrl + "?t=135790&f=secret.bin");
+                Assert.Equal(200, dlOk.Item1, "download with token 200");
+                Assert.True(Utils.ConstantTimeEquals(content, dlOk.Item2), "download bytes with token");
+
+                // Traversal attempts are blocked (sanitized into the root or 404)
+                var trav1 = HttpGet(baseUrl + "?t=" + Uri.EscapeDataString("135790") + "&f=" + Uri.EscapeDataString("../tr_http_out_" + Path.GetFileName(outsideDir) + "/escaped.txt"));
+                Assert.True(trav1.Item1 == 404 || trav1.Item1 == 200,
+                    "traversal attempt answered");
+                if (trav1.Item1 == 200)
+                    Assert.False(Utils.ConstantTimeEquals(new byte[] { 1 }, trav1.Item2), "traversal must not leak outside file");
+
+                var missing = HttpGet(baseUrl + "?t=135790&f=nope.bin");
+                Assert.Equal(404, missing.Item1, "missing file 404");
+
+                try { Directory.Delete(outsideDir, true); } catch { }
+            }
+            finally
+            {
+                server.Stop();
+                try { Directory.Delete(root, true); } catch { }
+            }
+        }
+
+        /// <summary>Fan-out pattern end-to-end: two independent servers receive the
+        /// same file concurrently from parallel clients (distinct random source ports).</summary>
+        private static void FanOutTwoTargets()
+        {
+            int port1 = FindFreePort();
+            int port2 = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_fan_s_" + Guid.NewGuid().ToString("N"));
+            string recv1 = Path.Combine(TempBase(), "tr_fan_r1_" + Guid.NewGuid().ToString("N"));
+            string recv2 = Path.Combine(TempBase(), "tr_fan_r2_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recv1);
+            Directory.CreateDirectory(recv2);
+            TransferServer s1 = null, s2 = null;
+            try
+            {
+                var content = new byte[200 * 1024];
+                new Random(33).NextBytes(content);
+                var testFile = Path.Combine(sendDir, "fan.bin");
+                File.WriteAllBytes(testFile, content);
+
+                var started = new ManualResetEvent(false);
+                s1 = new TransferServer("127.0.0.1", port1, recv1);
+                s2 = new TransferServer("127.0.0.1", port2, recv2);
+                var done1 = new ManualResetEvent(false);
+                var done2 = new ManualResetEvent(false);
+                s1.OnStarted += () => started.Set();
+                s1.OnFileReceived += (p, sz) => done1.Set();
+                s2.OnFileReceived += (p, sz) => done2.Set();
+                s1.Start();
+                s2.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("Servers did not start within 5s");
+
+                // Parallel clients — the fan-out core (random source ports, pairing, cards)
+                var c1 = new TransferClient("127.0.0.1", port1, testFile);
+                var c2 = new TransferClient("127.0.0.1", port2, testFile);
+                var t1 = c1.SendAsync();
+                var t2 = c2.SendAsync();
+                t1.Wait(30000);
+                t2.Wait(30000);
+
+                if (!done1.WaitOne(5000) || !done2.WaitOne(5000))
+                    throw new Exception("Both targets did not receive the file");
+
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(Path.Combine(recv1, "fan.bin"))), "target 1 content");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(Path.Combine(recv2, "fan.bin"))), "target 2 content");
+            }
+            finally
+            {
+                if (s1 != null) { try { s1.Stop(); } catch { } }
+                if (s2 != null) { try { s2.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recv1, true); } catch { }
+                try { Directory.Delete(recv2, true); } catch { }
+            }
+        }
+
+        // ---- HTTP share upload (multipart POST) ----
+
+        /// <summary>Builds a multipart/form-data body: fields then files.</summary>
+        private static byte[] BuildMultipart(string boundary,
+            System.Collections.Generic.Dictionary<string, string> fields,
+            System.Collections.Generic.Dictionary<string, byte[]> files)
+        {
+            var ms = new MemoryStream();
+            foreach (var kv in fields)
+            {
+                byte[] part = System.Text.Encoding.UTF8.GetBytes(
+                    "--" + boundary + "\r\n" +
+                    "Content-Disposition: form-data; name=\"" + kv.Key + "\"\r\n\r\n" +
+                    kv.Value + "\r\n");
+                ms.Write(part, 0, part.Length);
+            }
+            foreach (var kv in files)
+            {
+                byte[] head = System.Text.Encoding.UTF8.GetBytes(
+                    "--" + boundary + "\r\n" +
+                    "Content-Disposition: form-data; name=\"file\"; filename=\"" + kv.Key + "\"\r\n" +
+                    "Content-Type: application/octet-stream\r\n\r\n");
+                ms.Write(head, 0, head.Length);
+                ms.Write(kv.Value, 0, kv.Value.Length);
+                byte[] tail = System.Text.Encoding.UTF8.GetBytes("\r\n");
+                ms.Write(tail, 0, tail.Length);
+            }
+            byte[] end = System.Text.Encoding.UTF8.GetBytes("--" + boundary + "--\r\n");
+            ms.Write(end, 0, end.Length);
+            return ms.ToArray();
+        }
+
+        private static System.Tuple<int, byte[], string> HttpPost(string url, string contentType, byte[] body)
+        {
+            var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+            req.Method = "POST";
+            req.Timeout = 30000;
+            req.ReadWriteTimeout = 30000;
+            req.Proxy = null;
+            req.ContentType = contentType;
+            req.ContentLength = body.Length;
+            req.AllowAutoRedirect = false;
+            using (var rs = req.GetRequestStream())
+                rs.Write(body, 0, body.Length);
+            try
+            {
+                using (var resp = (System.Net.HttpWebResponse)req.GetResponse())
+                using (var ms = new MemoryStream())
+                {
+                    resp.GetResponseStream().CopyTo(ms);
+                    return System.Tuple.Create((int)resp.StatusCode, ms.ToArray(), resp.Headers["Location"]);
+                }
+            }
+            catch (System.Net.WebException ex)
+            {
+                var resp = ex.Response as System.Net.HttpWebResponse;
+                if (resp == null) throw;
+                using (resp)
+                using (var ms = new MemoryStream())
+                {
+                    resp.GetResponseStream().CopyTo(ms);
+                    return System.Tuple.Create((int)resp.StatusCode, ms.ToArray(), resp.Headers["Location"]);
+                }
+            }
+        }
+
+        private static void HttpShareUpload()
+        {
+            int port = FindFreePort();
+            string root = Path.Combine(TempBase(), "tr_http_up_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            var server = new HttpShareServer();
+            try
+            {
+                // Payload larger than the 64KB read buffer, with boundary-prefix fragments
+                // inside to stress the streaming pattern scanner across chunk edges
+                var content = new byte[300 * 1024];
+                new Random(77).NextBytes(content);
+                System.Text.Encoding.UTF8.GetBytes("--BOUND\r\n").CopyTo(content, 50000);
+                System.Text.Encoding.UTF8.GetBytes("\r\n--BOUN").CopyTo(content, 150000);
+                var small = System.Text.Encoding.UTF8.GetBytes("second file body");
+                var content2 = new byte[64 * 1024 + 17];
+                new Random(78).NextBytes(content2);
+
+                server.Start(root, port, null);
+                string baseUrl = "http://127.0.0.1:" + port + "/";
+
+                var files = new System.Collections.Generic.Dictionary<string, byte[]>
+                {
+                    { "up 大文件.bin", content },
+                    { "second.bin", content2 },
+                    { "small.txt", small }
+                };
+                var fields = new System.Collections.Generic.Dictionary<string, string>
+                {
+                    { "p", "" }
+                };
+                byte[] body = BuildMultipart("BOUND", fields, files);
+                var resp = HttpPost(baseUrl, "multipart/form-data; boundary=BOUND", body);
+
+                Assert.Equal(303, resp.Item1, "upload responds 303");
+                Assert.True(resp.Item3 != null && resp.Item3.StartsWith("/?p="), "redirect back to listing");
+                Assert.Equal(3, Directory.GetFiles(root).Length, "three files uploaded");
+
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(Path.Combine(root, "up 大文件.bin"))), "multipart file 1 bytes");
+                Assert.True(Utils.ConstantTimeEquals(content2, File.ReadAllBytes(Path.Combine(root, "second.bin"))), "file 2 bytes");
+                Assert.True(Utils.ConstantTimeEquals(small, File.ReadAllBytes(Path.Combine(root, "small.txt"))), "file 3 bytes");
+
+                // Listing now shows the uploaded names
+                var list = HttpGet(baseUrl);
+                Assert.True(System.Text.Encoding.UTF8.GetString(list.Item2).Contains("second.bin"), "listing shows uploaded file");
+
+                // Upload into a subdirectory via the p field
+                Directory.CreateDirectory(Path.Combine(root, "sub"));
+                var fieldsSub = new System.Collections.Generic.Dictionary<string, string> { { "p", "sub" } };
+                var filesSub = new System.Collections.Generic.Dictionary<string, byte[]> { { "inner.txt", small } };
+                var resp2 = HttpPost(baseUrl, "multipart/form-data; boundary=BOUND", BuildMultipart("BOUND", fieldsSub, filesSub));
+                Assert.Equal(303, resp2.Item1, "subdir upload 303");
+                Assert.True(Utils.ConstantTimeEquals(small, File.ReadAllBytes(Path.Combine(root, "sub", "inner.txt"))), "subdir upload bytes");
+            }
+            finally
+            {
+                server.Stop();
+                try { Directory.Delete(root, true); } catch { }
+            }
+        }
+
+        private static void HttpShareUploadTokenAndTraversalName()
+        {
+            int port = FindFreePort();
+            string root = Path.Combine(TempBase(), "tr_http_upt_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            var server = new HttpShareServer();
+            try
+            {
+                byte[] content = System.Text.Encoding.UTF8.GetBytes("guarded upload");
+                server.Start(root, port, "246810");
+                string baseUrl = "http://127.0.0.1:" + port + "/";
+
+                // Without token: POST is refused (token form instead of an upload)
+                var files = new System.Collections.Generic.Dictionary<string, byte[]> { { "a.txt", content } };
+                var noTok = HttpPost(baseUrl, "multipart/form-data; boundary=B",
+                    BuildMultipart("B", new System.Collections.Generic.Dictionary<string, string>(), files));
+                Assert.False(noTok.Item1 == 303, "upload without token must not succeed");
+                Assert.Equal(0, Directory.GetFiles(root).Length, "nothing written without token");
+
+                // With token: upload works
+                var withTok = HttpPost(baseUrl + "?t=246810", "multipart/form-data; boundary=B",
+                    BuildMultipart("B", new System.Collections.Generic.Dictionary<string, string>(), files));
+                Assert.Equal(303, withTok.Item1, "upload with token 303");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(Path.Combine(root, "a.txt"))), "token upload bytes");
+
+                // Traversal filename is stripped to a bare name inside the share root
+                var evil = new System.Collections.Generic.Dictionary<string, byte[]> { { "..\\..\\evil.txt", content } };
+                var respEvil = HttpPost(baseUrl + "?t=246810", "multipart/form-data; boundary=B",
+                    BuildMultipart("B", new System.Collections.Generic.Dictionary<string, string>(), evil));
+                Assert.Equal(303, respEvil.Item1, "traversal-named upload still handled");
+                Assert.True(File.Exists(Path.Combine(root, "evil.txt")), "name stripped to bare file name");
+                string parent = Path.GetDirectoryName(root.TrimEnd(Path.DirectorySeparatorChar));
+                Assert.False(File.Exists(Path.Combine(parent, "evil.txt")), "nothing written outside root");
+            }
+            finally
+            {
+                server.Stop();
+                try { Directory.Delete(root, true); } catch { }
+                string parent = Path.GetDirectoryName(root.TrimEnd(Path.DirectorySeparatorChar));
+                try { File.Delete(Path.Combine(parent, "evil.txt")); } catch { }
             }
         }
     }

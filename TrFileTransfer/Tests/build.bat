@@ -26,6 +26,7 @@ echo.
     ..\Shared.cs ^
     ..\L10N.cs ^
     ..\WireProtocol.cs ^
+    ..\WireCrypto.cs ^
     ..\ConcurrentTransfer.cs ^
     ..\TransferServer.cs ^
     ..\TransferUdt.cs ^
@@ -34,8 +35,13 @@ echo.
     ..\ResumeState.cs ^
     ..\ServerResumeStore.cs ^
     ..\FolderResumeState.cs ^
+    ..\Updater.cs ^
+    ..\HttpShare.cs ^
+    ..\QrCode.cs ^
+    ..\StatsStore.cs ^
     TestProgram.cs ^
-    IntegrationTests.cs
+    IntegrationTests.cs ^
+    FeatureTests.cs
 
 if %ERRORLEVEL% equ 0 (
     echo.
