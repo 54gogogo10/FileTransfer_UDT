@@ -37,6 +37,11 @@ namespace TrFileTransfer
         /// <summary>Whether a transfer is currently in progress.</summary>
         public bool IsRunning { get { return _isRunning; } }
 
+        /// <summary>True when the last run ended via Cancel() — lets the UI distinguish
+        /// a deliberate pause from a genuine failure (cancellation does not throw).</summary>
+        public bool WasCancelled { get { return _wasCancelled; } }
+        private bool _wasCancelled;
+
         /// <summary>Pairing code sent as a 0x05 auth frame before any transfer.
         /// Null/empty sends nothing (compatible with servers that don't require it).</summary>
         public string PairingCode { get; set; }
@@ -140,6 +145,7 @@ namespace TrFileTransfer
         {
             _cts = new CancellationTokenSource();
             _isRunning = true;
+            _wasCancelled = false;
 
             var startedHandler = OnStarted;
             if (startedHandler != null) startedHandler();
@@ -150,6 +156,7 @@ namespace TrFileTransfer
             }
             catch (OperationCanceledException)
             {
+                _wasCancelled = true;
                 Log(L.C_TransferCancelled);
             }
             catch (ObjectDisposedException) { }
