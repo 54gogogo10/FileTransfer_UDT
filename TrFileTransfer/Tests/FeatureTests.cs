@@ -19,6 +19,7 @@ namespace TrFileTransfer.Tests
             RunDiskSpace(runner);
             RunQr(runner);
             RunStatsStore(runner);
+            RunSpeedLimiter(runner);
         }
 
         public static void RunIntegration(TestRunner runner)
@@ -36,6 +37,8 @@ namespace TrFileTransfer.Tests
             runner.Run("Feature_TCP_ConfirmDeny", TcpConfirmDeny);
             runner.Run("Feature_TCP_ConfirmAccept", TcpConfirmAccept);
             runner.Run("Feature_TCP_SessionStats", TcpSessionStats);
+            runner.Run("Feature_TCP_RecvSpeedLimit", TcpRecvSpeedLimit);
+            runner.Run("Feature_TCP_PauseResume", TcpPauseResume);
         }
 
         // ==================== Unit: session crypto ====================
@@ -386,11 +389,80 @@ namespace TrFileTransfer.Tests
                     Assert.Equal(100L, ok.Bytes, "bytes");
                     Assert.Equal('R', ok.Direction, "direction");
                 });
+
+                runner.Run("StatsStore_DetailFieldsRoundtrip", () =>
+                {
+                    string path = Path.Combine(dir, "stats_detail.log");
+                    var store = new StatsStore(path);
+                    store.Append(new StatsEntry
+                    {
+                        When = DateTime.Now,
+                        Direction = 'R',
+                        Peer = "192.168.1.9",
+                        Bytes = 4242,
+                        Files = 2,
+                        Seconds = 3.0,
+                        Detail = "photo.zip",
+                        Path = @"C:\recv\photo.zip"
+                    });
+
+                    var entries = new StatsStore(path).LoadAll();
+                    Assert.Equal(1, entries.Count, "one line");
+                    Assert.Equal("photo.zip", entries[0].Detail, "detail survives the log");
+                    Assert.Equal(@"C:\recv\photo.zip", entries[0].Path, "path survives the log");
+                });
+
+                runner.Run("StatsStore_LegacyAndModernLines", () =>
+                {
+                    var legacy = StatsEntry.Parse("2026-09-07 10:00:00|S|10.0.0.1|123|1|2.5");
+                    Assert.NotNull(legacy, "legacy 6-field line still parses");
+                    Assert.True(string.IsNullOrEmpty(legacy.Detail), "legacy detail empty");
+                    Assert.True(string.IsNullOrEmpty(legacy.Path), "legacy path empty");
+
+                    var modern = StatsEntry.Parse("2026-09-07 10:00:00|S|10.0.0.1|123|1|2.5|report.pdf|C:\\docs\\report.pdf");
+                    Assert.NotNull(modern, "8-field line parses");
+                    Assert.Equal("report.pdf", modern.Detail, "modern detail");
+                    Assert.Equal("C:\\docs\\report.pdf", modern.Path, "modern path");
+
+                    Assert.True(StatsEntry.Parse("2026-09-07 10:00:00|S|10.0.0.1|1|1|1|only-detail") != null,
+                        "7-field line (empty path) parses");
+                });
             }
             finally
             {
                 try { Directory.Delete(dir, true); } catch { }
             }
+        }
+
+        /// <summary>The receive-side limiter shares one bucket across concurrent callers
+        /// (thread-safe accounting), unlike per-connection buckets.</summary>
+        private static void RunSpeedLimiter(TestRunner runner)
+        {
+            runner.Run("SpeedLimiter_ZeroIsUnlimited", () =>
+            {
+                var limiter = new SpeedLimiter(0);
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                limiter.ThrottleAsync(10 * 1024 * 1024, CancellationToken.None).Wait();
+                Assert.True(sw.ElapsedMilliseconds < 500, "zero limit never delays");
+            });
+
+            runner.Run("SpeedLimiter_SharedBucketPacesTotal", () =>
+            {
+                var limiter = new SpeedLimiter(100 * 1024); // 100 KB/s
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                // Two concurrent senders, 100 KB each: 200 KB through one 100 KB/s
+                // bucket must take ~2 s regardless of interleaving
+                var t1 = limiter.ThrottleAsync(50 * 1024, CancellationToken.None);
+                var t2 = limiter.ThrottleAsync(50 * 1024, CancellationToken.None);
+                var t3 = limiter.ThrottleAsync(50 * 1024, CancellationToken.None);
+                var t4 = limiter.ThrottleAsync(50 * 1024, CancellationToken.None);
+                Task.WaitAll(new[] { t1, t2, t3, t4 });
+                sw.Stop();
+                Assert.True(sw.ElapsedMilliseconds >= 1500,
+                    "shared bucket paces the TOTAL (took " + sw.ElapsedMilliseconds + "ms)");
+                Assert.True(sw.ElapsedMilliseconds < 10000,
+                    "throttling is not excessive (took " + sw.ElapsedMilliseconds + "ms)");
+            });
         }
 
         // ==================== Integration: TCP/UDT features ====================
@@ -916,6 +988,92 @@ namespace TrFileTransfer.Tests
                 Assert.Equal((long)content.Length, seen.Bytes, "bytes recorded");
                 Assert.Equal(1, seen.Files, "file count recorded");
                 Assert.False(seen.Encrypted, "no pairing -> plaintext session");
+                Assert.Equal("stats.bin", seen.Detail, "transfer name recorded for the history");
+                Assert.True(seen.Path != null && seen.Path.EndsWith("stats.bin"),
+                    "first save path recorded for the history");
+            }
+        }
+
+        /// <summary>Receive-side shaping: one server-wide bucket slows the incoming
+        /// transfer to roughly the configured rate (600 KB at 200 KB/s ≈ 3 s).</summary>
+        private static void TcpRecvSpeedLimit()
+        {
+            using (var fx = new TcpServerFixture())
+            {
+                fx.Server.ReceiveSpeedLimit = 200 * 1024; // 200 KB/s
+                fx.Start();
+
+                string testFile = Path.Combine(fx.SendDir, "limited.bin");
+                MakeTestFile(testFile, 600 * 1024);
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                SendAndWait(fx, testFile); // SendAndWait verifies the SHA256 as usual
+                sw.Stop();
+
+                Assert.True(sw.ElapsedMilliseconds >= 2200,
+                    "receive limit throttled the transfer (took " + sw.ElapsedMilliseconds + "ms)");
+                Assert.True(sw.ElapsedMilliseconds < 30000,
+                    "throttling is not excessive (took " + sw.ElapsedMilliseconds + "ms)");
+
+                var files = WaitForFileCount(fx, 1);
+                Assert.Equal(1, files.Length, "exactly one file saved");
+            }
+        }
+
+        /// <summary>The pause/resume mechanic behind the UI button: cancel a throttled
+        /// send mid-flight, then re-run the SAME session — the server checkpoint makes
+        /// the second pass finish the file byte-for-byte.</summary>
+        private static void TcpPauseResume()
+        {
+            using (var fx = new TcpServerFixture())
+            {
+                fx.Start();
+
+                string testFile = Path.Combine(fx.SendDir, "pause.bin");
+                byte[] content = MakeTestFile(testFile, 8 * 1024 * 1024); // 8 MB at 2 MB/s ≈ 4 s
+                var session = Guid.NewGuid();
+
+                var client = new TransferClient("127.0.0.1", fx.Port, testFile, 0, 4194304, 2 * 1024 * 1024);
+                var stopped = new ManualResetEvent(false);
+                client.OnStopped += () => stopped.Set();
+
+                var sendTask = client.SendResumableAsync(session, false);
+                if (!stopped.WaitOne(1500))
+                {
+                    // Mid-transfer: this is the "pause button"
+                    client.Cancel();
+                    if (!stopped.WaitOne(10000))
+                        throw new Exception("client did not stop after cancel");
+                }
+                Assert.True(client.WasCancelled, "cancel registered as a deliberate pause");
+                try { sendTask.Wait(15000); } catch { }
+                Thread.Sleep(600); // let the server persist the interrupted checkpoint
+
+                // Resume on the same session, unthrottled
+                var client2 = new TransferClient("127.0.0.1", fx.Port, testFile);
+                var done2 = new ManualResetEvent(false);
+                bool ok2 = false;
+                string error2 = null;
+                client2.OnTransferComplete += () => { ok2 = true; done2.Set(); };
+                client2.OnError += msg => { error2 = msg; done2.Set(); };
+                var resumeTask = client2.SendResumableAsync(session, false);
+                if (!done2.WaitOne(30000))
+                    throw new Exception("resume did not finish within 30s");
+                if (!ok2)
+                    throw new Exception("resume failed: " + (error2 ?? "unknown"));
+                try
+                {
+                    if (resumeTask.Exception != null)
+                        throw new Exception("resume task faulted: " + resumeTask.Exception.InnerException.Message);
+                }
+                catch (AggregateException) { }
+
+                Thread.Sleep(300);
+                var files = Directory.GetFiles(fx.RecvDir, "*", SearchOption.AllDirectories);
+                Assert.Equal(1, files.Length, "exactly one file after resume");
+                byte[] saved = File.ReadAllBytes(files[0]);
+                Assert.Equal(content.Length, saved.Length, "resumed file is complete");
+                Assert.True(Utils.ConstantTimeEquals(content, saved), "resumed content matches the source");
             }
         }
     }

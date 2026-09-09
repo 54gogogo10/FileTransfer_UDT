@@ -100,7 +100,9 @@ namespace TrFileTransfer
     }
     #pragma warning restore 1591
 
-        /// <summary>Token-bucket rate limiter for throttling transfer throughput.</summary>
+        /// <summary>Token-bucket rate limiter for throttling transfer throughput.
+        /// Thread-safe: a single instance may pace several concurrent connections
+        /// (receive-side shaping shares one bucket across all clients).</summary>
         public class SpeedLimiter
         {
             private readonly long _maxBytesPerSec;
@@ -119,8 +121,8 @@ namespace TrFileTransfer
             public async System.Threading.Tasks.Task ThrottleAsync(int bytes, System.Threading.CancellationToken ct)
             {
                 if (_maxBytesPerSec <= 0) return;
-                _totalSent += bytes;
-                double expectedSeconds = (double)_totalSent / _maxBytesPerSec;
+                long total = System.Threading.Interlocked.Add(ref _totalSent, bytes);
+                double expectedSeconds = (double)total / _maxBytesPerSec;
                 double elapsed = _sw.Elapsed.TotalSeconds;
                 double deficit = expectedSeconds - elapsed;
                 if (deficit > 0.002)

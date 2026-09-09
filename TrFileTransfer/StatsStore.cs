@@ -21,19 +21,26 @@ namespace TrFileTransfer
         public long Bytes;
         public int Files;
         public double Seconds;
+        /// <summary>Display name of what traveled (file or folder name). Optional —
+        /// empty for rows written before this field existed.</summary>
+        public string Detail;
+        /// <summary>First file's full local path, when known. Optional like Detail.</summary>
+        public string Path;
 
         public string Serialize()
         {
             return When.ToString("yyyy-MM-dd HH:mm:ss") + "|" + Direction + "|" + (Peer ?? "") + "|" +
                 Bytes.ToString(CultureInfo.InvariantCulture) + "|" +
                 Files.ToString(CultureInfo.InvariantCulture) + "|" +
-                Seconds.ToString("F1", CultureInfo.InvariantCulture);
+                Seconds.ToString("F1", CultureInfo.InvariantCulture) + "|" +
+                (Detail ?? "") + "|" +
+                (Path ?? "");
         }
 
         public static StatsEntry Parse(string line)
         {
             string[] f = line.Split('|');
-            if (f.Length != 6) return null;
+            if (f.Length < 6) return null;
             DateTime when;
             if (!DateTime.TryParseExact(f[0], "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture,
                 DateTimeStyles.None, out when)) return null;
@@ -52,7 +59,9 @@ namespace TrFileTransfer
                 Peer = f[2],
                 Bytes = bytes,
                 Files = files,
-                Seconds = secs
+                Seconds = secs,
+                Detail = f.Length > 6 ? f[6] : "",
+                Path = f.Length > 7 ? f[7] : ""
             };
         }
     }

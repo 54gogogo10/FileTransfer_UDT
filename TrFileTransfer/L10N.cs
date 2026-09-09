@@ -742,10 +742,11 @@ namespace TrFileTransfer
             get
             {
                 return IsChinese
-                    ? "设置已保存；分目录/去重选项在下次启动服务器时生效。"
-                    : "Saved; per-device/dedup options apply on the next server start.";
+                    ? "设置已保存；分目录/去重/接收限速在下次启动服务器时生效。"
+                    : "Saved; per-device/dedup/receive-limit options apply on the next server start.";
             }
         }
+        public static string RORecvSpeedLabel { get { return IsChinese ? "接收限速 KB/s (0=不限):" : "Receive limit KB/s (0 = off):"; } }
 
         // ---- Transfer statistics ----
         public static string StatsBtn { get { return IsChinese ? "统计" : "Stats"; } }
@@ -772,6 +773,73 @@ namespace TrFileTransfer
             }
         }
 
+        // ---- Transfer history ----
+        public static string HistoryBtn { get { return IsChinese ? "历史" : "History"; } }
+        public static string HistoryTitle { get { return IsChinese ? "传输历史" : "Transfer History"; } }
+        public static string HistoryAll { get { return IsChinese ? "全部" : "All"; } }
+        public static string HistoryFilterLabel { get { return IsChinese ? "方向:" : "Direction:"; } }
+        public static string HistoryExportCsv { get { return IsChinese ? "导出 CSV" : "Export CSV"; } }
+        public static string HistoryCsvHeader
+        {
+            get
+            {
+                return IsChinese
+                    ? "时间,方向,对端,名称,字节,文件数,秒,路径"
+                    : "Time,Direction,Peer,Detail,Bytes,Files,Seconds,Path";
+            }
+        }
+        public static string HistoryRowCount(int shown, int total)
+        {
+            return IsChinese
+                ? string.Format("显示 {0} / 共 {1} 条", shown, total)
+                : string.Format("Showing {0} of {1}", shown, total);
+        }
+        public static string HistoryCsvDone(string path)
+        {
+            return IsChinese ? "已导出到:\n" + path : "Exported to:\n" + path;
+        }
+
+        // ---- Known devices manager ----
+        public static string DevicesBtn { get { return IsChinese ? "设备" : "Devices"; } }
+        public static string DevicesTitle { get { return IsChinese ? "已知设备" : "Known Devices"; } }
+        public static string DevicesEmpty
+        {
+            get
+            {
+                return IsChinese
+                    ? "暂无已保存的设备。发送成功或扫描后自动记录。"
+                    : "No known devices yet. Devices are remembered after a successful send or scan.";
+            }
+        }
+        public static string DevicesUse { get { return IsChinese ? "使用" : "Use"; } }
+        public static string DevicesDelete { get { return IsChinese ? "删除" : "Delete"; } }
+        public static string DevicesClear { get { return IsChinese ? "全部清除" : "Clear All"; } }
+        public static string DevicesDeleted(string name)
+        {
+            return IsChinese ? "已删除 " + name + "。" : "Removed " + name + ".";
+        }
+        public static string DevicesClearConfirm
+        {
+            get { return IsChinese ? "确定清除全部已知设备？" : "Remove ALL known devices?"; }
+        }
+
+        // ---- Pause / resume ----
+        public static string PauseBtn { get { return IsChinese ? "暂停" : "Pause"; } }
+        public static string ResumeText { get { return IsChinese ? "继续" : "Resume"; } }
+        public static string PausingStatus { get { return IsChinese ? "正在暂停…" : "Pausing…"; } }
+        public static string PausedStatus
+        {
+            get
+            {
+                return IsChinese
+                    ? "已暂停 — 点击\"继续\"从断点恢复"
+                    : "Paused — click Resume to continue from the checkpoint";
+            }
+        }
+        public static string C_Paused { get { return IsChinese ? "传输已暂停。" : "Transfer paused."; } }
+        public static string C_TransferResumed { get { return IsChinese ? "继续传输，从断点续传…" : "Resuming from the checkpoint…"; } }
+
+
         public static string HelpText()
         {
             return IsChinese
@@ -793,7 +861,10 @@ namespace TrFileTransfer
                   "· 发文本 —— 向对方发送一条即时消息\n" +
                   "· 加密 —— 双方都开配对码即自动加密传输（AES-256）\n" +
                   "· 接收选项 —— 接收前确认、IP 过滤、按设备分目录、\n" +
-                  "  相同文件跳过；\"统计\"查看各设备传输量\n" +
+                  "  相同文件跳过、接收限速；\"统计\"查看各设备传输量\n" +
+                  "· 暂停/继续 —— 发送中可随时暂停，继续时自动从断点续传\n" +
+                  "· 历史 —— 查看全部收发记录，可按方向筛选、导出 CSV\n" +
+                  "· 设备 —— 管理自动记忆的设备列表\n" +
                   "· HTTP 共享 —— 开启时显示二维码，手机扫码即访\n\n" +
                   "提示：所有设置自动保存；关闭窗口仅最小化到托盘，\n托盘右键菜单可开机自启、检查更新或真正退出。"
                 : "[Receive (server)]\n" +
@@ -815,7 +886,10 @@ namespace TrFileTransfer
                   "- Encrypt: with pairing codes on both sides the session is\n" +
                   "  automatically encrypted (AES-256)\n" +
                   "- Options: receive confirmation, IP filter, per-device folders,\n" +
-                  "  duplicate skipping; \"Stats\" shows per-device volume\n" +
+                  "  duplicate skipping, receive rate limit; \"Stats\" shows per-device volume\n" +
+                  "- Pause/Resume: pause a send any time; Resume continues from the checkpoint\n" +
+                  "- History: browse every transfer, filter by direction, export to CSV\n" +
+                  "- Devices: manage the remembered device list\n" +
                   "- HTTP share shows a QR code when started — scan to open\n\n" +
                   "Tips: settings save automatically; closing the window hides to tray —\nuse the tray menu for auto-start, updates or a real exit.";
         }
