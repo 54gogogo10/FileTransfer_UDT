@@ -130,6 +130,13 @@ namespace TrFileTransfer
             set { _wire.ResolveDeviceName = value; }
         }
 
+        /// <summary>Receive-side speed limit in bytes per second, shared as one bucket by
+        /// all connected clients (0 = unlimited). Snapshot at Start() — set before starting.</summary>
+        public long ReceiveSpeedLimit
+        {
+            set { _wire.ReceiveLimiter = value > 0 ? new SpeedLimiter(value) : null; }
+        }
+
         /// <summary>Starts listening for incoming connections. Fires OnStarted on success.</summary>
         public void Start()
         {

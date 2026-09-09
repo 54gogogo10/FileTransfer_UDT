@@ -141,12 +141,16 @@
                                    Foreground="{DynamicResource Brush.AccentHover}" Visibility="Collapsed"/>
                     </StackPanel>
 
-                    <!-- Receive options: security gates + stats -->
+                    <!-- Receive options: security gates + stats + history + devices -->
                     <StackPanel Grid.Row="5" Orientation="Horizontal" Margin="0,0,0,0">
                         <Button x:Name="_btnRecvOptions" Style="{StaticResource BtnSecondary}" MinWidth="88"
                                 Click="BtnRecvOptions_Click"/>
                         <Button x:Name="_btnStats" Style="{StaticResource BtnSecondary}" MinWidth="76"
                                 Margin="8,0,0,0" Click="BtnStats_Click"/>
+                        <Button x:Name="_btnHistory" Style="{StaticResource BtnSecondary}" MinWidth="76"
+                                Margin="8,0,0,0" Click="BtnHistory_Click"/>
+                        <Button x:Name="_btnDevices" Style="{StaticResource BtnSecondary}" MinWidth="76"
+                                Margin="8,0,0,0" Click="BtnDevices_Click"/>
                     </StackPanel>
                 </Grid>
             </Border>
@@ -198,11 +202,12 @@
                                 Margin="10,0,0,0" Click="BtnSend_Click"/>
                     </Grid>
 
-                    <!-- Path / browse / cancel -->
+                    <!-- Path / browse / pause / cancel -->
                     <Grid Grid.Row="2" Margin="0,0,0,8">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto"/>
                             <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
                             <ColumnDefinition Width="Auto"/>
                             <ColumnDefinition Width="Auto"/>
                         </Grid.ColumnDefinitions>
@@ -211,7 +216,9 @@
                                  VerticalAlignment="Center"/>
                         <Button x:Name="_btnBrowseFile" Grid.Column="2" Style="{StaticResource BtnSecondary}"
                                 MinWidth="64" Margin="8,0,0,0" Click="BtnBrowseFile_Click"/>
-                        <Button x:Name="_btnCancel" Grid.Column="3" Style="{StaticResource BtnSecondary}"
+                        <Button x:Name="_btnPause" Grid.Column="3" Style="{StaticResource BtnSecondary}"
+                                MinWidth="64" Margin="8,0,0,0" IsEnabled="False" Click="BtnPause_Click"/>
+                        <Button x:Name="_btnCancel" Grid.Column="4" Style="{StaticResource BtnSecondary}"
                                 MinWidth="76" Margin="8,0,0,0" IsEnabled="False" Click="BtnCancel_Click"/>
                     </Grid>
 

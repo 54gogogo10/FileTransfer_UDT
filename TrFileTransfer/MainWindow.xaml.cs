@@ -75,6 +75,26 @@ namespace TrFileTransfer
         private readonly List<object> _fanOutClients = new List<object>();
         private volatile bool _fanOutRunning;
 
+        // Pause/resume: snapshot of the running single-connection send, so the resume
+        // click can restart it on the same 0x03/0x04 session (server checkpoint does the rest)
+        private sealed class PauseState
+        {
+            public string Path;
+            public bool IsFolder;
+            public string Ip;
+            public int Port;
+            public bool IsTcp;
+            public int SrcPort;
+            public int Concurrency;
+            public bool VerifyHash;
+            public int SpeedLimit;
+            public bool Sync;
+            public Guid Session;
+        }
+        private PauseState _pauseState;
+        private bool _paused;                     // paused right now (resume button armed)
+        private volatile bool _pauseRequested;    // pause clicked, waiting for the send to wind down
+
         public MainWindow()
         {
             UiChrome.ApplyDark(this, mica: true);
@@ -463,6 +483,9 @@ namespace TrFileTransfer
                 _btnHttpShare.Content = L.HttpShareStop;
             _btnRecvOptions.Content = L.RecvOptionsBtn;
             _btnStats.Content = L.StatsBtn;
+            _btnHistory.Content = L.HistoryBtn;
+            _btnDevices.Content = L.DevicesBtn;
+            _btnPause.Content = _paused ? L.ResumeText : L.PauseBtn;
             _chkEncrypt.Content = L.EncryptLabel;
             _chkAutoRetry.Content = L.AutoRetryLabel;
 
@@ -1343,6 +1366,7 @@ namespace TrFileTransfer
             server.ResolveDeviceName = ResolveDeviceNameForIp;
             server.IpAllowed = IpFilterPass;
             server.ConfirmRequest = AskReceiveConfirmation;
+            server.ReceiveSpeedLimit = (long)Config.GetInt("RecvSpeedLimit", 0) * 1024;
         }
 
         private void ApplyServerOptionsUdt(TransferUdtServer server)
@@ -1353,6 +1377,7 @@ namespace TrFileTransfer
             server.ResolveDeviceName = ResolveDeviceNameForIp;
             server.IpAllowed = IpFilterPass;
             server.ConfirmRequest = AskReceiveConfirmation;
+            server.ReceiveSpeedLimit = (long)Config.GetInt("RecvSpeedLimit", 0) * 1024;
         }
 
         /// <summary>IP filter decision — evaluated per connection from Config.</summary>
@@ -1438,11 +1463,13 @@ namespace TrFileTransfer
                 Peer = stats.Peer,
                 Bytes = stats.Bytes,
                 Files = stats.Files,
-                Seconds = stats.Watch.Elapsed.TotalSeconds
+                Seconds = stats.Watch.Elapsed.TotalSeconds,
+                Detail = stats.Detail,
+                Path = stats.Path
             });
         }
 
-        private void RecordSent(string ip, long bytes, int files, double seconds)
+        private void RecordSent(string ip, long bytes, int files, double seconds, string detail, string path)
         {
             if (bytes <= 0) return;
             _stats.Append(new StatsEntry
@@ -1452,7 +1479,9 @@ namespace TrFileTransfer
                 Peer = ip,
                 Bytes = bytes,
                 Files = files,
-                Seconds = seconds
+                Seconds = seconds,
+                Detail = detail,
+                Path = path
             });
         }
 
@@ -1468,6 +1497,20 @@ namespace TrFileTransfer
         {
             var dlg = new StatsDialog(_stats) { Owner = this };
             dlg.ShowDialog();
+        }
+
+        private void BtnHistory_Click(object sender, RoutedEventArgs e)
+        {
+            var dlg = new HistoryDialog(_stats) { Owner = this };
+            dlg.ShowDialog();
+        }
+
+        private void BtnDevices_Click(object sender, RoutedEventArgs e)
+        {
+            // The dialog edits _knownDevices in place; persist whatever remains
+            var dlg = new DevicesDialog(_knownDevices, UseDiscoveredDevice) { Owner = this };
+            dlg.ShowDialog();
+            SaveKnownDevices();
         }
 
         private void BtnStopServer_Click(object sender, RoutedEventArgs e)
@@ -1552,7 +1595,9 @@ namespace TrFileTransfer
         /// <summary>
         /// Runs a single send (single or concurrent, TCP or UDT). Disables client inputs
         /// while running and restores them afterwards. Returns false on failure — the
-        /// error is already surfaced via OnError event handlers.
+        /// error is already surfaced via OnError event handlers. Single-connection sends
+        /// arm the pause button: pausing cancels the client and keeps a parameter snapshot
+        /// (plus the 0x03/0x04 session id) so the resume click continues the checkpoint.
         /// </summary>
         private async Task<bool> StartTransfer(string path, bool isFolder, string ip, int port,
             bool isTcp, int srcPort, int concurrency, bool verifyHash, int speedLimit, Guid? resumeSession)
@@ -1573,7 +1618,39 @@ namespace TrFileTransfer
                     return false;
                 }
 
+                // A fresh send invalidates any leftover pause snapshot
+                _pauseState = null;
+                _paused = false;
+                _pauseRequested = false;
+                _btnPause.IsEnabled = false;
+                _btnPause.Content = L.PauseBtn;
+
                 DisableClientInputs();
+
+                bool syncMode = isFolder && _chkSync.IsChecked == true;
+                Guid pauseSession = resumeSession.HasValue ? resumeSession.Value
+                    : (syncMode ? FolderResumeState.DeriveSyncSession(path, ip, port, !isTcp)
+                                : Guid.NewGuid());
+                bool pausable = concurrency == 1; // chunked sends have no session to resume
+                if (pausable)
+                {
+                    _pauseState = new PauseState
+                    {
+                        Path = path,
+                        IsFolder = isFolder,
+                        Ip = ip,
+                        Port = port,
+                        IsTcp = isTcp,
+                        SrcPort = srcPort,
+                        Concurrency = concurrency,
+                        VerifyHash = verifyHash,
+                        SpeedLimit = speedLimit,
+                        Sync = syncMode,
+                        Session = pauseSession
+                    };
+                    _btnPause.IsEnabled = true;
+                }
+
                 var sendWatch = System.Diagnostics.Stopwatch.StartNew();
 
                 if (!isFolder && concurrency > 1)
@@ -1593,17 +1670,16 @@ namespace TrFileTransfer
                         await _client.SendFolderResumableAsync(resumeSession.Value);
                         _pendingResumeSession = null;
                     }
-                    else if (isFolder && _chkSync.IsChecked == true)
+                    else if (isFolder && syncMode)
                     {
                         // Sync mode: stable session per (folder, target) — the server-side
                         // 0x04 scan skips unchanged files, so only differences travel
                         AddLog(L.C_SyncStart(path));
-                        Guid syncSession = FolderResumeState.DeriveSyncSession(path, ip, port, false);
-                        await _client.SendFolderResumableAsync(syncSession, keepState: true);
+                        await _client.SendFolderResumableAsync(pauseSession, keepState: true);
                     }
                     else if (isFolder)
                     {
-                        await SendPlainWithRetryAsync(true, path,
+                        await SendPlainWithRetryAsync(true, path, pauseSession,
                             () => _client.SendFolderAsync(path),
                             s => _client.SendFolderResumableAsync(s));
                     }
@@ -1614,7 +1690,7 @@ namespace TrFileTransfer
                     }
                     else
                     {
-                        await SendPlainWithRetryAsync(false, path,
+                        await SendPlainWithRetryAsync(false, path, pauseSession,
                             () => _client.SendAsync(),
                             s => _client.SendResumableAsync(s, verifyHash));
                     }
@@ -1628,15 +1704,14 @@ namespace TrFileTransfer
                         await _clientUdt.SendFolderResumableAsync(resumeSession.Value);
                         _pendingResumeSession = null;
                     }
-                    else if (isFolder && _chkSync.IsChecked == true)
+                    else if (isFolder && syncMode)
                     {
                         AddLog(L.C_SyncStart(path));
-                        Guid syncSession = FolderResumeState.DeriveSyncSession(path, ip, port, true);
-                        await _clientUdt.SendFolderResumableAsync(syncSession, keepState: true);
+                        await _clientUdt.SendFolderResumableAsync(pauseSession, keepState: true);
                     }
                     else if (isFolder)
                     {
-                        await SendPlainWithRetryAsync(true, path,
+                        await SendPlainWithRetryAsync(true, path, pauseSession,
                             () => _clientUdt.SendFolderAsync(path),
                             s => _clientUdt.SendFolderResumableAsync(s));
                     }
@@ -1647,18 +1722,32 @@ namespace TrFileTransfer
                     }
                     else
                     {
-                        await SendPlainWithRetryAsync(false, path,
+                        await SendPlainWithRetryAsync(false, path, pauseSession,
                             () => _clientUdt.SendAsync(),
                             s => _clientUdt.SendResumableAsync(s, verifyHash));
                     }
                 }
+
+                // Cancellation does not throw — the clients swallow the OperationCanceled —
+                // so a user pause surfaces as a normal return flagged by WasCancelled
+                if (_pauseRequested && WasActiveClientCancelled())
+                {
+                    FinalizePause();
+                    return false;
+                }
                 RecordSent(ip, MeasurePathBytes(path, isFolder), isFolder ? 0 : 1,
-                    sendWatch.Elapsed.TotalSeconds);
+                    sendWatch.Elapsed.TotalSeconds, PathDisplayName(path), path);
                 RememberDevice(ip, port, !isTcp);
                 return true;
             }
             catch (Exception ex)
             {
+                if (_pauseRequested)
+                {
+                    // The cancel surfaced as a connection error instead of a clean stop
+                    FinalizePause();
+                    return false;
+                }
                 AddLog(L.ErrorPrefix + ex.Message);
                 return false;
             }
@@ -1668,6 +1757,74 @@ namespace TrFileTransfer
             }
         }
 
+        private bool WasActiveClientCancelled()
+        {
+            return (_client != null && _client.WasCancelled)
+                || (_clientUdt != null && _clientUdt.WasCancelled);
+        }
+
+        /// <summary>Locks in the paused state: keep the snapshot, arm the resume button.
+        /// Runs on the UI thread (StartTransfer's continuations resume there).</summary>
+        private void FinalizePause()
+        {
+            _pauseRequested = false;
+            _paused = true;
+            AddLog(L.C_Paused);
+            _lblStatusC.Text = L.PausedStatus;
+            _btnPause.IsEnabled = true;
+            _btnPause.Content = L.ResumeText;
+        }
+
+        /// <summary>Drops the pause snapshot and resets the button (a different transfer
+        /// mode is taking over; the interrupted session stays recoverable via the
+        /// resume list, since the client/server states are already on disk).</summary>
+        private void ClearPauseState()
+        {
+            _paused = false;
+            _pauseState = null;
+            _pauseRequested = false;
+            _btnPause.IsEnabled = false;
+            _btnPause.Content = L.PauseBtn;
+        }
+
+        /// <summary>Pause/Resume button. While sending: cancel the client and hold the
+        /// snapshot. While paused: re-run the snapshot on its recorded session — the
+        /// server-side checkpoint (and client resume state) continue from the break.</summary>
+        private void BtnPause_Click(object sender, RoutedEventArgs e)
+        {
+            if (_paused && _pauseState != null)
+            {
+                var st = _pauseState;
+                _pauseState = null;
+                _paused = false;
+                _btnPause.IsEnabled = false;
+                _btnPause.Content = L.PauseBtn;
+                _lblStatusC.Text = L.Ready;
+
+                // Sync folders re-derive their stable session on the way through;
+                // empty files cannot travel via 0x03, so resend them plainly
+                Guid? session = st.Sync ? (Guid?)null : st.Session;
+                if (!st.IsFolder && session.HasValue)
+                {
+                    try { if (new FileInfo(st.Path).Length == 0) session = null; }
+                    catch { session = null; }
+                }
+                AddLog(L.C_TransferResumed);
+                var _ = StartTransfer(st.Path, st.IsFolder, st.Ip, st.Port, st.IsTcp, st.SrcPort,
+                    st.Concurrency, st.VerifyHash, st.SpeedLimit, session);
+                return;
+            }
+
+            if (_pauseState == null || _pauseState.Concurrency > 1) return;
+            if (_client == null && _clientUdt == null) return;
+
+            _pauseRequested = true;
+            _btnPause.IsEnabled = false;
+            _lblStatusC.Text = L.PausingStatus;
+            if (_client != null) _client.Cancel();
+            if (_clientUdt != null) _clientUdt.Cancel();
+        }
+
         private void WireClientEvents(TransferClient c)
         {
             var card = RunOnUiSync(() => CreateTransferCard(_progressPanelC));
@@ -1675,7 +1832,8 @@ namespace TrFileTransfer
             c.OnProgress += p => RunOnUi(() => UpdateCardProgress(card, p));
             c.OnError += msg => RunOnUi(() =>
             {
-                AddLog(L.ErrorPrefix + msg);
+                // A deliberate pause breaks the socket on purpose — not an error
+                AddLog(_pauseRequested ? L.C_Paused : (L.ErrorPrefix + msg));
                 ResetClientUI();
                 UpdateCardComplete(card);
             });
@@ -1693,9 +1851,10 @@ namespace TrFileTransfer
         /// on, single files travel via the 0x03 protocol from the first attempt (cheap,
         /// and a broken attempt just resumes); folders stay on plain 0x01 until the first
         /// failure (0x04 needs the full manifest hash pass), then resume in place via a
-        /// stable session id.
+        /// stable session id. The session id comes from the caller so a user pause can
+        /// re-run the same session later from the pause snapshot.
         /// </summary>
-        private async Task SendPlainWithRetryAsync(bool isFolder, string path,
+        private async Task SendPlainWithRetryAsync(bool isFolder, string path, Guid session,
             Func<Task> plainSend, Func<Guid, Task> resumeSend)
         {
             if (_chkAutoRetry.IsChecked != true)
@@ -1720,7 +1879,6 @@ namespace TrFileTransfer
                 return;
             }
 
-            var session = Guid.NewGuid();
             const int MaxAttempts = 3;
             for (int attempt = 1; ; attempt++)
             {
@@ -1734,6 +1892,7 @@ namespace TrFileTransfer
                 }
                 catch (Exception)
                 {
+                    if (_pauseRequested) throw; // deliberate pause — never auto-retry
                     if (attempt >= MaxAttempts) throw;
                     AddLog(L.C_AutoRetry(attempt, MaxAttempts - 1));
                     DisableClientInputs(); // the client's error path re-enabled the panel
@@ -1762,6 +1921,13 @@ namespace TrFileTransfer
             catch { return 0; }
         }
 
+        /// <summary>File name, or the folder's own name for folder sends (stats detail).</summary>
+        private static string PathDisplayName(string path)
+        {
+            try { return Path.GetFileName(path.TrimEnd('\\', '/')); }
+            catch { return path; }
+        }
+
         private void WireConcurrentEvents(ConcurrentTransfer c)
         {
             var card = RunOnUiSync(() => CreateTransferCard(_progressPanelC));
@@ -1788,7 +1954,7 @@ namespace TrFileTransfer
             c.OnProgress += p => RunOnUi(() => UpdateCardProgress(card, p));
             c.OnError += msg => RunOnUi(() =>
             {
-                AddLog(L.ErrorPrefix + msg);
+                AddLog(_pauseRequested ? L.C_Paused : (L.ErrorPrefix + msg));
                 ResetClientUI();
                 UpdateCardComplete(card);
             });
@@ -1848,9 +2014,15 @@ namespace TrFileTransfer
 
         private void ResetClientUI()
         {
-            _lblStatusC.Text = L.Ready;
+            // While paused the resume button stays armed and the status keeps saying so
+            _lblStatusC.Text = _paused ? L.PausedStatus : L.Ready;
             _btnSend.IsEnabled = true;
             _btnCancel.IsEnabled = false;
+            if (!_paused)
+            {
+                _btnPause.IsEnabled = false;
+                _btnPause.Content = L.PauseBtn;
+            }
             if (!_btnStopServer.IsEnabled)
             {
                 _cmbLang.IsEnabled = true;
@@ -1907,7 +2079,9 @@ namespace TrFileTransfer
             if (_numSrcPort.Value != 0)
                 AddLog(L.FanOutIgnoreSrcPort);
 
+            ClearPauseState(); // fan-out replaces any paused send
             DisableClientInputs();
+            _btnPause.IsEnabled = false; // fan-out has no single session to resume
             _btnCancel.IsEnabled = true;
             _lblStatusC.Text = L.FanOutStart(targets.Count);
 
@@ -1935,7 +2109,8 @@ namespace TrFileTransfer
                     {
                         UpdateCardComplete(card);
                         Interlocked.Increment(ref okCount);
-                        RecordSent(t.Ip, MeasurePathBytes(path, isFolder), isFolder ? 0 : 1, 0);
+                        RecordSent(t.Ip, MeasurePathBytes(path, isFolder), isFolder ? 0 : 1, 0,
+                            PathDisplayName(path), path);
                         RememberDevice(t.Ip, t.Port, false);
                     });
                     client.OnStopped += () =>
@@ -1961,7 +2136,8 @@ namespace TrFileTransfer
                     {
                         UpdateCardComplete(card);
                         Interlocked.Increment(ref okCount);
-                        RecordSent(t.Ip, MeasurePathBytes(path, isFolder), isFolder ? 0 : 1, 0);
+                        RecordSent(t.Ip, MeasurePathBytes(path, isFolder), isFolder ? 0 : 1, 0,
+                            PathDisplayName(path), path);
                         RememberDevice(t.Ip, t.Port, true);
                     });
                     client.OnStopped += () =>
@@ -2200,6 +2376,7 @@ namespace TrFileTransfer
 
         private void StartMonitoring(string folderPath, string ip, int port)
         {
+            ClearPauseState(); // monitor mode replaces any paused send
             _monitorCts = new CancellationTokenSource();
             _monitorSrcPort = _numSrcPort.Value;
             _monitorSpeedBytesPerSec = _numSpeed.Value * 1024;
@@ -2316,7 +2493,7 @@ namespace TrFileTransfer
             {
                 long bytes = 0;
                 try { bytes = new FileInfo(filePath).Length; } catch { }
-                RecordSent(ip, bytes, 1, 0);
+                RecordSent(ip, bytes, 1, 0, Path.GetFileName(filePath), filePath);
                 string destPath = Utils.GetUniqueSavePath(sentDir, fileName);
                 try { File.Move(filePath, destPath); } catch { }
                 RunOnUi(() =>

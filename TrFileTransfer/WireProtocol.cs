@@ -184,6 +184,10 @@ namespace TrFileTransfer
         public int Files;
         public bool Encrypted;
         public bool Rejected;
+        /// <summary>Display name of the transfer (file or folder name) — first one wins.</summary>
+        public string Detail;
+        /// <summary>First received file's full save path (history "open location").</summary>
+        public string Path;
     }
 
     /// <summary>State a server keeps across client connections: save location plus chunk/resume tracking.</summary>
@@ -208,6 +212,9 @@ namespace TrFileTransfer
         public Func<string, string, long, int, bool, Task<bool>> ConfirmRequest;
         /// <summary>Maps a client IP to a friendly device folder name (per-device mode).</summary>
         public Func<string, string> ResolveDeviceName;
+        /// <summary>Receive-side rate limiter shared by every connection of this server
+        /// (one global bucket). Null = unlimited. Thread-safe (see SpeedLimiter).</summary>
+        public SpeedLimiter ReceiveLimiter;
         public WireCallbacks Cb = new WireCallbacks();
         // Not readonly: per-connection clones (BeginSession) share the parent's instances
         public ConcurrentDictionary<string, ChunkTracker> ChunkTrackers
@@ -282,6 +289,7 @@ namespace TrFileTransfer
             {
                 stats.Bytes += size;
                 stats.Files++;
+                if (string.IsNullOrEmpty(stats.Path)) stats.Path = path;
                 ctx.Cb.RaiseFileReceived(path, size);
             };
 
@@ -293,6 +301,9 @@ namespace TrFileTransfer
             clone.IpAllowed = ctx.IpAllowed;
             clone.ConfirmRequest = ctx.ConfirmRequest;
             clone.ResolveDeviceName = ctx.ResolveDeviceName;
+            // One shared receive bucket for the whole server — concurrent connections
+            // split the configured limit instead of each getting a full one
+            clone.ReceiveLimiter = ctx.ReceiveLimiter;
             // Chunk reassembly and resume sessions are process-wide state — every
             // connection must share the parent's dictionaries
             clone.ChunkTrackers = ctx.ChunkTrackers;
@@ -427,6 +438,9 @@ namespace TrFileTransfer
         /// (UI prompt) and refuses the transfer when it answers false.</summary>
         private static async Task<bool> GateAsync(ServerWireContext ctx, string name, long size, int fileCount, bool isFolder)
         {
+            // Remember what this connection is about to receive (session stats detail)
+            if (ctx.Session != null && string.IsNullOrEmpty(ctx.Session.Detail))
+                ctx.Session.Detail = name;
             var gate = ctx.ConfirmRequest;
             if (gate == null) return true;
             string ip = ctx.Session != null ? ctx.Session.Peer : "";
@@ -735,6 +749,8 @@ namespace TrFileTransfer
                                 int read = await s.ReadSomeAsync(buf, 0, toRead, ct).ConfigureAwait(false);
                                 if (read <= 0)
                                     throw new IOException(L.S_ConnClosedPrematurely);
+                                if (ctx.ReceiveLimiter != null)
+                                    await ctx.ReceiveLimiter.ThrottleAsync(read, ct).ConfigureAwait(false);
                                 sha256.TransformBlock(buf, 0, read, null, 0);
                                 fileStream.Write(buf, 0, read);
                                 remaining -= read;
@@ -940,6 +956,8 @@ namespace TrFileTransfer
                 {
                     int toRead = (int)Math.Min(remaining, (long)BufSize);
                     await s.ReadExactAsync(buf, 0, toRead, ct).ConfigureAwait(false);
+                    if (ctx.ReceiveLimiter != null)
+                        await ctx.ReceiveLimiter.ThrottleAsync(toRead, ct).ConfigureAwait(false);
                     sha256.TransformBlock(buf, 0, toRead, null, 0);
                     isComplete = tracker.WriteChunk(writeOffset, buf, toRead);
                     writeOffset += toRead;
@@ -1226,6 +1244,8 @@ namespace TrFileTransfer
                     int read = await s.ReadSomeAsync(buf, 0, toRead, ct).ConfigureAwait(false);
                     if (read <= 0)
                         throw new IOException(L.S_ConnClosedPrematurely);
+                    if (ctx.ReceiveLimiter != null)
+                        await ctx.ReceiveLimiter.ThrottleAsync(read, ct).ConfigureAwait(false);
                     sha256.TransformBlock(buf, 0, read, null, 0);
                     await state.WriteStream.WriteAsync(buf, 0, read, ct).ConfigureAwait(false);
                     bytesRead += read;
@@ -1357,6 +1377,11 @@ namespace TrFileTransfer
                 if (read <= 0)
                     throw new IOException(L.S_ConnClosedPrematurely);
 
+                // Throttle the FIRST read too: on loopback the whole payload can already
+                // sit in the socket buffer, and a small file may complete inside it
+                if (ctx.ReceiveLimiter != null)
+                    await ctx.ReceiveLimiter.ThrottleAsync(read, ct).ConfigureAwait(false);
+
                 remaining -= read;
                 var cur = bufA;
                 var nxt = bufB;
@@ -1370,12 +1395,17 @@ namespace TrFileTransfer
                     await fileStream.WriteAsync(cur, 0, read, ct);
                     bytesRead += read;
 
-                    read = await nextReadTask.ConfigureAwait(false);
-                    if (read <= 0)
-                        throw new IOException(L.S_ConnClosedPrematurely);
-                    remaining -= read;
+                read = await nextReadTask.ConfigureAwait(false);
+                if (read <= 0)
+                    throw new IOException(L.S_ConnClosedPrematurely);
+                remaining -= read;
 
-                    var tmp = cur; cur = nxt; nxt = tmp;
+                // One paced bucket across all connections of this server: throttling
+                // the read paces the sender too via TCP/UDT flow control
+                if (ctx.ReceiveLimiter != null)
+                    await ctx.ReceiveLimiter.ThrottleAsync(read, ct).ConfigureAwait(false);
+
+                var tmp = cur; cur = nxt; nxt = tmp;
 
                     if (progressTimer.ElapsedMilliseconds >= 100 || remaining == 0)
                     {
