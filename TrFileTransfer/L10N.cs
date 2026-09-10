@@ -535,6 +535,7 @@ namespace TrFileTransfer
         public static string HttpPortLabel { get { return IsChinese ? "HTTP:" : "HTTP:"; } }
         public static string HttpShareUploadBtn { get { return IsChinese ? "上传" : "Upload"; } }
         public static string HttpShareStop { get { return IsChinese ? "停止" : "Stop"; } }
+        public static string ShareQrBtn { get { return IsChinese ? "二维码" : "QR Code"; } }
         public static string HttpShareOn(object url)
         {
             return IsChinese
@@ -619,6 +620,145 @@ namespace TrFileTransfer
         public static string EncryptLabel { get { return IsChinese ? "加密传输" : "Encrypt"; } }
         public static string C_EncryptedOn { get { return IsChinese ? "已启用加密传输（AES-256）。" : "Encrypted session established (AES-256)."; } }
         public static string S_EncryptedOn { get { return IsChinese ? "连接已加密（AES-256）。" : "Connection encrypted (AES-256)."; } }
+
+        // ---- Compressed transport (0x08) ----
+        public static string CompressLabel { get { return IsChinese ? "传输压缩" : "Compress"; } }
+        public static string C_CompressedOn { get { return IsChinese ? "已启用传输压缩（deflate），对端按段解压。" : "Transfer compression enabled (deflate); the peer inflates per segment."; } }
+        public static string S_CompressedOn { get { return IsChinese ? "连接已启用传输压缩（deflate）。" : "Connection using transfer compression (deflate)."; } }
+        public static string C_CompressFallback
+        {
+            get
+            {
+                return IsChinese
+                    ? "对方版本较旧，不支持压缩，已回退未压缩连接。"
+                    : "Peer is an older version without compression — falling back to uncompressed.";
+            }
+        }
+
+        // ---- Queue after-action ----
+        public static string QueueAfterLabel { get { return IsChinese ? "完成后:" : "After queue:"; } }
+        public static string AfterNone { get { return IsChinese ? "无动作" : "None"; } }
+        public static string AfterShutdown { get { return IsChinese ? "关机" : "Shut down"; } }
+        public static string AfterHibernate { get { return IsChinese ? "休眠" : "Hibernate"; } }
+        public static string AfterCommand { get { return IsChinese ? "执行命令" : "Run command"; } }
+        public static string AfterCommandHint { get { return IsChinese ? "命令经 cmd /c 执行" : "Run via cmd /c"; } }
+        public static string QueueAfterConfirm(string action, int failed)
+        {
+            return IsChinese
+                ? string.Format("队列已执行完毕（失败 {0} 项）。确定执行「{1}」？", failed, action)
+                : string.Format("Queue finished ({0} failed). Execute \"{1}\" now?", failed, action);
+        }
+        public static string QueueAfterShutdownStarted
+        {
+            get
+            {
+                return IsChinese
+                    ? "系统将在 60 秒后关机；如需取消请运行 shutdown /a。"
+                    : "System shuts down in 60 s; run \"shutdown /a\" to abort.";
+            }
+        }
+        public static string QueueAfterActionFailed(object msg)
+        {
+            return IsChinese
+                ? string.Format("完成后动作执行失败：{0}", msg)
+                : string.Format("After-queue action failed: {0}", msg);
+        }
+
+        // ---- Theme modes (dark/light/auto) ----
+        public static string ThemeModeAuto { get { return IsChinese ? "主题：跟随系统" : "Theme: follow system"; } }
+        public static string ThemeModeDark { get { return IsChinese ? "主题：深色" : "Theme: dark"; } }
+        public static string ThemeModeLight { get { return IsChinese ? "主题：浅色" : "Theme: light"; } }
+        public static string ThemeToggleTip3
+        {
+            get
+            {
+                return IsChinese
+                    ? "切换主题：深色 → 浅色 → 跟随系统"
+                    : "Cycle theme: dark → light → follow system";
+            }
+        }
+
+        // ---- CLI (headless) ----
+        public static string CliHelp
+        {
+            get
+            {
+                return IsChinese
+                    ? "用法:\r\n" +
+                      "  TrFileTransfer send --ip <IP> --port <端口> [--tcp|--udt] --file <路径|--folder <路径>\r\n" +
+                      "        [--code <配对码>] [--limit <KB/s>] [--srcport <端口>] [--nocompress] [--noencrypt]\r\n" +
+                      "  TrFileTransfer recv --port <端口> [--out <目录>] [--tcp|--udt] [--code <配对码>] [--count <N>]\r\n" +
+                      "\r\n" +
+                      "send: 发送一个文件或文件夹后退出（退出码 0=成功）。\r\n" +
+                      "recv: 接收直到 Ctrl+C，或收到 --count 个文件后退出。\r\n" +
+                      "默认协议 TCP；--nocompress/--noencrypt 关闭压缩/加密协商。"
+                    : "Usage:\r\n" +
+                      "  TrFileTransfer send --ip <IP> --port <port> [--tcp|--udt] --file <path|--folder <path>\r\n" +
+                      "        [--code <pairing code>] [--limit <KB/s>] [--srcport <port>] [--nocompress] [--noencrypt]\r\n" +
+                      "  TrFileTransfer recv --port <port> [--out <dir>] [--tcp|--udt] [--code <pairing code>] [--count <N>]\r\n" +
+                      "\r\n" +
+                      "send: sends one file or folder, then exits (exit code 0 = success).\r\n" +
+                      "recv: receives until Ctrl+C, or until --count files have arrived.\r\n" +
+                      "TCP is the default protocol; --nocompress/--noencrypt disable those negotiations.";
+            }
+        }
+        public static string CliUnknownCmd(object cmd)
+        {
+            return IsChinese
+                ? string.Format("未知命令：{0}（用 --help 查看用法）", cmd)
+                : string.Format("Unknown command: {0} (try --help)", cmd);
+        }
+        public static string CliMissingArg(object opt)
+        {
+            return IsChinese
+                ? string.Format("缺少参数值：{0}", opt)
+                : string.Format("Missing value for option: {0}", opt);
+        }
+        public static string CliSendingDone(object path, object size, object secs)
+        {
+            return IsChinese
+                ? string.Format("发送完成：{0}（{1}，{2:F1}s）", path, size, secs)
+                : string.Format("Sent: {0} ({1}, {2:F1}s)", path, size, secs);
+        }
+        public static string CliReceivedFile(object path, object size)
+        {
+            return IsChinese
+                ? string.Format("已接收：{0}（{1}）", path, size)
+                : string.Format("Received: {0} ({1})", path, size);
+        }
+        public static string CliRecvWaiting(object proto, object port, object dir)
+        {
+            return IsChinese
+                ? string.Format("接收中（{0} 端口 {1}）→ {2}，Ctrl+C 退出。", proto, port, dir)
+                : string.Format("Receiving ({0} port {1}) → {2}; Ctrl+C to quit.", proto, port, dir);
+        }
+        public static string CliRecvCountDone(object n)
+        {
+            return IsChinese
+                ? string.Format("已收到 {0} 个文件，退出。", n)
+                : string.Format("Received {0} file(s); exiting.", n);
+        }
+        public static string C_NoCompletionAck
+        {
+            get
+            {
+                return IsChinese
+                    ? "连接在接收方确认前关闭，传输结果未知（可能被接收方拒绝）。"
+                    : "Connection closed before the receiver acknowledged — the transfer may have been refused.";
+            }
+        }
+        public static string S_ConfirmGateError(object msg)
+        {
+            return IsChinese
+                ? string.Format("接收确认检查失败，已拒绝本次接收：{0}", msg)
+                : string.Format("Receive-confirmation check failed; transfer denied: {0}", msg);
+        }
+        public static string CliRecvStartFailed(object port)
+        {
+            return IsChinese
+                ? string.Format("无法在端口 {0} 上启动接收服务（端口被占用或绑定失败）。", port)
+                : string.Format("Failed to start the receiver on port {0} (in use or bind error).", port);
+        }
         public static string C_EncryptFallback
         {
             get
@@ -644,6 +784,45 @@ namespace TrFileTransfer
                 return IsChinese
                     ? "对方请求加密，但本机未启用配对码，保持普通连接。"
                     : "Client asked for encryption but pairing is off — staying plaintext.";
+            }
+        }
+        public static string C_EncryptPeerTooOld
+        {
+            get
+            {
+                return IsChinese
+                    ? "对方不支持安全加密握手（版本过旧或连接被劫持）。已中止传输以免明文泄漏；如确需与旧版本互传，请关闭加密或取消配对码。"
+                    : "Peer does not support the secure encrypted handshake (older version, or the connection was tampered with). Transfer aborted to avoid sending plaintext; disable encryption or clear the pairing code to interoperate with an old peer.";
+            }
+        }
+        public static string S_ChunkTrackerReset(object name)
+        {
+            return IsChinese
+                ? string.Format("检测到同名文件的上次分块传输未完成且大小不同，已重置重组状态：{0}", name)
+                : string.Format("Stale chunk reassembly for '{0}' (different size) — reset", name);
+        }
+        public static string S_AuthLockedOut(object ip)
+        {
+            return IsChinese
+                ? string.Format("配对码错误次数过多，已临时锁定该来源: {0}（重启服务可解除）。", ip)
+                : string.Format("Too many wrong pairing codes — temporarily locked out: {0} (restart the server to clear).", ip);
+        }
+        public static string S_EncHandshakeFailed
+        {
+            get
+            {
+                return IsChinese
+                    ? "加密握手失败（配对码错误或连接被篡改），连接已拒绝。"
+                    : "Encrypted handshake failed (wrong code or tampered connection) — connection refused.";
+            }
+        }
+        public static string S_LegacyCryptoWeak
+        {
+            get
+            {
+                return IsChinese
+                    ? "对方使用了旧版加密握手（密钥强度不足），会话仅防被动窃听；建议双方升级。"
+                    : "Peer used the legacy encrypted handshake (weak key derivation) — upgrade both ends to get the secure handshake.";
             }
         }
         public static string S_EncStreamCorrupt { get { return IsChinese ? "加密流数据格式错误，连接中断。" : "Encrypted stream corrupted — connection dropped."; } }
@@ -760,9 +939,20 @@ namespace TrFileTransfer
         public static string StatsSentCol { get { return IsChinese ? "发送" : "Sent"; } }
         public static string StatsRecvCol { get { return IsChinese ? "接收" : "Received"; } }
         public static string StatsEmpty { get { return IsChinese ? "暂无传输记录。" : "No transfers recorded yet."; } }
+        public static string StatsClear { get { return IsChinese ? "全部清除" : "Clear All"; } }
+        public static string StatsClearConfirm
+        {
+            get
+            {
+                return IsChinese
+                    ? "确定清除全部传输记录？统计与历史将同时清空，此操作不可恢复。"
+                    : "Clear ALL transfer records? Statistics and history are wiped together — this cannot be undone.";
+            }
+        }
 
         // ---- QR code (HTTP share) ----
         public static string QrTitle { get { return IsChinese ? "HTTP 共享二维码" : "HTTP Share QR Code"; } }
+        public static string QrAddressLabel { get { return IsChinese ? "地址:" : "Address:"; } }
         public static string QrHint
         {
             get

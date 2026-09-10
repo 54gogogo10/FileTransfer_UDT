@@ -37,6 +37,7 @@ echo.
     ..\FolderResumeState.cs ^
     ..\Updater.cs ^
     ..\HttpShare.cs ^
+    ..\WireCompress.cs ^
     ..\QrCode.cs ^
     ..\StatsStore.cs ^
     TestProgram.cs ^

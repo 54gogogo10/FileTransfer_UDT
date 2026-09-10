@@ -16,6 +16,7 @@ namespace TrFileTransfer
         private static readonly Dictionary<string, Color> Light = new Dictionary<string, Color>();
         private static ResourceDictionary _tokens;
         private static bool _dark = true;
+        private static string _mode = "dark"; // "dark" | "light" | "auto"
 
         /// <summary>Raised after a theme switch (UI thread) so chrome can be refreshed.</summary>
         public static event Action Changed;
@@ -23,6 +24,12 @@ namespace TrFileTransfer
         public static bool IsDark
         {
             get { return _dark; }
+        }
+
+        /// <summary>Current mode: explicit "dark"/"light", or "auto" (follow the OS).</summary>
+        public static string Mode
+        {
+            get { return _mode; }
         }
 
         /// <summary>Merges Tokens.xaml and Controls.xaml into the app resources, then
@@ -36,24 +43,69 @@ namespace TrFileTransfer
             app.Resources.MergedDictionaries.Add(_tokens);
             app.Resources.MergedDictionaries.Add(new ResourceDictionary { Source = new Uri("pack://application:,,,/Themes/Controls.xaml") });
 
-            _dark = Config.Get("Theme", "dark") != "light";
+            _mode = Config.Get("Theme", "dark");
+            if (_mode != "dark" && _mode != "light" && _mode != "auto") _mode = "dark";
+            _dark = _mode == "auto" ? SystemWantsDark() : _mode == "dark";
             Apply(_dark);
         }
 
+        /// <summary>Cycles the explicit/auto modes: dark → light → auto → dark.</summary>
         public static void Toggle()
         {
-            SetDark(!_dark);
+            SetMode(_mode == "dark" ? "light" : _mode == "light" ? "auto" : "dark");
         }
 
         public static void SetDark(bool dark)
         {
+            SetMode(dark ? "dark" : "light");
+        }
+
+        public static void SetMode(string mode)
+        {
+            if (mode != "dark" && mode != "light" && mode != "auto") mode = "dark";
+            _mode = mode;
+            bool dark = mode == "auto" ? SystemWantsDark() : mode == "dark";
+            bool changed = dark != _dark;
+            _dark = dark;
+            Apply(dark);
+            Config.Set("Theme", mode);
+            Config.Save();
+            if (changed)
+            {
+                var handler = Changed;
+                if (handler != null) handler();
+            }
+        }
+
+        /// <summary>Re-evaluates the OS theme when running in auto mode — call from the
+        /// WM_SETTINGCHANGE hook so flipping the Windows theme live-flips the app.</summary>
+        public static void SystemThemeChanged()
+        {
+            if (_mode != "auto") return;
+            bool dark = SystemWantsDark();
             if (dark == _dark) return;
             _dark = dark;
             Apply(dark);
-            Config.Set("Theme", dark ? "dark" : "light");
-            Config.Save();
             var handler = Changed;
             if (handler != null) handler();
+        }
+
+        /// <summary>Windows personalization: AppsUseLightTheme DWORD (0 = apps dark).
+        /// Anything unreadable (older OS, policy-locked registry) falls back to dark.</summary>
+        private static bool SystemWantsDark()
+        {
+            try
+            {
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                    @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                {
+                    if (key == null) return true;
+                    object v = key.GetValue("AppsUseLightTheme");
+                    if (v is int) return (int)v == 0;
+                }
+            }
+            catch { }
+            return true;
         }
 
         private static void Apply(bool dark)

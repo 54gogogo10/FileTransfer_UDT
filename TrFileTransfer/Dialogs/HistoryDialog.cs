@@ -19,13 +19,16 @@ namespace TrFileTransfer
         private readonly ListBox _list = DlgUi.DarkList();
         private readonly ComboBox _cmbFilter = new ComboBox { Style = DlgUi.Res<Style>("CmbInput"), MinWidth = 110 };
         private readonly List<StatsEntry> _shown = new List<StatsEntry>();
-        private readonly List<StatsEntry> _all;
+        private readonly List<StatsEntry> _all = new List<StatsEntry>();
+        private readonly StatsStore _store;
+        private TextBlock _countLabel;
 
         public HistoryDialog(StatsStore store)
         {
+            _store = store;
             DlgUi.Init(this, L.HistoryTitle, 640, 500, 520, 380);
 
-            _all = store.LoadAll();
+            _all.AddRange(store.LoadAll());
 
             _cmbFilter.Items.Add(L.HistoryAll);   // 0 -> all
             _cmbFilter.Items.Add(L.StatsSentCol); // 1 -> sent
@@ -34,8 +37,10 @@ namespace TrFileTransfer
             _cmbFilter.SelectionChanged += (s, e) => Repopulate();
 
             var btnExport = DlgUi.SecondaryMin(L.HistoryExportCsv, 110);
+            var btnClear = new Button { Style = DlgUi.Res<Style>("BtnDanger"), Content = L.StatsClear, MinWidth = 96 };
             var btnClose = DlgUi.SecondaryMin(L.CancelBtn, 96);
             btnExport.Click += BtnExport_Click;
+            btnClear.Click += (s, e) => ClearAll();
             btnClose.Click += (s, e) => Close();
             _list.MouseDoubleClick += (s, e) => OpenSelectedLocation();
 
@@ -43,13 +48,13 @@ namespace TrFileTransfer
             topRow.Children.Add(DlgUi.Label(L.HistoryFilterLabel));
             _cmbFilter.Margin = new Thickness(8, 0, 0, 0);
             topRow.Children.Add(_cmbFilter);
-            var countLabel = new TextBlock
+            _countLabel = new TextBlock
             {
                 Foreground = DlgUi.Res<Brush>("Brush.TextSecondary"),
                 VerticalAlignment = VerticalAlignment.Center,
                 Margin = new Thickness(12, 0, 0, 0)
             };
-            topRow.Children.Add(countLabel);
+            topRow.Children.Add(_countLabel);
 
             var grid = new Grid { Margin = new Thickness(16) };
             grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -60,7 +65,7 @@ namespace TrFileTransfer
             grid.Children.Add(topRow);
             Grid.SetRow(_list, 1);
             grid.Children.Add(_list);
-            var buttons = DlgUi.ButtonRowRight(btnExport, btnClose);
+            var buttons = DlgUi.ButtonRowRight(btnExport, btnClear, btnClose);
             Grid.SetRow(buttons, 2);
             buttons.Margin = new Thickness(0, 10, 0, 0);
             grid.Children.Add(buttons);
@@ -68,7 +73,22 @@ namespace TrFileTransfer
             Content = grid;
 
             Repopulate();
-            countLabel.Text = L.HistoryRowCount(_shown.Count, _all.Count);
+        }
+
+        /// <summary>Wipes the shared stats log (the stats dialog reads the same data)
+        /// after confirmation, then refreshes the list in place.</summary>
+        private void ClearAll()
+        {
+            if (MessageBox.Show(this, L.StatsClearConfirm, L.HistoryTitle,
+                MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
+            _store.ClearAll();
+            _all.Clear();
+            Repopulate();
+        }
+
+        private void UpdateCountLabel()
+        {
+            _countLabel.Text = L.HistoryRowCount(_shown.Count, _all.Count);
         }
 
         private void Repopulate()
@@ -104,6 +124,9 @@ namespace TrFileTransfer
                 var container = _list.ItemContainerGenerator.ContainerFromItem(hint) as ListBoxItem;
                 if (container != null) { container.IsEnabled = false; container.Focusable = false; }
             }
+
+            // Filter changes reshape _shown — the count label must follow along
+            UpdateCountLabel();
         }
 
         private static string FormatEntry(StatsEntry e)

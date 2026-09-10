@@ -238,8 +238,9 @@ namespace TrFileTransfer
                     MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
                 {
                     var main = Owner as MainWindow;
+                    string expect = _manifest.Sha256Hex;
                     Close();
-                    if (main != null) main.ApplyUpdateAndRestart(staged);
+                    if (main != null) main.ApplyUpdateAndRestart(staged, expect);
                 }
                 else
                 {

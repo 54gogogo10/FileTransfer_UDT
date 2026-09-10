@@ -97,6 +97,7 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_FanOut_TwoTargets", FanOutTwoTargets);
             runner.Run("Integration_HTTP_Upload", HttpShareUpload);
             runner.Run("Integration_HTTP_UploadTokenAndTraversalName", HttpShareUploadTokenAndTraversalName);
+            runner.Run("Integration_HTTP_AuthLockout", HttpShareAuthLockout);
         }
 
         private static void TcpSingleFile()
@@ -1295,7 +1296,8 @@ namespace TrFileTransfer.Tests
                 // client's send) and persists the incomplete resume state to disk.
                 server1.Stop();
                 server1 = null;
-                sendTask1.Wait(30000);
+                try { sendTask1.Wait(30000); }
+                catch (AggregateException) { /* the interrupted send faults — expected */ }
                 if (!client1Done.WaitOne(5000))
                     throw new Exception("Client 1 did not stop after server stop");
                 phase1Closed.WaitOne(2000);
@@ -1464,7 +1466,8 @@ namespace TrFileTransfer.Tests
                 if (!partialReceived.WaitOne(60000))
                     throw new Exception("UDT server did not receive partial data within 60s — client error: "
                         + (client1Error ?? "none") + " — clientDone=" + client1Done.WaitOne(0));
-                sendTask1.Wait(30000);
+                try { sendTask1.Wait(30000); }
+                catch (AggregateException) { /* server Stop() interrupted the send — expected fault */ }
                 if (!client1Done.WaitOne(5000))
                     throw new Exception("Client 1 did not stop after server stop");
                 // Wait for server 1 to finish unwinding (persisting resume state to disk)
@@ -2954,11 +2957,19 @@ namespace TrFileTransfer.Tests
         /// <summary>GET helper returning (status, body bytes, headers).</summary>
         private static System.Tuple<int, byte[], System.Net.WebHeaderCollection> HttpGet(string url)
         {
+            return HttpGet(url, null);
+        }
+
+        /// <summary>GET with a cookie jar — models a browser: Set-Cookie from a 303
+        /// lands in the container and rides along on the redirected request.</summary>
+        private static System.Tuple<int, byte[], System.Net.WebHeaderCollection> HttpGet(string url, System.Net.CookieContainer cookies)
+        {
             var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
             req.Method = "GET";
             req.Timeout = 10000;
             req.ReadWriteTimeout = 10000;
             req.Proxy = null;
+            if (cookies != null) req.CookieContainer = cookies;
             try
             {
                 using (var resp = (System.Net.HttpWebResponse)req.GetResponse())
@@ -3061,28 +3072,75 @@ namespace TrFileTransfer.Tests
                 var badTok = HttpGet(baseUrl + "?t=000000");
                 Assert.True(System.Text.Encoding.UTF8.GetString(badTok.Item2).Contains("name=\"t\""), "wrong token -> form");
 
-                // Correct token -> listing visible
-                var okTok = HttpGet(baseUrl + "?t=135790");
-                Assert.True(System.Text.Encoding.UTF8.GetString(okTok.Item2).Contains("secret.bin"), "correct token -> listing");
+                // Correct code submits ?t=... once: the server parks it in a cookie and
+                // bounces to the bare URL — the jar models the browser following that
+                var jar = new System.Net.CookieContainer();
+                var okTok = HttpGet(baseUrl + "?t=135790", jar);
+                Assert.True(System.Text.Encoding.UTF8.GetString(okTok.Item2).Contains("secret.bin"),
+                    "correct token -> listing (via cookie redirect)");
+                Assert.Equal(1, jar.Count, "access code parked in a cookie");
 
-                // Download needs the token too
+                // Cookie alone (no ?t= anywhere) keeps the session — links stay clean
+                var cookieOnly = HttpGet(baseUrl, jar);
+                Assert.True(System.Text.Encoding.UTF8.GetString(cookieOnly.Item2).Contains("secret.bin"),
+                    "cookie alone -> listing");
+
+                // A wrong cookie value is still just the form
+                var badJar = new System.Net.CookieContainer();
+                badJar.Add(new System.Net.Cookie("t", "000000", "/", "127.0.0.1"));
+                var cookieBad = HttpGet(baseUrl, badJar);
+                Assert.True(System.Text.Encoding.UTF8.GetString(cookieBad.Item2).Contains("name=\"t\""),
+                    "wrong cookie -> form");
+
+                // Download needs the session too
                 var dlNoTok = HttpGet(baseUrl + "?f=secret.bin");
                 Assert.True(System.Text.Encoding.UTF8.GetString(dlNoTok.Item2).Contains("name=\"t\""), "download without token -> form");
-                var dlOk = HttpGet(baseUrl + "?t=135790&f=secret.bin");
-                Assert.Equal(200, dlOk.Item1, "download with token 200");
-                Assert.True(Utils.ConstantTimeEquals(content, dlOk.Item2), "download bytes with token");
+                var dlOk = HttpGet(baseUrl + "?f=secret.bin", jar);
+                Assert.Equal(200, dlOk.Item1, "download with cookie 200");
+                Assert.True(Utils.ConstantTimeEquals(content, dlOk.Item2), "download bytes with cookie");
 
                 // Traversal attempts are blocked (sanitized into the root or 404)
-                var trav1 = HttpGet(baseUrl + "?t=" + Uri.EscapeDataString("135790") + "&f=" + Uri.EscapeDataString("../tr_http_out_" + Path.GetFileName(outsideDir) + "/escaped.txt"));
+                var trav1 = HttpGet(baseUrl + "?t=" + Uri.EscapeDataString("135790") + "&f=" + Uri.EscapeDataString("../tr_http_out_" + Path.GetFileName(outsideDir) + "/escaped.txt"), jar);
                 Assert.True(trav1.Item1 == 404 || trav1.Item1 == 200,
                     "traversal attempt answered");
                 if (trav1.Item1 == 200)
                     Assert.False(Utils.ConstantTimeEquals(new byte[] { 1 }, trav1.Item2), "traversal must not leak outside file");
 
-                var missing = HttpGet(baseUrl + "?t=135790&f=nope.bin");
+                var missing = HttpGet(baseUrl + "?f=nope.bin", jar);
                 Assert.Equal(404, missing.Item1, "missing file 404");
 
                 try { Directory.Delete(outsideDir, true); } catch { }
+            }
+            finally
+            {
+                server.Stop();
+                try { Directory.Delete(root, true); } catch { }
+            }
+        }
+
+        /// <summary>Repeated wrong access codes lock the client IP out; the correct code
+        /// is then refused with 429 until the lockout expires.</summary>
+        private static void HttpShareAuthLockout()
+        {
+            int port = FindFreePort();
+            string root = Path.Combine(TempBase(), "tr_http_lock_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            var server = new HttpShareServer();
+            try
+            {
+                File.WriteAllBytes(Path.Combine(root, "a.bin"), new byte[] { 1, 2, 3 });
+                server.Start(root, port, "424242");
+                string baseUrl = "http://127.0.0.1:" + port + "/";
+
+                // Burn the allowance with wrong codes
+                for (int i = 0; i < HttpShareServer.MaxAuthFailures + 2; i++)
+                    HttpGet(baseUrl + "?t=000000");
+
+                // Now even the CORRECT code is refused
+                var ok = HttpGet(baseUrl + "?t=424242");
+                Assert.Equal(429, ok.Item1, "locked out -> 429 even with the right code");
+                Assert.False(System.Text.Encoding.UTF8.GetString(ok.Item2).Contains("a.bin"),
+                    "no listing while locked out");
             }
             finally
             {

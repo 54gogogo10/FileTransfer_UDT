@@ -353,6 +353,12 @@ namespace TrFileTransfer
             _cts = new CancellationTokenSource();
             ServerResumeStore.CleanupStale(7); // drop orphaned resume sessions from clients that never returned
             UdtDll.EnsureExtracted();
+
+            // The save directory may legitimately not exist yet (date-archive mode
+            // appends a yyyy-MM-dd child); single-file receivers write straight
+            // into it and FileStream never creates intermediate directories.
+            try { Directory.CreateDirectory(_saveDirectory); } catch { }
+
             if (!UdtNative.UdtStartup())
             {
                 Log(L.S_BindFailed(_bindAddress, _port.ToString(), "UDT library init failed"));
@@ -511,18 +517,26 @@ namespace TrFileTransfer
 
                 if (outcome.IsChunked)
                 {
-                    // Application-level ACK for this chunk. Chunk connections always clean
-                    // up their progress card; assembled-file completion fires separately.
-                    var ack2 = new byte[1] { 0x01 };
-                    await Task.Run(() => UdtNative.udt_send(clientSocket, ack2, 1, 0), ct).ConfigureAwait(false);
-                    var ccHandler = OnClientTransferComplete;
-                    if (ccHandler != null) ccHandler(clientEp);
-                    RaiseSessionStats(outcome);
+                    if (outcome.Success)
+                    {
+                        // Application-level ACK for this chunk. Chunk connections
+                        // always clean up their progress card (in the finally below);
+                        // assembled-file completion fires separately.
+                        var ack2 = new byte[1] { 0x01 };
+                        await Task.Run(() => UdtNative.udt_send(clientSocket, ack2, 1, 0), ct).ConfigureAwait(false);
+                        RaiseSessionStats(outcome);
+                    }
+                    else
+                    {
+                        // A chunk that failed its hash must not be ACKed as delivered —
+                        // the sender would count it complete and the file would never
+                        // finish assembling. NACK so the concurrent sender fails fast.
+                        var nackChunk = new byte[1] { 0x00 };
+                        await Task.Run(() => UdtNative.udt_send(clientSocket, nackChunk, 1, 0), ct).ConfigureAwait(false);
+                    }
                 }
                 else if (outcome.Success)
                 {
-                    var ccHandler = OnClientTransferComplete;
-                    if (ccHandler != null) ccHandler(clientEp);
                     RaiseSessionStats(outcome);
                     // Application-level ACK only on verified success
                     var ack = new byte[1] { 0x01 };
@@ -555,6 +569,12 @@ namespace TrFileTransfer
                 lock (_clientSockets) { _clientSockets.Remove(clientSocket); }
                 ws.Dispose(); // closes the native socket, unblocking pending I/O
                 System.Threading.Interlocked.Decrement(ref _activeClients);
+                // Fire on every connection end, not just clean finishes: a
+                // connection that died mid-transfer (pause/cancel/network drop)
+                // must still finalize the client's progress card, or the card
+                // lingers forever while the retry gets a fresh endpoint.
+                var ccHandler = OnClientTransferComplete;
+                if (ccHandler != null) ccHandler(clientEp);
             }
         }
 
@@ -618,9 +638,18 @@ namespace TrFileTransfer
         /// Null/empty sends nothing (compatible with servers that don't require it).</summary>
         public string PairingCode { get; set; }
 
-        /// <summary>When a pairing code is set, try the 0x07 encrypted handshake first
-        /// (falls back to plain 0x05 against older peers). Default from Config "Encrypt".</summary>
+        /// <summary>When a pairing code is set, try the encrypted (0x09 ECDH) handshake
+        /// first. Default from Config "Encrypt".</summary>
         public bool EncryptionEnabled { get; set; }
+
+        /// <summary>Default true: if the peer cannot do the authenticated handshake
+        /// (older build), reconnect in plaintext so version-skew still works. Set false
+        /// (Config "EncryptStrict") to fail closed, so a downgrade cannot be forced.</summary>
+        public bool EncryptionDowngradeAllowed { get; set; }
+
+        /// <summary>Offer the 0x08 deflate transport before the transfer (falls back
+        /// to uncompressed against older peers). Default from Config "Compress".</summary>
+        public bool CompressionEnabled { get; set; }
 
         /// <summary>Creates a UDT client for sending files or folders.</summary>
         /// <param name="serverIp">Target server IPv4 address.</param>
@@ -648,6 +677,8 @@ namespace TrFileTransfer
             _localPort = localPort;
             _limiter = new SpeedLimiter(maxBytesPerSec);
             EncryptionEnabled = Config.GetBool("Encrypt", true);
+            EncryptionDowngradeAllowed = !Config.GetBool("EncryptStrict", false);
+            CompressionEnabled = Config.GetBool("Compress", true);
             _cb.Log = Log;
             _cb.Progress = delegate(TransferProgress p)
             {
@@ -661,25 +692,28 @@ namespace TrFileTransfer
             {
                 var h = OnTransferComplete; if (h != null) h();
             };
+            // UDT's verdict is the out-of-band 1-byte ACK read in RunUdtTransfer, not a
+            // byte on the stream — do not wait for a stream byte (it would see EOF).
+            _cb.CompletionAckOnStream = false;
         }
 
         /// <summary>Sends the file specified in the constructor over UDT.</summary>
         public async Task SendAsync()
         {
-            await RunUdtTransfer(SendFileInternal);
+            await RunUdtTransfer(SendFileInternal).ConfigureAwait(false);
         }
 
         /// <summary>Sends a folder recursively over UDT.</summary>
         /// <param name="folderPath">Path to the folder to send.</param>
         public async Task SendFolderAsync(string folderPath)
         {
-            await RunUdtTransfer(ct => SendFolderInternal(folderPath, ct));
+            await RunUdtTransfer(ct => SendFolderInternal(folderPath, ct)).ConfigureAwait(false);
         }
 
         /// <summary>Sends a chunk of a file (type 0x02) for concurrent transfer.</summary>
         public async Task SendChunkedAsync(long offset, long chunkSize, long totalSize)
         {
-            await RunUdtTransfer(ct => SendChunkedInternal(offset, chunkSize, totalSize, ct));
+            await RunUdtTransfer(ct => SendChunkedInternal(offset, chunkSize, totalSize, ct)).ConfigureAwait(false);
         }
 
         /// <summary>Sends a folder with resume support (type 0x04). Interrupted sessions
@@ -690,21 +724,21 @@ namespace TrFileTransfer
         public async Task<Guid> SendFolderResumableAsync(Guid? existingSessionId = null, bool keepState = false)
         {
             var sessionId = existingSessionId ?? Guid.NewGuid();
-            await RunUdtTransfer(ct => SendFolderResumableInternal(sessionId, ct, keepState));
+            await RunUdtTransfer(ct => SendFolderResumableInternal(sessionId, ct, keepState)).ConfigureAwait(false);
             return sessionId;
         }
 
         public async Task<Guid> SendResumableAsync(Guid? existingSessionId = null, bool verifyHash = false)
         {
             var sessionId = existingSessionId ?? Guid.NewGuid();
-            await RunUdtTransfer(ct => SendResumableUdtInternal(sessionId, ct, verifyHash));
+            await RunUdtTransfer(ct => SendResumableUdtInternal(sessionId, ct, verifyHash)).ConfigureAwait(false);
             return sessionId;
         }
 
         /// <summary>Sends a UTF-8 text message (type 0x06) over UDT.</summary>
         public async Task SendTextAsync(string text)
         {
-            await RunUdtTransfer(ct => SendTextInternal(text, ct));
+            await RunUdtTransfer(ct => SendTextInternal(text, ct)).ConfigureAwait(false);
         }
 
         private async Task RunUdtTransfer(Func<CancellationToken, Task> transferAction)
@@ -742,6 +776,10 @@ namespace TrFileTransfer
                 Log(L.C_Error(ex.Message));
                 var handler = OnError;
                 if (handler != null) handler(ex.Message);
+                // Mirror the TCP client: failures propagate to the caller after the
+                // error event fired. Swallowing them made UDT failures look like
+                // successes to ConcurrentTransfer / CLI / the retry logic.
+                throw;
             }
             finally
             {
@@ -786,7 +824,7 @@ namespace TrFileTransfer
             Log(L.UdtC_Connecting(_serverIp, _port));
             var addr = UdtNative.BuildSockaddr(_serverIp, _port);
             int connectResult = await Task.Run(
-                () => UdtNative.udt_connect(_socket, ref addr, UdtNative.SockAddrSize), ct);
+                () => UdtNative.udt_connect(_socket, ref addr, UdtNative.SockAddrSize), ct).ConfigureAwait(false);
             if (connectResult == UdtNative.ERROR)
                 throw new Exception("UDT connect failed: " + UdtNative.GetErrorDesc());
             Log(L.C_Connected(_serverIp, _port));
@@ -795,17 +833,19 @@ namespace TrFileTransfer
             int bufSize = 8 * 1024 * 1024; // 8 MB
             UdtNative.udt_setsockopt(_socket, 0, UdtNative.UDT_SNDBUF, ref bufSize, 4);
             UdtNative.udt_setsockopt(_socket, 0, UdtNative.UDT_RCVBUF, ref bufSize, 4);
-            await UdtIo.WaitForConnectionReady(_socket, ct);
+            await UdtIo.WaitForConnectionReady(_socket, ct).ConfigureAwait(false);
         }
 
         /// <summary>
-        /// Connects and runs the auth handshake, wrapping the wire stream for encryption
-        /// when the peer accepts 0x07. Against an older peer (no 0x17 answer) the
-        /// connection is re-established once and the plain 0x05 frame is used instead.
+        /// Connects and runs the prelude negotiation: 0x08 compression offer, then the
+        /// 0x07/0x05 auth. Against an older peer each offer can fail independently —
+        /// the connection is re-established with that feature dropped (compression
+        /// first, then encryption), at most twice.
         /// </summary>
         private async Task<IWireStream> OpenAndAuthenticateAsync(CancellationToken ct)
         {
             bool allowEncrypt = EncryptionEnabled;
+            bool allowCompress = CompressionEnabled;
             for (int attempt = 0; ; attempt++)
             {
                 await UdtConnect(ct).ConfigureAwait(false);
@@ -813,10 +853,11 @@ namespace TrFileTransfer
                 AuthResult auth;
                 try
                 {
-                    // Short receive window: an older peer that does not know 0x07 never
-                    // answers, and waiting out the full 30s timeout would feel broken
+                    // Short receive window: an older peer that does not know 0x07/0x08
+                    // never answers, and waiting out the full 30s timeout would feel broken
                     UdtNative.SetTimeout(_socket, 8000, 30000);
-                    auth = await ClientWire.AuthenticateAsync(raw, PairingCode, allowEncrypt, _cb, ct).ConfigureAwait(false);
+                    auth = await ClientWire.AuthenticateAsync(raw, PairingCode, allowEncrypt, allowCompress, _cb, ct,
+                        EncryptionDowngradeAllowed).ConfigureAwait(false);
                     UdtNative.SetTimeout(_socket, 30000, 30000);
                 }
                 catch
@@ -824,12 +865,23 @@ namespace TrFileTransfer
                     raw.Dispose();
                     throw;
                 }
-                if (auth.NeedPlainFallback && allowEncrypt && attempt == 0)
+                if (auth.NeedNoCompressionFallback && allowCompress && attempt < 2)
                 {
                     raw.Dispose();
                     try { UdtNative.udt_close(_socket); } catch { }
                     _socket = -1;
+                    allowCompress = false;
+                    _cb.RaiseLog(L.C_CompressFallback);
+                    continue;
+                }
+                if (auth.NeedPlainFallback && allowEncrypt && attempt < 2)
+                {
+                    raw.Dispose();
+                    try { UdtNative.udt_close(_socket); } catch { }
+                    _socket = -1;
+                    // A peer too old for 0x17 is too old for 0x08 as well
                     allowEncrypt = false;
+                    allowCompress = false;
                     _cb.RaiseLog(L.C_EncryptFallback);
                     continue;
                 }

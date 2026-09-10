@@ -64,6 +64,10 @@ namespace TrFileTransfer
             _bufferSize = bufferSize;
             _wire.SaveDirectory = saveDirectory;
             _wire.BufferSize = bufferSize;
+            // TCP has no out-of-band ACK, so the sender must be told the receiver's
+            // verdict for 0x00/0x01/0x06 — otherwise a rejected transfer looks like a
+            // success (silent data loss).
+            _wire.CompletionAck = true;
             _wire.Cb.Log = Log;
             _wire.Cb.Progress = delegate(TransferProgress p)
             {
@@ -145,6 +149,11 @@ namespace TrFileTransfer
             IPAddress bindIp;
             if (!IPAddress.TryParse(_bindAddress, out bindIp))
                 bindIp = IPAddress.Any;
+
+            // The save directory may legitimately not exist yet (date-archive mode
+            // appends a yyyy-MM-dd child); single-file receivers write straight
+            // into it and FileStream never creates intermediate directories.
+            try { Directory.CreateDirectory(_saveDirectory); } catch { }
 
             try
             {
@@ -257,9 +266,6 @@ namespace TrFileTransfer
                         // instead of draining into a socket nobody reads
                         try { client.LingerState = new System.Net.Sockets.LingerOption(true, 0); } catch { }
                     }
-
-                    var ccHandler = OnClientTransferComplete;
-                    if (ccHandler != null) ccHandler(clientEp);
                 }
                 catch (OperationCanceledException) { }
                 catch (ObjectDisposedException) { }
@@ -278,6 +284,12 @@ namespace TrFileTransfer
                 finally
                 {
                     OnProgress -= clientProgress;
+                    // Fire on every connection end, not just clean finishes: a
+                    // connection that died mid-transfer (pause/cancel/network drop)
+                    // must still finalize the client's progress card, or the card
+                    // lingers forever while the retry gets a fresh endpoint.
+                    var ccHandler = OnClientTransferComplete;
+                    if (ccHandler != null) ccHandler(clientEp);
                 }
             }
         }

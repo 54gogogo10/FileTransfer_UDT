@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net.Sockets;
 
@@ -42,6 +43,10 @@ namespace TrFileTransfer
         public int ChunksCompleted;
         public readonly object Lock = new object();
         public bool Complete;
+        // Received byte ranges, kept merged and sorted. Completion is decided by real
+        // COVERAGE, not by summing chunk sizes: overlapping or duplicate chunks used to
+        // inflate BytesReceived past TotalSize and report a file with holes as complete.
+        private readonly List<long[]> _ranges = new List<long[]>();
 
         public void Dispose()
         {
@@ -52,13 +57,15 @@ namespace TrFileTransfer
             }
         }
 
-        /// <summary>Gets or creates a tracker, deferring FileStream creation.</summary>
+        /// <summary>Gets or creates a tracker, deferring FileStream creation.
+        /// The dictionary key is separate from the display name so callers can
+        /// namespace it (per-peer isolation for concurrent same-named files).</summary>
         public static ChunkTracker GetOrCreate(
             System.Collections.Concurrent.ConcurrentDictionary<string, ChunkTracker> dict,
-            string fileName, long totalSize, string saveDirectory)
+            string key, string fileName, long totalSize, string saveDirectory)
         {
             ChunkTracker tracker;
-            if (!dict.TryGetValue(fileName, out tracker))
+            if (!dict.TryGetValue(key, out tracker))
             {
                 var newTracker = new ChunkTracker
                 {
@@ -66,12 +73,15 @@ namespace TrFileTransfer
                     TotalSize = totalSize,
                     SavePath = Utils.GetUniqueSavePath(saveDirectory, fileName)
                 };
-                tracker = dict.GetOrAdd(fileName, newTracker);
+                tracker = dict.GetOrAdd(key, newTracker);
             }
             return tracker;
         }
 
-        /// <summary>Writes chunk data and checks completion. Returns true if all chunks received.</summary>
+        /// <summary>Writes chunk data and checks completion. Returns true only when the
+        /// received ranges actually COVER [0, TotalSize) — a sum of chunk sizes is not
+        /// enough, because duplicate/overlapping chunks inflate the sum without filling
+        /// the file, and a gap would be reported as a complete file.</summary>
         public bool WriteChunk(long chunkOffset, byte[] data, int bufferSize)
         {
             bool isComplete = false;
@@ -89,13 +99,47 @@ namespace TrFileTransfer
                 BytesReceived += bufferSize;
                 ChunksCompleted++;
 
-                if (BytesReceived >= TotalSize && !Complete)
+                AddRange(chunkOffset, chunkOffset + bufferSize);
+                if (!Complete && CoversAll())
                 {
                     Complete = true;
                     isComplete = true;
                 }
             }
             return isComplete;
+        }
+
+        /// <summary>True when the merged ranges cover exactly [0, TotalSize).</summary>
+        private bool CoversAll()
+        {
+            if (TotalSize <= 0) return false;
+            // Ranges are merged+sorted on insert, so full coverage is a single range
+            return _ranges.Count == 1 && _ranges[0][0] <= 0 && _ranges[0][1] >= TotalSize;
+        }
+
+        /// <summary>Merges [start,end) into the sorted, non-overlapping range list —
+        /// keeps the list tiny (a handful of entries for an out-of-order transfer).</summary>
+        private void AddRange(long start, long end)
+        {
+            if (start < 0) start = 0;
+            if (end <= start) return;
+
+            // Ignore the part beyond the declared file size
+            if (end > TotalSize) end = TotalSize;
+            if (end <= start) return;
+
+            int i = 0;
+            while (i < _ranges.Count && _ranges[i][1] < start) i++;
+            int lo = i;
+            int hi = i;
+            while (hi < _ranges.Count && _ranges[hi][0] <= end)
+            {
+                if (_ranges[hi][0] < start) start = _ranges[hi][0];
+                if (_ranges[hi][1] > end) end = _ranges[hi][1];
+                hi++;
+            }
+            if (hi > lo) _ranges.RemoveRange(lo, hi - lo);
+            _ranges.Insert(lo, new long[] { start, end });
         }
     }
     #pragma warning restore 1591
@@ -259,8 +303,39 @@ namespace TrFileTransfer
                     parts[i] = "_";
                 if (string.IsNullOrWhiteSpace(parts[i]))
                     parts[i] = "_";
+                // A colon would make "C:\evil" a rooted path (Path.Combine returns a
+                // rooted second argument verbatim) or address an NTFS alternate
+                // data stream ("file.txt:hidden") — neither may come from the wire.
+                parts[i] = parts[i].Replace(':', '_');
+                // Windows strips trailing dots/spaces on create, which desyncs the
+                // collision check from the file that actually lands on disk
+                parts[i] = parts[i].TrimEnd('.', ' ');
+                if (parts[i].Length == 0)
+                    parts[i] = "_";
+                else if (IsReservedFileName(parts[i]))
+                    parts[i] = "_" + parts[i];
             }
             return string.Join(Path.DirectorySeparatorChar.ToString(), parts);
+        }
+
+        /// <summary>Whether the file name (any extension) collides with a Windows
+        /// reserved device name (CON, NUL, COM1…). Those resolve to devices instead
+        /// of disk files, so a crafted peer name must never reach FileStream.</summary>
+        public static bool IsReservedFileName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            string baseName = name;
+            int dot = name.IndexOf('.');
+            if (dot >= 0) baseName = name.Substring(0, dot);
+            string upper = baseName.ToUpperInvariant();
+            if (upper == "CON" || upper == "PRN" || upper == "AUX" || upper == "NUL")
+                return true;
+            if (upper.Length == 4 && (upper.StartsWith("COM") || upper.StartsWith("LPT")))
+            {
+                char c = upper[3];
+                return c >= '1' && c <= '9';
+            }
+            return false;
         }
 
         /// <summary>Finds a free port starting from basePort, scanning upward.</summary>
@@ -343,11 +418,18 @@ namespace TrFileTransfer
         /// <summary>Headroom required on top of each incoming file (write cache, metadata, safety).</summary>
         public const long DiskSpaceMargin = 64 * 1024 * 1024;
 
+        /// <summary>Largest file size a peer header may declare. Far beyond any real
+        /// single file, and low enough that fileSize + DiskSpaceMargin cannot overflow
+        /// a signed 64-bit value (which would silently defeat the free-space check).</summary>
+        public const long MaxTransferSize = 1L << 50; // 1 PiB
+
         /// <summary>Whether the drive holding the directory has at least requiredBytes free.
         /// Returns true when availability cannot be determined — a broken probe must not
-        /// block every transfer.</summary>
+        /// block every transfer. A negative requirement (nonsense or overflowed) is
+        /// rejected rather than treated as "no space needed".</summary>
         public static bool HasFreeSpace(string directory, long requiredBytes)
         {
+            if (requiredBytes < 0) return false;
             try
             {
                 string root = Path.GetPathRoot(Path.GetFullPath(directory));
@@ -358,6 +440,14 @@ namespace TrFileTransfer
             {
                 return true;
             }
+        }
+
+        /// <summary>Disk-space precheck for an incoming file of the given declared size,
+        /// adding the safety margin without overflowing. Implausible sizes fail closed.</summary>
+        public static bool HasFreeSpaceFor(string directory, long fileSize)
+        {
+            if (fileSize < 0 || fileSize > MaxTransferSize) return false;
+            return HasFreeSpace(directory, fileSize + DiskSpaceMargin);
         }
     }
 

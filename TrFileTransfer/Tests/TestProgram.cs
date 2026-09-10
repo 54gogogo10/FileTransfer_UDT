@@ -47,8 +47,38 @@ namespace TrFileTransfer.Tests
         public int Passed { get { return _passed; } }
         public int Failed { get { return _failed; } }
 
+        /// <summary>Optional name filter from the TF_TEST_FILTER environment variable:
+        /// when set, only tests whose name contains it run. Lets a single failing
+        /// integration test be iterated on without paying for the whole slow suite.</summary>
+        private static readonly string Filter = Environment.GetEnvironmentVariable("TF_TEST_FILTER");
+
+        private static bool Matches(string name)
+        {
+            return string.IsNullOrEmpty(Filter) || name.IndexOf(Filter, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        /// <summary>Flattens an AggregateException so a FAIL line names the real cause
+        /// instead of the useless "one or more errors occurred".</summary>
+        private static string Describe(Exception ex)
+        {
+            var agg = ex as AggregateException;
+            if (agg != null && agg.InnerExceptions.Count > 0)
+            {
+                var sb = new System.Text.StringBuilder();
+                foreach (var inner in agg.InnerExceptions)
+                {
+                    if (sb.Length > 0) sb.Append(" | ");
+                    sb.Append(inner.GetType().Name).Append(": ").Append(inner.Message);
+                }
+                return sb.ToString();
+            }
+            return ex.GetType().Name + ": " + ex.Message;
+        }
+
         public void Run(string name, Action test, int retries = 0)
         {
+            if (!Matches(name))
+                return;
             for (int attempt = 0; ; attempt++)
             {
                 try
@@ -62,11 +92,11 @@ namespace TrFileTransfer.Tests
                 {
                     if (attempt < retries)
                     {
-                        Console.WriteLine("  RETRY " + name + " (attempt " + (attempt + 1) + "): " + ex.Message);
+                        Console.WriteLine("  RETRY " + name + " (attempt " + (attempt + 1) + "): " + Describe(ex));
                         continue;
                     }
                     _failed++;
-                    var msg = string.Format("  FAIL  {0} — {1}", name, ex.Message);
+                    var msg = string.Format("  FAIL  {0} — {1}", name, Describe(ex));
                     Console.WriteLine(msg);
                     _failures.Add(msg);
                     return;
@@ -146,6 +176,26 @@ namespace TrFileTransfer.Tests
             runner.Run("Sanitize_EmptyPart", () =>
                 Assert.Equal("_",
                     Utils.SanitizeRelativePath("/"), "empty parts -> _"));
+            // A drive-letter path must never survive: Path.Combine returns a rooted
+            // second argument verbatim, so "C:\evil" would escape the save directory
+            runner.Run("Sanitize_DriveLetter", () =>
+                Assert.Equal(string.Format("C_{0}evil", sep),
+                    Utils.SanitizeRelativePath("C:\\evil"), "C:\\evil defused"));
+            runner.Run("Sanitize_UncLikeDrive", () =>
+                Assert.Equal(string.Format("server{0}share", sep),
+                    Utils.SanitizeRelativePath("\\\\server\\share"), "UNC defused"));
+            // Colons also address NTFS alternate data streams ("file.txt:hidden")
+            runner.Run("Sanitize_AdsColon", () =>
+                Assert.Equal(string.Format("sub{0}file.txt_ads", sep),
+                    Utils.SanitizeRelativePath("sub/file.txt:ads"), "ADS colon defused"));
+            // Reserved device names must not pass through a segment
+            runner.Run("Sanitize_ReservedName", () =>
+                Assert.Equal("_con", Utils.SanitizeRelativePath("con"), "con reserved"));
+            // Trailing dots/spaces desync the unique-name collision check on Windows
+            runner.Run("Sanitize_TrailingDots", () =>
+                Assert.Equal("a.txt", Utils.SanitizeRelativePath("a.txt."), "trailing dot trimmed"));
+            runner.Run("Sanitize_OnlyDots", () =>
+                Assert.Equal("_", Utils.SanitizeRelativePath("..."), "only dots -> _"));
         }
 
         private static void RunConstantTimeEquals(TestRunner runner)
@@ -388,12 +438,25 @@ namespace TrFileTransfer.Tests
             // ---- UpdateManifest.Parse ----
             runner.Run("Update_Parse_Valid", () =>
             {
-                string text = "version=2.2.0.0\r\nurl=http://192.168.1.10/app.exe\nsha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nnotes=Fixes\n";
+                string text = "version=2.2.0.0\r\nurl=https://192.168.1.10/app.exe\nsha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nnotes=Fixes\n";
                 var m = UpdateManifest.Parse(text);
                 Assert.True(m != null, "parsed");
                 Assert.Equal(new Version(2, 2, 0, 0), m.Version, "version");
-                Assert.Equal("http://192.168.1.10/app.exe", m.Url, "url");
+                Assert.Equal("https://192.168.1.10/app.exe", m.Url, "url");
                 Assert.Equal("Fixes", m.Notes, "notes");
+            });
+
+            runner.Run("Update_Parse_InsecureHttpRejected", () =>
+            {
+                // Plain http is only accepted for loopback; a real host must be https,
+                // otherwise a MITM serves both the exe and its matching hash.
+                string sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+                Assert.True(UpdateManifest.Parse("version=1.0.0.0\nurl=http://192.168.1.10/a.exe\nsha256=" + sha) == null,
+                    "http on a real host rejected");
+                Assert.True(UpdateManifest.Parse("version=1.0.0.0\nurl=http://localhost:8080/a.exe\nsha256=" + sha) != null,
+                    "http on localhost accepted");
+                Assert.True(UpdateManifest.Parse("version=1.0.0.0\nurl=http://127.0.0.1:8080/a.exe\nsha256=" + sha) != null,
+                    "http on loopback IP accepted");
             });
 
             runner.Run("Update_Parse_UppercaseHashNormalized", () =>
@@ -422,7 +485,7 @@ namespace TrFileTransfer.Tests
                 Assert.True(UpdateManifest.Parse("") == null, "null"));
             runner.Run("Update_Parse_UnknownKeysIgnored", () =>
             {
-                string text = "# comment line\nfoo=bar\nversion=3.0.0.0\nurl=http://x/a.exe\nsha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+                string text = "# comment line\nfoo=bar\nversion=3.0.0.0\nurl=https://x/a.exe\nsha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
                 var m = UpdateManifest.Parse(text);
                 Assert.True(m != null, "unknown keys ignored");
                 Assert.Equal(new Version(3, 0, 0, 0), m.Version, "version");
@@ -451,7 +514,7 @@ namespace TrFileTransfer.Tests
 
             runner.Run("Update_GitHub_Parse_TagWithoutV", () =>
             {
-                string json = "{\"tag_name\":\"3.1.4.1\",\"assets\":[{\"browser_download_url\":\"http://x/a.exe\"}]}";
+                string json = "{\"tag_name\":\"3.1.4.1\",\"assets\":[{\"browser_download_url\":\"https://x/a.exe\"}]}";
                 var m = UpdateManifest.FromGitHubJson(json);
                 Assert.True(m != null, "parsed");
                 Assert.Equal(new Version(3, 1, 4, 1), m.Version, "bare tag");
