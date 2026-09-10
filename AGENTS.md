@@ -10,7 +10,12 @@ This file provides guidance to AI coding agents (Codex / ZCode / Claude Code) wh
 cd TrFileTransfer && build.bat
 ```
 
-使用 .NET SDK（`dotnet build`，需 SDK 8+）编译 SDK 风格 `TrFileTransfer.csproj`：目标 `net48`（WPF），输出 `bin\Release\net48\TrFileTransfer.exe`。csproj 经 `Microsoft.NETFramework.ReferenceAssemblies` 包（`PrivateAssets=all`，仅编译期、不进运行时）解决本机/CI 无 4.8 targeting pack 的问题；`udt.dll` 和 `libmcfgthread-2.dll` 经 `<EmbeddedResource LogicalName="TrFileTransfer.udt.dll">` 嵌入 exe（**LogicalName 必须与 `TransferUdt.cs` 运行时查找的资源名精确一致**，否则 UDT 静默降级为依赖 exe 旁 DLL）；托盘 `NotifyIcon`/`FolderBrowserDialog`/图标仍引用 System.Windows.Forms/System.Drawing 程序集（net48 WPF 无零依赖替代，仅此两处借用）。
+`build.bat` 包装 `dotnet build -c Release`，然后把产物落到两处：
+
+- **`release\TrFileTransfer-<版本>.exe`**（+ 同名 `.exe.config` 与 `.exe.sha256`）——本地分发用的带版本号产物。版本号从 `AssemblyInfo.cs` 的 `AssemblyVersion` 解析（**单一来源**，改版本只动 `AssemblyInfo.cs`），与 GitHub Release 的 tag 保持一致；`.sha256` 按「小写哈希 + 两空格 + 文件名」写入，与 `.github/workflows/release.yml` 同一约定。`release\` 已在 `.gitignore` 中，不纳入版本库。
+- **`TrFileTransfer.exe`**（+ `.exe.config`）——不带版本号的副本，**保留是为了 `.github/workflows/ci.yml` 与 `release.yml`**（两者按 `TrFileTransfer\TrFileTransfer.exe` 取产物并生成边车）。改动该路径前须同步改那两个工作流。
+
+使用 .NET SDK（`dotnet build`，需 SDK 8+）编译 SDK 风格 `TrFileTransfer.csproj`：目标 `net48`（WPF），中间输出 `bin\Release\net48\TrFileTransfer.exe`。csproj 经 `Microsoft.NETFramework.ReferenceAssemblies` 包（`PrivateAssets=all`，仅编译期、不进运行时）解决本机/CI 无 4.8 targeting pack 的问题；`udt.dll` 和 `libmcfgthread-2.dll` 经 `<EmbeddedResource LogicalName="TrFileTransfer.udt.dll">` 嵌入 exe（**LogicalName 必须与 `TransferUdt.cs` 运行时查找的资源名精确一致**，否则 UDT 静默降级为依赖 exe 旁 DLL）；托盘 `NotifyIcon`/`FolderBrowserDialog`/图标仍引用 System.Windows.Forms/System.Drawing 程序集（net48 WPF 无零依赖替代，仅此两处借用）。
 
 **UDT DLL 编译**（如更新原生代码）：需 MinGW-w64，在 `udt-sdk\udt4\src\` 下执行：
 ```

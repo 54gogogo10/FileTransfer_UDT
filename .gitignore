@@ -8,6 +8,7 @@
 *.vs/
 bin/
 obj/
+release/
 .claude/
 *.xml
 TrFileTransfer.exe.config
