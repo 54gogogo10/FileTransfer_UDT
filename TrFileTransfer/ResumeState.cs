@@ -18,10 +18,14 @@ namespace TrFileTransfer
         public int Port;
         public bool IsUdt;
         public DateTime Created;
-        // Server-side only (not persisted)
+        // Server-side only
         public string SavePath;
         public FileStream WriteStream;
         public long ReceivedBytes;
+        /// <summary>Server-side: peer IP that owns this session. A connection presenting
+        /// the same sessionId from a different peer is refused, so one client cannot
+        /// hijack or corrupt another client's in-flight resume session.</summary>
+        public string Peer;
 
         private static readonly string ResumeDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),

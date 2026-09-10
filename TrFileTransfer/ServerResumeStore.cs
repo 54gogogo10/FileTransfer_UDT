@@ -35,6 +35,7 @@ namespace TrFileTransfer
             sb.AppendLine("ReceivedBytes=" + state.ReceivedBytes);
             sb.AppendLine("FileName=" + (state.FileName ?? "").Replace("\r", "").Replace("\n", ""));
             sb.AppendLine("SavePath=" + (state.SavePath ?? "").Replace("\r", "").Replace("\n", ""));
+            sb.AppendLine("Peer=" + (state.Peer ?? "").Replace("\r", "").Replace("\n", ""));
             sb.AppendLine("Created=" + state.Created.ToString("o"));
             File.WriteAllText(GetPath(state.SessionId), sb.ToString(), Encoding.UTF8);
         }
@@ -59,6 +60,7 @@ namespace TrFileTransfer
                         case "ReceivedBytes": { long v; if (long.TryParse(val, out v)) state.ReceivedBytes = v; break; }
                         case "FileName": state.FileName = val; break;
                         case "SavePath": state.SavePath = val; break;
+                        case "Peer": state.Peer = val; break;
                         case "Created":
                             try
                             {

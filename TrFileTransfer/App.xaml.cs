@@ -22,6 +22,26 @@ namespace TrFileTransfer
             // Repaint the token brushes before any window parses (Config is loaded
             // again — harmlessly — inside MainWindow)
             Config.Load();
+
+            // Headless branch: "send"/"recv"/"--help" run without any window.
+            // The work runs on a worker thread so the logic layer's awaits never
+            // capture the dispatcher context; the dispatcher itself stays free
+            // (the worker calls Shutdown when done instead of being joined here).
+            if (Cli.IsCliInvocation(e.Args))
+            {
+                ShutdownMode = ShutdownMode.OnExplicitShutdown;
+                var worker = new System.Threading.Thread(() =>
+                {
+                    int exitCode;
+                    try { exitCode = Cli.Run(e.Args); }
+                    catch { exitCode = 1; }
+                    Dispatcher.BeginInvoke(new Action(() => Shutdown(exitCode)));
+                });
+                worker.IsBackground = true;
+                worker.Start();
+                return;
+            }
+
             ThemeManager.Initialize();
 
             // Escape hatch for machines whose GPU driver black-screens WPF's

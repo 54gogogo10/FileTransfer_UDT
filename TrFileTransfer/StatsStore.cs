@@ -160,6 +160,21 @@ namespace TrFileTransfer
             return result;
         }
 
+        /// <summary>Erases every recorded transfer by truncating the log file in place
+        /// (kept as an empty file so concurrent appends never hit a missing path).</summary>
+        public void ClearAll()
+        {
+            lock (_lock)
+            {
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(_path));
+                    File.WriteAllText(_path, "");
+                }
+                catch { }
+            }
+        }
+
         /// <summary>Aggregates raw entries into today / last-7-days / all-time totals and
         /// a per-peer breakdown. "Today" is the local calendar day of 'now'.</summary>
         public static StatsSummary Aggregate(IEnumerable<StatsEntry> entries, DateTime now)

@@ -26,6 +26,9 @@ namespace TrFileTransfer
             w.MinWidth = Math.Min(minW, w.Width);
             w.MinHeight = Math.Min(minH, w.Height);
             w.Background = Res<Brush>("Brush.Window");
+            // Inheritable default so bare TextBlocks (no explicit style/foreground)
+            // don't fall back to black system text on the dark window background.
+            w.Foreground = Res<Brush>("Brush.TextPrimary");
             w.FontFamily = Res<FontFamily>("Font.Main");
             w.FontSize = 12;
             w.WindowStartupLocation = WindowStartupLocation.CenterOwner;

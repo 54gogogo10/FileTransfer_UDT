@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
@@ -14,10 +15,12 @@ namespace TrFileTransfer
     /// Read-only HTTP share over a directory: any LAN browser (phones included) can
     /// list and download files. Built on TcpListener so it needs no HttpListener URL
     /// ACLs or admin rights. An optional access token (pairing mode reuses the pairing
-    /// code) rides in every link as "?t=..." — without it only the token entry form
-    /// is served. Navigation and download paths are sanitized and pinned under the
-    /// shared root; files are always served as attachments except a small safe-inline
-    /// allowlist (images/video/pdf/text — never HTML/SVG, which could script the page).
+    /// code) is exchanged once via the entry form for an HttpOnly cookie — listing and
+    /// download links stay clean of credentials. The legacy "?t=..." query still
+    /// authenticates (bookmarks, scripted clients). Navigation and download paths are
+    /// sanitized and pinned under the shared root; files are always served as
+    /// attachments except a small safe-inline allowlist (images/video/pdf/text — never
+    /// HTML/SVG, which could script the page).
     /// </summary>
     public class HttpShareServer
     {
@@ -27,6 +30,27 @@ namespace TrFileTransfer
         private string _rootFull;
         private string _token;
         private volatile bool _isRunning;
+
+        // Access-code brute-force defence. The code may be short (a pairing code),
+        // so a LAN peer must not be able to try unlimited guesses against the cheap
+        // HTTP endpoint. Failures are counted per client IP; on success the count
+        // resets. Locked-out attempts are answered 429 without touching the token.
+        private readonly object _authLock = new object();
+        private readonly Dictionary<string, int> _authFailures = new Dictionary<string, int>();
+        private readonly Dictionary<string, DateTime> _authLockedUntil = new Dictionary<string, DateTime>();
+        /// <summary>Wrong access codes allowed per client IP before a temporary lockout.</summary>
+        public const int MaxAuthFailures = 10;
+        /// <summary>How long a locked-out IP stays refused.</summary>
+        public static readonly TimeSpan AuthLockoutDuration = TimeSpan.FromMinutes(10);
+
+        // Connection admission: without a cap, an unauthenticated peer can open
+        // thousands of idle connections and exhaust memory/handles (slowloris).
+        private SemaphoreSlim _connLimit;
+        /// <summary>Maximum requests being served at once.</summary>
+        public const int MaxConcurrentConnections = 32;
+        /// <summary>Per-connection idle deadline while reading the request head — a
+        /// client that never finishes its headers is dropped instead of held open.</summary>
+        public const int HeadReadTimeoutMs = 15000;
 
         /// <summary>Fired for lifecycle events and downloads (log-ready lines).</summary>
         public event Action<string> OnLog;
@@ -39,6 +63,11 @@ namespace TrFileTransfer
         /// <summary>Hard cap for a single upload request body (4 GB).</summary>
         public const long MaxUploadBytes = 4L * 1024 * 1024 * 1024;
 
+        /// <summary>Hard cap for one uploaded FILE, enforced while writing rather than
+        /// only against the whole-request Content-Length (a request may carry several
+        /// parts, so the request cap alone does not bound a single file).</summary>
+        public const long MaxUploadFileBytes = 2L * 1024 * 1024 * 1024;
+
         /// <summary>MIME types served inline (browser plays/preview); everything else is
         /// sent as an attachment. HTML/SVG are deliberately absent — inline markup could
         /// script the listing page and read the access token from its links.</summary>
@@ -50,36 +79,51 @@ namespace TrFileTransfer
             { ".pdf", "application/pdf" }, { ".txt", "text/plain; charset=utf-8" }
         };
 
-        /// <summary>The best LAN-facing URL for browsers — prefers RFC1918 private
-        /// addresses (what phones actually reach), falls back to the first non-loopback
-        /// IPv4, then loopback for local testing.</summary>
+        /// <summary>The best LAN-facing URL for browsers — first entry of
+        /// LanAddresses() (RFC1918 private first — what phones actually reach).</summary>
         public string LanUrl
         {
-            get
+            get { return "http://" + LanAddresses()[0] + ":" + Port + "/"; }
+        }
+
+        /// <summary>All non-loopback IPv4 addresses worth offering for the share URL,
+        /// RFC1918 private ranges first (interface enumeration order kept within each
+        /// group), loopback alone as the local-testing fallback when nothing else exists.</summary>
+        public static List<string> LanAddresses()
+        {
+            var privateIps = new List<string>();
+            var otherIps = new List<string>();
+            try
             {
-                string firstAny = null;
-                try
+                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
                 {
-                    foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    foreach (var addr in ni.GetIPProperties().UnicastAddresses)
                     {
-                        if (ni.OperationalStatus != OperationalStatus.Up) continue;
-                        foreach (var addr in ni.GetIPProperties().UnicastAddresses)
-                        {
-                            if (addr.Address.AddressFamily != AddressFamily.InterNetwork ||
-                                IPAddress.IsLoopback(addr.Address)) continue;
-                            string ip = addr.Address.ToString();
-                            if (firstAny == null) firstAny = ip;
-                            if (ip.StartsWith("192.168.", StringComparison.Ordinal) ||
-                                ip.StartsWith("10.", StringComparison.Ordinal) ||
-                                IsRfc1918_172(ip))
-                                return "http://" + ip + ":" + Port + "/";
-                        }
+                        if (addr.Address.AddressFamily != AddressFamily.InterNetwork ||
+                            IPAddress.IsLoopback(addr.Address)) continue;
+                        string ip = addr.Address.ToString();
+                        if (ip.StartsWith("192.168.", StringComparison.Ordinal) ||
+                            ip.StartsWith("10.", StringComparison.Ordinal) ||
+                            IsRfc1918_172(ip))
+                            privateIps.Add(ip);
+                        else
+                            otherIps.Add(ip);
                     }
                 }
-                catch { }
-                if (firstAny != null) return "http://" + firstAny + ":" + Port + "/";
-                return "http://127.0.0.1:" + Port + "/";
             }
+            catch { }
+            var all = new List<string>();
+            all.AddRange(privateIps);
+            all.AddRange(otherIps);
+            if (all.Count == 0) all.Add("127.0.0.1");
+            return all;
+        }
+
+        /// <summary>Builds a share URL for one of the LanAddresses() entries.</summary>
+        public static string BuildLanUrl(string ip, int port)
+        {
+            return "http://" + ip + ":" + port.ToString(CultureInfo.InvariantCulture) + "/";
         }
 
         private static bool IsRfc1918_172(string ip)
@@ -100,6 +144,12 @@ namespace TrFileTransfer
             if (!_rootFull.EndsWith(Path.DirectorySeparatorChar.ToString()))
                 _rootFull += Path.DirectorySeparatorChar;
             _token = token ?? "";
+            lock (_authLock)
+            {
+                _authFailures.Clear();
+                _authLockedUntil.Clear();
+            }
+            _connLimit = new SemaphoreSlim(MaxConcurrentConnections, MaxConcurrentConnections);
             _cts = new CancellationTokenSource();
             _listener = new TcpListener(IPAddress.Any, port);
             _listener.Start();
@@ -133,7 +183,19 @@ namespace TrFileTransfer
                 catch (ObjectDisposedException) { break; }
                 catch (InvalidOperationException) { break; }
                 catch (SocketException) { if (ct.IsCancellationRequested) break; continue; }
-                var _ = Task.Run(() => HandleClient(client, ct), ct);
+
+                // Admission control: hold a slot for the whole request. When all slots
+                // are busy, stop accepting (back-pressure) instead of piling up
+                // unbounded fire-and-forget handlers.
+                var limit = _connLimit;
+                if (limit == null) { try { client.Close(); } catch { } continue; }
+                try { await limit.WaitAsync(ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { try { client.Close(); } catch { } break; }
+                var _ = Task.Run(async () =>
+                {
+                    try { await HandleClient(client, ct).ConfigureAwait(false); }
+                    finally { try { limit.Release(); } catch { } }
+                }, ct);
             }
         }
 
@@ -154,7 +216,32 @@ namespace TrFileTransfer
                     // (start of a POST body) must survive into the body parsing
                     var reader = new NetBufReader(ns);
 
-                    string head = await reader.ReadHeadAsync(ct).ConfigureAwait(false);
+                    // Idle deadline for the head only: a client that opens a connection
+                    // and dribbles bytes must not hold the slot open indefinitely.
+                    // (C# 5 forbids awaiting inside a catch, so the timeout is handled
+                    // after the try with a flag.)
+                    string head;
+                    bool headTimedOut = false;
+                    using (var headCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                    {
+                        headCts.CancelAfter(HeadReadTimeoutMs);
+                        try
+                        {
+                            head = await reader.ReadHeadAsync(headCts.Token).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            if (ct.IsCancellationRequested) return;
+                            headTimedOut = true;
+                            head = null;
+                        }
+                    }
+                    if (headTimedOut)
+                    {
+                        try { await WriteSimpleAsync(ns, 408, "Request Timeout", ct).ConfigureAwait(false); }
+                        catch { }
+                        return;
+                    }
                     if (head == null) return;
                     string requestLine = head.Length > 0 ? head : "";
                     int nl = requestLine.IndexOf("\r\n", StringComparison.Ordinal);
@@ -174,21 +261,53 @@ namespace TrFileTransfer
                     string tArg;
                     args.TryGetValue("t", out tArg);
 
-                    // Token gate: every real response requires ?t=<token> when set
-                    if (_token.Length > 0 && tArg != _token)
+                    // Token gate: a valid session = cookie t=<token> (set on the code
+                    // form's first success) or the legacy ?t=<token> query (kept for
+                    // bookmarks and scripted clients). Everything else gets the form.
+                    if (_token.Length > 0)
                     {
-                        // Drain the request body first — closing mid-upload resets
-                        // the connection under the client before it reads the reply
-                        string clenGate;
-                        if (method == "POST" && headers.TryGetValue("Content-Length", out clenGate))
+                        // A locked-out IP is refused before any token comparison, so a
+                        // brute-force loop cannot keep guessing (it gets 429, not a hint).
+                        if (IsAuthLockedOut(peer))
                         {
-                            long bodyLen;
-                            if (long.TryParse(clenGate, out bodyLen) && bodyLen > 0 && bodyLen <= MaxUploadBytes)
-                                await reader.DiscardAsync(bodyLen, ct).ConfigureAwait(false);
+                            await WriteBytesAsync(ns, "429 Too Many Requests", "text/plain; charset=utf-8",
+                                Encoding.UTF8.GetBytes("Too many wrong codes. Try again later.\r\n"), ct).ConfigureAwait(false);
+                            return;
                         }
-                        await WriteBytesAsync(ns, "200 OK", "text/html; charset=utf-8",
-                            BuildTokenForm(tArg == ""), ct).ConfigureAwait(false);
-                        return;
+
+                        bool cookieOk = TokenEquals(TokenFromCookie(headers));
+                        bool queryOk = TokenEquals(tArg);
+                        if (!cookieOk && !queryOk)
+                        {
+                            // Drain the request body first — closing mid-upload resets
+                            // the connection under the client before it reads the reply
+                            string clenGate;
+                            if (method == "POST" && headers.TryGetValue("Content-Length", out clenGate))
+                            {
+                                long bodyLen;
+                                if (long.TryParse(clenGate, out bodyLen) && bodyLen > 0 && bodyLen <= MaxUploadBytes)
+                                    await reader.DiscardAsync(bodyLen, ct).ConfigureAwait(false);
+                            }
+                            // Only a real attempt (a token was actually presented) counts
+                            // as a failure; a plain first visit stays clean.
+                            if (!string.IsNullOrEmpty(tArg) || !string.IsNullOrEmpty(TokenFromCookie(headers)))
+                                NoteAuthFailure(peer);
+                            // Only a real attempt (a t= parameter was present) gets the
+                            // red "wrong code" hint — first visits stay clean
+                            await WriteBytesAsync(ns, "200 OK", "text/html; charset=utf-8",
+                                BuildTokenForm(tArg != null), ct).ConfigureAwait(false);
+                            return;
+                        }
+                        NoteAuthSuccess(peer);
+                        if (queryOk && !cookieOk && method == "GET")
+                        {
+                            // Valid code just submitted (the form is a GET) — park it in
+                            // a cookie and bounce to the same page without the token
+                            // riding the URL. POSTs fall through: a redirect would eat
+                            // the multipart body, and scripted uploads keep ?t= working.
+                            await WriteRedirectAsync(ns, BuildTokenlessPath(path, query), _token, ct).ConfigureAwait(false);
+                            return;
+                        }
                     }
 
                     if (method == "POST")
@@ -368,6 +487,101 @@ namespace TrFileTransfer
             return result;
         }
 
+        /// <summary>Value of the "t" cookie from a Cookie header, or null.</summary>
+        private static string TokenFromCookie(Dictionary<string, string> headers)
+        {
+            string cookies;
+            if (!headers.TryGetValue("Cookie", out cookies)) return null;
+            foreach (string part in cookies.Split(';'))
+            {
+                int eq = part.IndexOf('=');
+                if (eq <= 0) continue;
+                if (part.Substring(0, eq).Trim() == "t")
+                    return part.Substring(eq + 1).Trim();
+            }
+            return null;
+        }
+
+        /// <summary>Constant-time code comparison (null never matches).</summary>
+        private bool TokenEquals(string candidate)
+        {
+            if (string.IsNullOrEmpty(candidate) || _token.Length == 0) return false;
+            return Utils.ConstantTimeEquals(Encoding.UTF8.GetBytes(candidate), Encoding.UTF8.GetBytes(_token));
+        }
+
+        /// <summary>True when this peer IP has exhausted its wrong-code allowance.</summary>
+        private bool IsAuthLockedOut(string peer)
+        {
+            if (string.IsNullOrEmpty(peer)) return false;
+            lock (_authLock)
+            {
+                DateTime until;
+                if (!_authLockedUntil.TryGetValue(peer, out until)) return false;
+                if (DateTime.UtcNow >= until)
+                {
+                    _authLockedUntil.Remove(peer);
+                    _authFailures.Remove(peer);
+                    return false;
+                }
+                return true;
+            }
+        }
+
+        private void NoteAuthFailure(string peer)
+        {
+            if (string.IsNullOrEmpty(peer)) return;
+            lock (_authLock)
+            {
+                int n;
+                _authFailures.TryGetValue(peer, out n);
+                n++;
+                _authFailures[peer] = n;
+                if (n >= MaxAuthFailures)
+                {
+                    _authLockedUntil[peer] = DateTime.UtcNow + AuthLockoutDuration;
+                    var handler = OnLog;
+                    if (handler != null)
+                        handler("[HTTP] " + peer + " locked out after " + n + " wrong access codes");
+                }
+            }
+        }
+
+        private void NoteAuthSuccess(string peer)
+        {
+            if (string.IsNullOrEmpty(peer)) return;
+            lock (_authLock)
+            {
+                _authFailures.Remove(peer);
+                _authLockedUntil.Remove(peer);
+            }
+        }
+
+        /// <summary>The same path/query minus the t= parameter.</summary>
+        private static string BuildTokenlessPath(string path, string query)
+        {
+            if (query.Length == 0) return path;
+            var kept = new StringBuilder();
+            string[] pairs = query.Split('&');
+            for (int i = 0; i < pairs.Length; i++)
+            {
+                if (pairs[i].Length == 0) continue;
+                if (pairs[i] == "t" || pairs[i].StartsWith("t=", StringComparison.Ordinal)) continue;
+                kept.Append(kept.Length > 0 ? "&" : "").Append(pairs[i]);
+            }
+            return kept.Length == 0 ? path : path + "?" + kept;
+        }
+
+        /// <summary>303 that also plants the access-code cookie (HttpOnly so page
+        /// scripts can never read it; SameSite=Strict pins it to this share).</summary>
+        private static async Task WriteRedirectAsync(NetworkStream ns, string location, string token, CancellationToken ct)
+        {
+            byte[] resp = Encoding.ASCII.GetBytes(
+                "HTTP/1.1 303 See Other\r\nLocation: " + location +
+                "\r\nSet-Cookie: t=" + token + "; Path=/; HttpOnly; SameSite=Strict" +
+                "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            await ns.WriteAsync(resp, 0, resp.Length, ct).ConfigureAwait(false);
+        }
+
         // ---- Upload (multipart/form-data POST) ----
 
         /// <summary>
@@ -441,7 +655,13 @@ namespace TrFileTransfer
                     continue;
                 }
 
+                // Reduce to a bare file name and neutralize reserved device names
+                // (CON/NUL/…) plus trailing dots/spaces — same rules the transfer
+                // receivers apply; a crafted upload must never open a device.
                 string bareName = Path.GetFileName(filename.Replace('/', '\\'));
+                bareName = bareName.TrimEnd('.', ' ');
+                if (Utils.IsReservedFileName(bareName))
+                    bareName = "_" + bareName;
                 if (string.IsNullOrWhiteSpace(bareName) || bareName == "_")
                 {
                     // No usable name — stream the content to null and continue
@@ -452,16 +672,33 @@ namespace TrFileTransfer
 
                 string dir = ResolveSafe(uploadRel);
                 if (dir == null) dir = _rootFull;
+                // Same pre-flight the file receivers use — fail with 507 instead of
+                // dying mid-upload when the disk cannot hold the announced body
+                if (!Utils.HasFreeSpaceFor(dir, contentLength))
+                {
+                    await WriteSimpleAsync(ns, 507, "Insufficient Storage", ct).ConfigureAwait(false);
+                    return;
+                }
                 string savePath = Utils.GetUniqueSavePath(dir, bareName);
 
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 using (var fs = new FileStream(savePath, FileMode.Create, FileAccess.Write,
                     FileShare.None, 65536, FileOptions.SequentialScan))
                 {
-                    if (!await ReadUntilAsync(reader, midDelim, fs, contentLength, ct).ConfigureAwait(false))
+                    // Cap THIS file, not just the whole request: one part must not be
+                    // able to stream up to the 4 GB request cap into a single file.
+                    long perFile = Math.Min(MaxUploadFileBytes, contentLength);
+                    if (!await ReadUntilAsync(reader, midDelim, fs, perFile, ct).ConfigureAwait(false))
                         throw new IOException("upload part truncated");
                 }
                 sw.Stop();
+                if (filesBytes + new FileInfo(savePath).Length > MaxUploadBytes)
+                {
+                    // Aggregate request cap exceeded — undo this file and refuse.
+                    try { File.Delete(savePath); } catch { }
+                    await WriteSimpleAsync(ns, 413, "File Too Large", ct).ConfigureAwait(false);
+                    return;
+                }
                 files++;
                 long size = new FileInfo(savePath).Length;
                 filesBytes += size;
@@ -499,15 +736,30 @@ namespace TrFileTransfer
         /// <summary>Extracts name=/filename= from a Content-Disposition header line.
         /// No backslash unescaping: browsers send raw names (old IE sends full paths,
         /// where "\" is a separator to strip), and escaping would corrupt path stripping
-        /// ("..\..\x" would become "....x"). Callers must still strip path segments.</summary>
+        /// ("..\..\x" would become "....x"). The key must start at a token boundary —
+        /// otherwise the "name=" search would match the tail of "filename=". Callers
+        /// must still strip path segments.</summary>
         private static string ExtractDispositionValue(string partHead, string key)
         {
-            int idx = partHead.IndexOf(key + "=\"", StringComparison.OrdinalIgnoreCase);
-            if (idx < 0) return "";
-            int start = idx + key.Length + 2;
-            int end = partHead.IndexOf('"', start);
-            if (end < 0) end = partHead.Length;
-            return partHead.Substring(start, end - start);
+            int idx = 0;
+            while (true)
+            {
+                idx = partHead.IndexOf(key + "=\"", idx, StringComparison.OrdinalIgnoreCase);
+                if (idx < 0) return "";
+                if (idx > 0)
+                {
+                    char prev = partHead[idx - 1];
+                    if (prev != ';' && prev != ',' && prev != ' ' && prev != '\t' && prev != '\r' && prev != '\n')
+                    {
+                        idx++; // matched inside another attribute name — keep looking
+                        continue;
+                    }
+                }
+                int start = idx + key.Length + 2;
+                int end = partHead.IndexOf('"', start);
+                if (end < 0) end = partHead.Length;
+                return partHead.Substring(start, end - start);
+            }
         }
 
         private static Dictionary<string, string> ParseQuery(string query)
@@ -610,7 +862,10 @@ namespace TrFileTransfer
                 Encoding.UTF8.GetBytes(sb.ToString()), ct).ConfigureAwait(false);
         }
 
-        /// <summary>Re-attaches the token (plus any unrelated params) to listing links.</summary>
+        /// <summary>Carries unrelated params over to listing links. The access token is
+        /// deliberately NOT re-attached: the authenticated session lives in the HttpOnly
+        /// cookie, and re-emitting t= in every href would leak the credential into
+        /// browser history, Referer headers and shared links — defeating the cookie.</summary>
         private static string AppendToken(string rawQuery)
         {
             var kept = new StringBuilder();
@@ -619,7 +874,9 @@ namespace TrFileTransfer
             {
                 if (pairs[i].Length == 0) continue;
                 if (pairs[i].StartsWith("p=", StringComparison.Ordinal) ||
-                    pairs[i].StartsWith("f=", StringComparison.Ordinal)) continue;
+                    pairs[i].StartsWith("f=", StringComparison.Ordinal) ||
+                    pairs[i] == "t" ||
+                    pairs[i].StartsWith("t=", StringComparison.Ordinal)) continue;
                 kept.Append("&").Append(pairs[i]);
             }
             return kept.ToString();
@@ -693,7 +950,11 @@ namespace TrFileTransfer
         {
             byte[] head = Encoding.ASCII.GetBytes(
                 "HTTP/1.1 " + status + "\r\nContent-Type: " + contentType +
-                "\r\nContent-Length: " + body.Length + "\r\nConnection: close\r\n\r\n");
+                "\r\nContent-Length: " + body.Length + "\r\nConnection: close\r\n" +
+                // This share renders attacker-influenced names; do not cache and do not
+                // let another origin frame it (clickjacking on the upload form).
+                "Cache-Control: no-store\r\nX-Frame-Options: DENY\r\n" +
+                "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\n\r\n");
             await ns.WriteAsync(head, 0, head.Length, ct).ConfigureAwait(false);
             await ns.WriteAsync(body, 0, body.Length, ct).ConfigureAwait(false);
         }

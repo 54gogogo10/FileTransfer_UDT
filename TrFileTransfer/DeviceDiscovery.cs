@@ -117,7 +117,14 @@ namespace TrFileTransfer
                     }
                 }
                 catch (ObjectDisposedException) { break; }
-                catch (SocketException) { break; }
+                catch (SocketException)
+                {
+                    // On Windows a UDP socket gets poisoned by ICMP port-unreachable
+                    // (ConnectionReset) after replying to a probe sender that already
+                    // vanished — the next ReceiveAsync throws. Keep serving; only a
+                    // real teardown (Stop → ObjectDisposedException) ends the loop.
+                    if (ct.IsCancellationRequested) break;
+                }
                 catch (Exception) { if (ct.IsCancellationRequested) break; }
             }
         }

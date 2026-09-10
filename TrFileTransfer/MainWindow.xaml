@@ -132,6 +132,8 @@
                         <local:NumericBox x:Name="_numHttpPort" Width="84" Min="1" Max="65535" VerticalAlignment="Center"/>
                         <Button x:Name="_btnHttpShare" Style="{StaticResource BtnSecondary}" MinWidth="76"
                                 Margin="8,0,0,0" Click="BtnHttpShare_Click"/>
+                        <Button x:Name="_btnShareQr" Style="{StaticResource BtnSecondary}" MinWidth="76"
+                                Margin="8,0,0,0" IsEnabled="False" Click="BtnShareQr_Click"/>
                         <Rectangle Width="1" Height="18" RadiusX="0.5" RadiusY="0.5"
                                    Fill="{DynamicResource Brush.CardBorder}" VerticalAlignment="Center" Margin="12,0"/>
                         <CheckBox x:Name="_chkPairing" Style="{StaticResource ChkBox}" Margin="0,0,0,0"
@@ -270,9 +272,10 @@
                                 Click="BtnSendText_Click"/>
                     </StackPanel>
 
-                    <!-- Security options: encryption (with pairing) + auto resume retry -->
+                    <!-- Security options: encryption/compression (with pairing) + auto resume retry -->
                     <StackPanel Grid.Row="6" Orientation="Horizontal" Margin="0,8,0,0">
                         <CheckBox x:Name="_chkEncrypt" Style="{StaticResource ChkBox}" Margin="0,0,16,0"/>
+                        <CheckBox x:Name="_chkCompress" Style="{StaticResource ChkBox}" Margin="0,0,16,0"/>
                         <CheckBox x:Name="_chkAutoRetry" Style="{StaticResource ChkBox}"/>
                     </StackPanel>
                 </Grid>

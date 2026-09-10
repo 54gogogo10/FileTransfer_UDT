@@ -46,12 +46,37 @@ namespace TrFileTransfer
             Version v;
             try { v = new Version(version); }
             catch { return null; }
-            if (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
-                !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-                return null;
+            if (!IsSecureUpdateUrl(url)) return null;
             if (!IsHex64(sha)) return null;
 
             return new UpdateManifest { Version = v, Url = url, Sha256Hex = sha, Notes = notes ?? "" };
+        }
+
+        /// <summary>True when the update URL is safe to trust: https anywhere, or plain
+        /// http only for a loopback host (local testing). The SHA256 is fetched from the
+        /// same origin as the binary, so over plain http a LAN attacker could serve both
+        /// a malicious exe and its matching hash; requiring https for real hosts removes
+        /// that whole class of attack.</summary>
+        public static bool IsSecureUpdateUrl(string url)
+        {
+            if (string.IsNullOrEmpty(url)) return false;
+            Uri uri;
+            if (!Uri.TryCreate(url, UriKind.Absolute, out uri)) return false;
+            if (uri.Scheme == Uri.UriSchemeHttps) return true;
+            if (uri.Scheme != Uri.UriSchemeHttp) return false;
+            return IsLoopbackHost(uri.Host);
+        }
+
+        private static bool IsLoopbackHost(string host)
+        {
+            if (string.IsNullOrEmpty(host)) return false;
+            if (string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase)) return true;
+            UriHostNameType t;
+            System.Net.IPAddress addr;
+            if (System.Net.IPAddress.TryParse(host, out addr))
+                return System.Net.IPAddress.IsLoopback(addr);
+            t = Uri.CheckHostName(host);
+            return t == UriHostNameType.IPv6 && host == "::1";
         }
 
         private static bool IsHex64(string s)
@@ -97,6 +122,8 @@ namespace TrFileTransfer
                 idx++;
             }
             if (tag == null || exeUrl == null) return null;
+            // GitHub asset URLs are https; reject a downgraded one defensively
+            if (!IsSecureUpdateUrl(exeUrl)) return null;
 
             tag = tag.TrimStart('v', 'V');
             Version v;
@@ -201,6 +228,11 @@ namespace TrFileTransfer
         /// </summary>
         public static Task<UpdateManifest> CheckAnyAsync(string url, int timeoutMs)
         {
+            // Refuse to even talk to an insecure update source (plain http on a real
+            // host): a MITM there controls both the manifest and the hash it names.
+            if (!UpdateManifest.IsSecureUpdateUrl(url))
+                throw new InvalidDataException(
+                    "insecure update URL (use https, or http only for localhost): " + url);
             if (url.IndexOf("api.github.com", StringComparison.OrdinalIgnoreCase) >= 0)
                 return CheckGitHubAsync(url, timeoutMs);
             return CheckAsync(url, timeoutMs);
@@ -289,11 +321,15 @@ namespace TrFileTransfer
         public static Task DownloadAsync(UpdateManifest manifest, string destPath,
             Action<long, long> progress, int timeoutMs)
         {
+            if (!UpdateManifest.IsSecureUpdateUrl(manifest.Url))
+                throw new InvalidDataException("insecure update asset URL: " + manifest.Url);
             return Task.Run(delegate
             {
                 string dir = Path.GetDirectoryName(destPath);
                 if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-                string tmp = destPath + ".part";
+                // Unique per download: two app instances updating at once must not
+                // fight over one staging file (truncation / wrong binary applied).
+                string tmp = destPath + "." + Guid.NewGuid().ToString("N") + ".part";
                 try
                 {
                     using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
@@ -313,6 +349,10 @@ namespace TrFileTransfer
                 }
             });
         }
+
+        /// <summary>Hard cap for anything buffered in memory (manifests, GitHub API
+        /// documents) — a hostile update URL must not be able to OOM the process.</summary>
+        private const long MaxMetaBytes = 8L * 1024 * 1024;
 
         private static void HttpGetToStream(string url, int timeoutMs, Action<long, long> progress, Stream dest)
         {
@@ -338,6 +378,10 @@ namespace TrFileTransfer
                     {
                         dest.Write(buf, 0, n);
                         read += n;
+                        // Only metadata callers pass a null progress callback; the exe
+                        // download (streamed to disk, hash-verified) is unbounded
+                        if (progress == null && read > MaxMetaBytes)
+                            throw new InvalidDataException("update document exceeds " + MaxMetaBytes + " bytes: " + url);
                         if (progress != null) progress(read, total);
                     }
                 }
@@ -352,6 +396,22 @@ namespace TrFileTransfer
         /// </summary>
         public static void Apply(string stagedPath, string targetPath)
         {
+            Apply(stagedPath, targetPath, null);
+        }
+
+        /// <summary>Same as Apply, but re-verifies the staged file's SHA256 immediately
+        /// before swapping it in. Closes the window between download-time verification
+        /// and apply: another local process could otherwise replace the staged exe in
+        /// between. Pass null to skip (kept for callers that already verified).</summary>
+        public static void Apply(string stagedPath, string targetPath, string expectedSha256Hex)
+        {
+            if (!string.IsNullOrEmpty(expectedSha256Hex))
+            {
+                string actual = ComputeSha256Hex(stagedPath);
+                if (!string.Equals(actual, expectedSha256Hex, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("staged update no longer matches its hash");
+            }
+
             string backup = targetPath + ".old";
             if (File.Exists(backup)) File.Delete(backup);
             File.Move(targetPath, backup);

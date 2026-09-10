@@ -149,6 +149,10 @@ namespace TrFileTransfer
         public Action Complete;
         public Action<string, long> FileReceived;
         public Action<string> TextReceived;
+        /// <summary>True when the transport's completion verdict arrives as a byte on the
+        /// wire stream (TCP) rather than out-of-band (UDT's 1-byte app ACK). ClientWire
+        /// reads the stream only in the former case.</summary>
+        public bool CompletionAckOnStream = true;
 
         public void RaiseLog(string msg) { var h = Log; if (h != null) h(msg); }
         public void RaiseProgress(TransferProgress p) { var h = Progress; if (h != null) h(p); }
@@ -183,6 +187,8 @@ namespace TrFileTransfer
         public long Bytes;
         public int Files;
         public bool Encrypted;
+        /// <summary>True when the 0x08 compression prelude was accepted for the connection.</summary>
+        public bool Compressed;
         public bool Rejected;
         /// <summary>Display name of the transfer (file or folder name) — first one wins.</summary>
         public string Detail;
@@ -221,10 +227,29 @@ namespace TrFileTransfer
             = new ConcurrentDictionary<string, ChunkTracker>();
         public ConcurrentDictionary<Guid, ResumeState> ResumeStates
             = new ConcurrentDictionary<Guid, ResumeState>();
+        /// <summary>One mutex per resume session: a second connection carrying the same
+        /// sessionId must not share the first one's write stream — that interleaves
+        /// offsets and corrupts both the file and the persisted checkpoint.</summary>
+        public ConcurrentDictionary<Guid, System.Threading.SemaphoreSlim> ResumeLocks
+            = new ConcurrentDictionary<Guid, System.Threading.SemaphoreSlim>();
+        /// <summary>Consecutive pairing failures per peer IP. The pairing code is only
+        /// 6 digits, so without a cap a LAN peer can brute-force it with cheap 0x05/0x07
+        /// frames; after MaxAuthFailures the peer is locked out until it authenticates
+        /// successfully (or the server restarts).</summary>
+        public ConcurrentDictionary<string, int> AuthFailures
+            = new ConcurrentDictionary<string, int>();
+        /// <summary>Pairing failures allowed per peer IP before lockout. 0 disables.</summary>
+        public int MaxAuthFailures = 10;
         /// <summary>Statistics for the CURRENT connection (set by BeginSession).</summary>
         public WireSessionStats Session;
         /// <summary>True when BeginSession redirected SaveDirectory into a per-device folder.</summary>
         public bool PerDeviceApplied;
+        /// <summary>True for transports whose sender would otherwise never learn the
+        /// receiver's verdict (TCP): after a 0x00/0x01/0x06 transfer the server writes
+        /// one status byte through the live stream (0x01 accepted, 0x00 refused) so a
+        /// rejected transfer is not reported as a success. UDT has its own out-of-band
+        /// ACK, so its server leaves this false and the wire format is unchanged.</summary>
+        public bool CompletionAck;
 
         /// <summary>Persists incomplete resume sessions and disposes trackers (called from server Stop).</summary>
         public void Shutdown()
@@ -235,18 +260,32 @@ namespace TrFileTransfer
             }
             ChunkTrackers.Clear();
 
-            // Persist incomplete resume states before releasing file handles
+            // Persist incomplete resume states before releasing file handles.
+            // Each step is guarded separately: a Flush/Save hiccup (it races the
+            // handler thread's in-flight WriteAsync) must NOT skip the Dispose —
+            // a leaked write handle keeps FileShare.None locked, and the next
+            // server run's restore-open fails and discards the checkpoint.
             foreach (var kv in ResumeStates)
             {
-                try
-                {
-                    if (kv.Value.WriteStream != null) kv.Value.WriteStream.Flush();
-                    ServerResumeStore.Save(kv.Value);
-                    if (kv.Value.WriteStream != null) { kv.Value.WriteStream.Dispose(); kv.Value.WriteStream = null; }
-                }
+                ResumeState st = kv.Value;
+                try { if (st.WriteStream != null) st.WriteStream.Flush(); }
                 catch { }
+                try { ServerResumeStore.Save(st); }
+                catch { }
+                if (st.WriteStream != null)
+                {
+                    try { st.WriteStream.Dispose(); }
+                    catch { }
+                    st.WriteStream = null;
+                }
             }
             ResumeStates.Clear();
+
+            foreach (var kv in ResumeLocks)
+            {
+                try { kv.Value.Dispose(); } catch { }
+            }
+            ResumeLocks.Clear();
         }
     }
 
@@ -259,6 +298,8 @@ namespace TrFileTransfer
     {
         /// <summary>Maximum payload size for a 0x06 text message (1 MB of UTF-8 bytes).</summary>
         public const int MaxTextBytes = 1048576;
+        /// <summary>Upper bound on the file count in a folder manifest (0x01/0x04).</summary>
+        public const int MaxFolderFileCount = 1000000;
 
         /// <summary>Single-line preview of a text message for logs and balloon tips.</summary>
         public static string Preview(string text)
@@ -308,6 +349,14 @@ namespace TrFileTransfer
             // connection must share the parent's dictionaries
             clone.ChunkTrackers = ctx.ChunkTrackers;
             clone.ResumeStates = ctx.ResumeStates;
+            // Per-session mutexes must also be process-wide, or two connections could
+            // each take their own copy of the "same" lock and still share a FileStream.
+            clone.ResumeLocks = ctx.ResumeLocks;
+            // Pairing-failure counters are process-wide (per peer IP, across connections)
+            clone.AuthFailures = ctx.AuthFailures;
+            clone.MaxAuthFailures = ctx.MaxAuthFailures;
+            // Transport-selected: TCP needs the sender to read the verdict byte.
+            clone.CompletionAck = ctx.CompletionAck;
             clone.Cb = scb;
             clone.Session = stats;
 
@@ -370,32 +419,104 @@ namespace TrFileTransfer
             IWireStream active = s;
             try
             {
-                // Optional 0x07 encrypted pairing (preferred over 0x05 when the client encrypts)
-                if (transferType == 0x07)
+                // Prelude frames, in any mix the client chose: 0x05 pairing, 0x08
+                // compression (wraps the stream), 0x07 encryption (wraps again —
+                // wire order is encrypt(compress(plain))). A hostile client could
+                // otherwise stack unlimited decorators (each 0x08 adds a nested
+                // decompressor) — cap the prelude length.
+                bool authSeen = false;
+                const int MaxPreludeFrames = 8;
+                int preludeFrames = 0;
+                while (true)
                 {
-                    IWireStream enc = await HandleEncryptedAuthAsync(s, ctx, ct).ConfigureAwait(false);
-                    if (enc == null)
-                        return outcome; // rejected — outcome.Rejected was flagged via Session
-                    active = enc;
-                    await active.ReadExactAsync(typeBuf, 0, 1, ct).ConfigureAwait(false);
-                    transferType = typeBuf[0];
-                }
-                else if (transferType == 0x05)
-                {
-                    if (!await HandleAuthAsync(active, ctx, ct).ConfigureAwait(false))
+                    if (transferType == 0x07)
                     {
-                        outcome.Rejected = true;
-                        return outcome;
+                        if (++preludeFrames > MaxPreludeFrames)
+                        {
+                            ctx.Cb.RaiseLog(L.S_InvalidHeader(transferType, preludeFrames));
+                            return outcome;
+                        }
+                        IWireStream enc = await HandleEncryptedAuthAsync(active, ctx, ct).ConfigureAwait(false);
+                        if (enc == null)
+                            return outcome; // rejected — outcome.Rejected was flagged via Session
+                        active = enc;
+                        authSeen = true;
+                    }
+                    else if (transferType == 0x05)
+                    {
+                        if (++preludeFrames > MaxPreludeFrames)
+                        {
+                            ctx.Cb.RaiseLog(L.S_InvalidHeader(transferType, preludeFrames));
+                            return outcome;
+                        }
+                        if (!await HandleAuthAsync(active, ctx, ct).ConfigureAwait(false))
+                        {
+                            outcome.Rejected = true;
+                            return outcome;
+                        }
+                        authSeen = true;
+                    }
+                    else if (transferType == 0x09)
+                    {
+                        if (++preludeFrames > MaxPreludeFrames)
+                        {
+                            ctx.Cb.RaiseLog(L.S_InvalidHeader(transferType, preludeFrames));
+                            return outcome;
+                        }
+                        IWireStream enc2 = await HandleEcdhAuthAsync(active, ctx, ct).ConfigureAwait(false);
+                        if (enc2 == null)
+                            return outcome; // rejected — Session.Rejected flagged
+                        active = enc2;
+                        authSeen = true;
+                    }
+                    else if (transferType == 0x08)
+                    {
+                        if (++preludeFrames > MaxPreludeFrames)
+                        {
+                            ctx.Cb.RaiseLog(L.S_InvalidHeader(transferType, preludeFrames));
+                            return outcome;
+                        }
+                        // Compression must not be negotiated before authentication: an
+                        // unauthenticated peer could otherwise stack decompressors and
+                        // force large per-segment allocations (attacker-declared length,
+                        // up to the 64 MB cap) on a server that requires pairing.
+                        // Clients with a code always authenticate first, so this is not
+                        // reachable for well-behaved peers.
+                        if (!authSeen && !string.IsNullOrEmpty(ctx.PairingCode))
+                        {
+                            ctx.Cb.RaiseLog(L.S_InvalidHeader(transferType, preludeFrames));
+                            outcome.Rejected = true;
+                            return outcome;
+                        }
+                        active = await HandleCompressionOfferAsync(active, ctx, ct).ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        break;
                     }
                     await active.ReadExactAsync(typeBuf, 0, 1, ct).ConfigureAwait(false);
                     transferType = typeBuf[0];
                 }
-                else if (!string.IsNullOrEmpty(ctx.PairingCode))
+
+                if (!authSeen && !string.IsNullOrEmpty(ctx.PairingCode))
                 {
                     // Server requires pairing — reject clients that skip authentication
                     await SendAuthResponse(active, 1, ct).ConfigureAwait(false);
                     ctx.Cb.RaiseLog(L.S_AuthRequired);
                     ctx.Cb.RaiseError(L.S_AuthRequired);
+                    outcome.Rejected = true;
+                    return outcome;
+                }
+
+                // Reject unknown transfer types explicitly. Without this the final
+                // `return` below parses any unrecognized byte as a 0x00 single-file
+                // header, which is confusing and lets a stray type byte look like a
+                // legitimate transfer.
+                if (transferType != 0x00 && transferType != 0x01 && transferType != 0x02 &&
+                    transferType != 0x03 && transferType != 0x04 && transferType != 0x06)
+                {
+                    ctx.Cb.RaiseLog(L.S_InvalidHeader(transferType, 0));
+                    ctx.Cb.RaiseError(L.S_InvalidHeader(transferType, 0));
                     outcome.Rejected = true;
                     return outcome;
                 }
@@ -406,8 +527,17 @@ namespace TrFileTransfer
                     try { Directory.CreateDirectory(ctx.SaveDirectory); } catch { }
                 }
 
+                // 0x00/0x01/0x06 have no other way for the sender to learn the verdict.
+                // On TCP the server writes one status byte through the live (possibly
+                // decorated) stream: 0x01 accepted, 0x00 refused. On UDT CompletionAck
+                // is false — the transport sends its own out-of-band ACK/NACK and the
+                // wire format stays byte-identical.
                 if (transferType == 0x01)
-                    return UpdateOutcome(outcome, await HandleFolderTransfer(active, ctx, ct).ConfigureAwait(false));
+                {
+                    bool okFolder = await HandleFolderTransfer(active, ctx, ct).ConfigureAwait(false);
+                    if (ctx.CompletionAck) await WriteCompletionAck(active, okFolder, ct).ConfigureAwait(false);
+                    return UpdateOutcome(outcome, okFolder);
+                }
                 if (transferType == 0x02)
                 {
                     outcome.IsChunked = true;
@@ -418,8 +548,14 @@ namespace TrFileTransfer
                 if (transferType == 0x04)
                     return UpdateOutcome(outcome, await HandleFolderResumableAsync(active, ctx, ct).ConfigureAwait(false));
                 if (transferType == 0x06)
-                    return UpdateOutcome(outcome, await HandleTextMessage(active, ctx, ct).ConfigureAwait(false));
-                return UpdateOutcome(outcome, await HandleFileTransfer(active, ctx, ct).ConfigureAwait(false));
+                {
+                    bool okText = await HandleTextMessage(active, ctx, ct).ConfigureAwait(false);
+                    if (ctx.CompletionAck) await WriteCompletionAck(active, okText, ct).ConfigureAwait(false);
+                    return UpdateOutcome(outcome, okText);
+                }
+                bool okFile = await HandleFileTransfer(active, ctx, ct).ConfigureAwait(false);
+                if (ctx.CompletionAck) await WriteCompletionAck(active, okFile, ct).ConfigureAwait(false);
+                return UpdateOutcome(outcome, okFile);
             }
             finally
             {
@@ -432,6 +568,21 @@ namespace TrFileTransfer
         {
             outcome.Success = success;
             return outcome;
+        }
+
+        /// <summary>TCP completion verdict for 0x00/0x01/0x06: one byte the client
+        /// blocks on (0x01 = accepted, 0x00 = refused). Best-effort — a failure here
+        /// means the connection is already gone, which the client sees as no ACK.</summary>
+        private static async Task WriteCompletionAck(IWireStream s, bool ok, CancellationToken ct)
+        {
+            var buf = new byte[1];
+            buf[0] = ok ? (byte)0x01 : (byte)0x00;
+            try
+            {
+                await s.WriteExactAsync(buf, 0, 1, ct).ConfigureAwait(false);
+            }
+            catch (IOException) { }
+            catch (ObjectDisposedException) { }
         }
 
         /// <summary>Receive-confirmation gate. Runs the context's ConfirmRequest delegate
@@ -449,9 +600,12 @@ namespace TrFileTransfer
             {
                 ok = await gate(ip, name, size, fileCount, isFolder).ConfigureAwait(false);
             }
-            catch
+            catch (Exception ex)
             {
-                ok = true; // a broken gate must not wedge every transfer
+                // The gate is the receive-confirmation security control: on failure it
+                // must deny, not silently allow. The log keeps a broken gate diagnosable.
+                ok = false;
+                ctx.Cb.RaiseLog(L.S_ConfirmGateError(ex.Message));
             }
             if (ok)
             {
@@ -487,23 +641,61 @@ namespace TrFileTransfer
                 return s;
             }
 
+            string legacyPeer = ctx.Session != null ? ctx.Session.Peer : null;
+            if (AuthLockedOut(ctx, legacyPeer))
+            {
+                await SendEncAuthResponse(s, 1, ct).ConfigureAwait(false);
+                ctx.Cb.RaiseLog(L.S_AuthLockedOut(legacyPeer));
+                if (ctx.Session != null) ctx.Session.Rejected = true;
+                return null;
+            }
+
             byte[] codeHash = WireAuth.HashCode(ctx.PairingCode);
             if (!Utils.ConstantTimeEquals(hashBuf, codeHash))
             {
+                NoteAuthFailure(ctx, legacyPeer);
                 await SendEncAuthResponse(s, 1, ct).ConfigureAwait(false);
                 ctx.Cb.RaiseLog(L.S_AuthFailed);
                 ctx.Cb.RaiseError(L.S_AuthFailed);
                 if (ctx.Session != null) ctx.Session.Rejected = true;
                 return null;
             }
+            NoteAuthSuccess(ctx, legacyPeer);
 
             await SendEncAuthResponse(s, 0, ct).ConfigureAwait(false);
             byte[] c2sEnc, c2sMac, s2cEnc, s2cMac;
             SessionCrypto.DeriveSessionKeys(codeHash, salt, out c2sEnc, out c2sMac, out s2cEnc, out s2cMac);
             if (ctx.Session != null) ctx.Session.Encrypted = true;
             ctx.Cb.RaiseLog(L.S_EncryptedOn);
-            // The server sends with the s2c keys and receives with the c2s keys
-            return new EncryptedWireStream(s, s2cEnc, s2cMac, c2sEnc, c2sMac);
+            // Legacy 0x07: the session key is derived from the pairing-code hash the
+            // client just sent in the clear, so this only protects against a passive
+            // eavesdropper who missed the handshake. Warn so operators upgrade.
+            ctx.Cb.RaiseLog(L.S_LegacyCryptoWeak);
+            // The server sends with the s2c keys and receives with the c2s keys.
+            // ownsInner:false — the transport owns the socket and must keep it open to
+            // send its application-level ACK/NACK after this decorator is disposed.
+            return new EncryptedWireStream(s, s2cEnc, s2cMac, c2sEnc, c2sMac, false);
+        }
+
+        /// <summary>True when the peer has failed pairing too many times and is locked out.</summary>
+        private static bool AuthLockedOut(ServerWireContext ctx, string peer)
+        {
+            if (ctx.MaxAuthFailures <= 0 || string.IsNullOrEmpty(peer)) return false;
+            int n;
+            return ctx.AuthFailures.TryGetValue(peer, out n) && n >= ctx.MaxAuthFailures;
+        }
+
+        private static void NoteAuthFailure(ServerWireContext ctx, string peer)
+        {
+            if (ctx.MaxAuthFailures <= 0 || string.IsNullOrEmpty(peer)) return;
+            ctx.AuthFailures.AddOrUpdate(peer, 1, delegate (string k, int v) { return v + 1; });
+        }
+
+        private static void NoteAuthSuccess(ServerWireContext ctx, string peer)
+        {
+            if (string.IsNullOrEmpty(peer)) return;
+            int ignored;
+            ctx.AuthFailures.TryRemove(peer, out ignored);
         }
 
         private static async Task SendEncAuthResponse(IWireStream s, byte status, CancellationToken ct)
@@ -515,6 +707,140 @@ namespace TrFileTransfer
         }
 
         /// <summary>
+        /// Server side of the authenticated ECDH handshake (0x09). Wire:
+        ///   client → server: [0x09][codeHash 32][clientPub 72]
+        ///   server → client: [0x19][status 1][serverPub 72][confirmS 32]
+        ///   client → server: [confirmC 32]
+        /// status: 0 accepted, 1 code wrong (session key is then a random dummy so the
+        /// reply carries no information an attacker could use), 2 pairing disabled
+        /// (continue plaintext on the same connection). Returns the raw stream for
+        /// status 1/2; a wrapped EncryptedWireStream on success.
+        /// </summary>
+        private static async Task<IWireStream> HandleEcdhAuthAsync(IWireStream s, ServerWireContext ctx, CancellationToken ct)
+        {
+            var buf = new byte[32 + SessionCrypto.EcdhPublicBytes];
+            await s.ReadExactAsync(buf, 0, buf.Length, ct).ConfigureAwait(false);
+            var codeHash = new byte[32];
+            Buffer.BlockCopy(buf, 0, codeHash, 0, 32);
+            var clientPub = new byte[SessionCrypto.EcdhPublicBytes];
+            Buffer.BlockCopy(buf, 32, clientPub, 0, clientPub.Length);
+
+            string peer = ctx.Session != null ? ctx.Session.Peer : null;
+            if (string.IsNullOrEmpty(ctx.PairingCode))
+            {
+                await SendEcdhAuthResponse(s, 2, new byte[SessionCrypto.EcdhPublicBytes], new byte[32], ct).ConfigureAwait(false);
+                ctx.Cb.RaiseLog(L.S_EncryptUnsupported);
+                return s;
+            }
+
+            bool codeOk = !AuthLockedOut(ctx, peer)
+                && Utils.ConstantTimeEquals(codeHash, WireAuth.HashCode(ctx.PairingCode));
+            if (!codeOk && AuthLockedOut(ctx, peer))
+                ctx.Cb.RaiseLog(L.S_AuthLockedOut(peer));
+
+            byte[] serverPub;
+            byte[] authKey;
+            try
+            {
+                using (var serverKey = SessionCrypto.CreateEcdhKey())
+                {
+                    serverPub = SessionCrypto.EcdhPublicBlob(serverKey);
+                    byte[] shared = null;
+                    try { shared = SessionCrypto.EcdhDeriveShared(serverKey, clientPub); }
+                    catch { /* malformed peer blob — generate a dummy secret below */ }
+                    if (shared == null)
+                    {
+                        shared = new byte[32];
+                        using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create())
+                            rng.GetBytes(shared);
+                    }
+                    // Always derive a key (even on mismatch) so the rejection reply is
+                    // indistinguishable from a success reply except for the status byte.
+                    byte[] keyMaterial = codeOk ? SessionCrypto.DeriveAuthKey(ctx.PairingCode, clientPub, serverPub, shared) : null;
+                    if (keyMaterial == null)
+                    {
+                        keyMaterial = new byte[SessionCrypto.KeyBytes];
+                        using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create())
+                            rng.GetBytes(keyMaterial);
+                    }
+                    authKey = keyMaterial;
+
+                    byte[] confirmS = SessionCrypto.Confirm(authKey, "s2c-confirm", clientPub, serverPub);
+                    await SendEcdhAuthResponse(s, codeOk ? (byte)0 : (byte)1, serverPub, confirmS, ct).ConfigureAwait(false);
+
+                    if (!codeOk)
+                    {
+                        NoteAuthFailure(ctx, peer);
+                        ctx.Cb.RaiseLog(L.S_AuthFailed);
+                        ctx.Cb.RaiseError(L.S_AuthFailed);
+                        if (ctx.Session != null) ctx.Session.Rejected = true;
+                        return null;
+                    }
+
+                    // Client prove-it confirm
+                    var confirmC = new byte[32];
+                    await s.ReadExactAsync(confirmC, 0, 32, ct).ConfigureAwait(false);
+                    byte[] expected = SessionCrypto.Confirm(authKey, "c2s-confirm", clientPub, serverPub);
+                    if (!Utils.ConstantTimeEquals(confirmC, expected))
+                    {
+                        ctx.Cb.RaiseLog(L.S_EncHandshakeFailed);
+                        ctx.Cb.RaiseError(L.S_EncHandshakeFailed);
+                        if (ctx.Session != null) ctx.Session.Rejected = true;
+                        return null;
+                    }
+
+                    NoteAuthSuccess(ctx, peer);
+                    byte[] c2sEnc, c2sMac, s2cEnc, s2cMac;
+                    SessionCrypto.DeriveSessionKeys(authKey, new byte[SessionCrypto.SaltBytes], out c2sEnc, out c2sMac, out s2cEnc, out s2cMac);
+                    if (ctx.Session != null) ctx.Session.Encrypted = true;
+                    ctx.Cb.RaiseLog(L.S_EncryptedOn);
+                    // ownsInner:false — the transport sends its own ACK/NACK afterwards.
+                    // bindSequence:true — 0x09 peers use the sequence-bound segment format.
+                    return new EncryptedWireStream(s, s2cEnc, s2cMac, c2sEnc, c2sMac, false, true);
+                }
+            }
+            catch (IOException)
+            {
+                ctx.Cb.RaiseLog(L.S_EncHandshakeFailed);
+                if (ctx.Session != null) ctx.Session.Rejected = true;
+                return null;
+            }
+        }
+
+        private static async Task SendEcdhAuthResponse(IWireStream s, byte status, byte[] serverPub, byte[] confirmS, CancellationToken ct)
+        {
+            var resp = new byte[1 + 1 + SessionCrypto.EcdhPublicBytes + 32];
+            resp[0] = 0x19;
+            resp[1] = status;
+            Buffer.BlockCopy(serverPub, 0, resp, 2, serverPub.Length);
+            Buffer.BlockCopy(confirmS, 0, resp, 2 + serverPub.Length, 32);
+            await s.WriteExactAsync(resp, 0, resp.Length, ct).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Handles the 0x08 compression offer: 16 padding bytes follow the type (an
+        /// older peer mistakes the frame for a corrupt transfer header and drops the
+        /// connection — exactly what the client's fallback detects). The 0x18 status 0
+        /// answer accepts, and every following byte rides in deflate segments.
+        /// </summary>
+        private static async Task<IWireStream> HandleCompressionOfferAsync(IWireStream s, ServerWireContext ctx, CancellationToken ct)
+        {
+            var pad = new byte[16];
+            await s.ReadExactAsync(pad, 0, 16, ct).ConfigureAwait(false);
+
+            var resp = new byte[2]; // type(1) + status(1)
+            resp[0] = 0x18;
+            resp[1] = 0; // accepted
+            await s.WriteExactAsync(resp, 0, 2, ct).ConfigureAwait(false);
+
+            if (ctx.Session != null) ctx.Session.Compressed = true;
+            ctx.Cb.RaiseLog(L.S_CompressedOn);
+            // ownsInner:false — same reason as the encryption decorator: keep the socket
+            // open for the transport's ACK after the decorator is disposed.
+            return new CompressedWireStream(s, false);
+        }
+
+        /// <summary>
         /// Verifies a 0x05 pairing frame and answers with 0x15 status. A server without
         /// a configured code accepts any 0x05 (lenient path — clients may always send
         /// their code). Returns false (after rejecting) when the code is wrong.
@@ -523,6 +849,15 @@ namespace TrFileTransfer
         {
             var hashBuf = new byte[32];
             await s.ReadExactAsync(hashBuf, 0, 32, ct).ConfigureAwait(false);
+
+            string peer = ctx.Session != null ? ctx.Session.Peer : null;
+            if (AuthLockedOut(ctx, peer))
+            {
+                await SendAuthResponse(s, 1, ct).ConfigureAwait(false);
+                ctx.Cb.RaiseLog(L.S_AuthLockedOut(peer));
+                ctx.Cb.RaiseError(L.S_AuthFailed);
+                return false;
+            }
 
             byte status;
             if (string.IsNullOrEmpty(ctx.PairingCode))
@@ -537,10 +872,12 @@ namespace TrFileTransfer
 
             if (status == 1)
             {
+                NoteAuthFailure(ctx, peer);
                 ctx.Cb.RaiseLog(L.S_AuthFailed);
                 ctx.Cb.RaiseError(L.S_AuthFailed);
                 return false;
             }
+            NoteAuthSuccess(ctx, peer);
             ctx.Cb.RaiseLog(L.S_AuthOk);
             return true;
         }
@@ -578,12 +915,20 @@ namespace TrFileTransfer
             return true;
         }
 
-        /// <summary>Normalizes a received name to a bare file name with a fallback.</summary>
+        /// <summary>Normalizes a received name to a bare file name with a fallback.
+        /// Reserved device names (CON, NUL, COM1…) and trailing dots/spaces are
+        /// neutralized — they either open a device instead of a file or desync the
+        /// unique-name collision check from what actually lands on disk.</summary>
         private static string SafeName(string rawName, string fallback)
         {
             string name = Path.GetFileName(rawName);
             if (string.IsNullOrWhiteSpace(name))
                 name = fallback;
+            name = name.TrimEnd('.', ' ');
+            if (name.Length == 0)
+                return fallback;
+            if (Utils.IsReservedFileName(name))
+                name = "_" + name;
             return name;
         }
 
@@ -620,7 +965,7 @@ namespace TrFileTransfer
             await s.ReadExactAsync(countBuf, 0, countBuf.Length, ct).ConfigureAwait(false);
             int fileCount = BitConverter.ToInt32(countBuf, 0);
             long totalBytes = BitConverter.ToInt64(countBuf, 4);
-            if (fileCount <= 0 || fileCount > 1000000 || totalBytes < 0) return false;
+            if (fileCount <= 0 || fileCount > MaxFolderFileCount || totalBytes < 0 || totalBytes > Utils.MaxTransferSize) return false;
 
             var relativePaths = new string[fileCount];
             var sizes = new long[fileCount];
@@ -632,7 +977,7 @@ namespace TrFileTransfer
                 await s.ReadExactAsync(fileHeader, 0, fileHeader.Length, ct).ConfigureAwait(false);
                 long size = BitConverter.ToInt64(fileHeader, 0);
                 int pathLen = BitConverter.ToInt16(fileHeader, 8);
-                if (size < 0 || pathLen <= 0 || pathLen > 4096) return false;
+                if (size < 0 || size > Utils.MaxTransferSize || pathLen <= 0 || pathLen > 4096) return false;
 
                 var pathBuf = new byte[pathLen];
                 await s.ReadExactAsync(pathBuf, 0, pathLen, ct).ConfigureAwait(false);
@@ -720,7 +1065,7 @@ namespace TrFileTransfer
                 if (!string.IsNullOrEmpty(subDir) && !Directory.Exists(subDir))
                     Directory.CreateDirectory(subDir);
 
-                if (!Utils.HasFreeSpace(dir, sizes[i] + Utils.DiskSpaceMargin))
+                if (!Utils.HasFreeSpaceFor(dir, sizes[i]))
                 {
                     ctx.Cb.RaiseLog(L.S_DiskFull(relativePaths[i], Utils.FormatSize(sizes[i])));
                     ctx.Cb.RaiseError(L.S_DiskFull(relativePaths[i], Utils.FormatSize(sizes[i])));
@@ -770,6 +1115,16 @@ namespace TrFileTransfer
                     }
                 }
 
+                // A resumed file is old-prefix + new-suffix. The increment hash covers
+                // only the suffix, so re-verify the assembled file against the manifest
+                // hash — otherwise a stale/corrupt prefix yields a silently wrong file.
+                if (start > 0 && !await VerifyFullHashFile(savePath, fullHashes[i], ct).ConfigureAwait(false))
+                {
+                    ctx.Cb.RaiseLog(L.S_FullHashFailed(relativePaths[i]));
+                    ctx.Cb.RaiseError(L.S_FullHashFailed(relativePaths[i]));
+                    return false;
+                }
+
                 ctx.Cb.RaiseFileReceived(savePath, sizes[i]);
                 completedBytes += sizes[i] - start;
 
@@ -800,7 +1155,7 @@ namespace TrFileTransfer
             long fileSize = BitConverter.ToInt64(headerBuf, 0);
             int nameLen = BitConverter.ToInt32(headerBuf, 8);
 
-            if (fileSize < 0 || nameLen <= 0 || nameLen > 4096)
+            if (fileSize < 0 || fileSize > Utils.MaxTransferSize || nameLen <= 0 || nameLen > 4096)
             {
                 ctx.Cb.RaiseLog(L.S_InvalidHeader(fileSize, nameLen));
                 return false;
@@ -850,7 +1205,9 @@ namespace TrFileTransfer
             var fileCountBuf = new byte[4];
             await s.ReadExactAsync(fileCountBuf, 0, 4, ct).ConfigureAwait(false);
             int fileCount = BitConverter.ToInt32(fileCountBuf, 0);
-            if (fileCount <= 0) return false;
+            // Same bound as the 0x04 manifest: without it a peer can drive an
+            // unbounded per-file loop (directory creation) on one connection.
+            if (fileCount <= 0 || fileCount > MaxFolderFileCount) return false;
 
             if (!await GateAsync(ctx, folderName, -1, fileCount, true).ConfigureAwait(false))
                 return false;
@@ -870,7 +1227,7 @@ namespace TrFileTransfer
                 await s.ReadExactAsync(fileHeaderBuf, 0, 10, ct).ConfigureAwait(false);
                 long fileSize = BitConverter.ToInt64(fileHeaderBuf, 0);
                 int pathLen = BitConverter.ToInt16(fileHeaderBuf, 8);
-                if (fileSize < 0 || pathLen <= 0 || pathLen > 4096) return false;
+                if (fileSize < 0 || fileSize > Utils.MaxTransferSize || pathLen <= 0 || pathLen > 4096) return false;
 
                 var pathBuf = new byte[pathLen];
                 await s.ReadExactAsync(pathBuf, 0, pathLen, ct).ConfigureAwait(false);
@@ -918,7 +1275,7 @@ namespace TrFileTransfer
             long chunkSize = BitConverter.ToInt64(headerBuf, 16);
             int nameLen = BitConverter.ToInt32(headerBuf, 24);
 
-            if (totalSize <= 0 || chunkOffset < 0 || chunkSize <= 0 || chunkOffset > totalSize - chunkSize
+            if (totalSize <= 0 || totalSize > Utils.MaxTransferSize || chunkOffset < 0 || chunkSize <= 0 || chunkOffset > totalSize - chunkSize
                 || nameLen <= 0 || nameLen > 4096)
             {
                 ctx.Cb.RaiseLog(L.S_InvalidHeader(totalSize, nameLen));
@@ -930,7 +1287,7 @@ namespace TrFileTransfer
             string fileName = SafeName(System.Text.Encoding.UTF8.GetString(nameBuf), L.S_ReceivedFile);
 
             // The chunk file is preallocated at totalSize — require that much headroom
-            if (!Utils.HasFreeSpace(ctx.SaveDirectory, totalSize + Utils.DiskSpaceMargin))
+            if (!Utils.HasFreeSpaceFor(ctx.SaveDirectory, totalSize))
             {
                 ctx.Cb.RaiseLog(L.S_DiskFull(fileName, Utils.FormatSize(totalSize)));
                 ctx.Cb.RaiseError(L.S_DiskFull(fileName, Utils.FormatSize(totalSize)));
@@ -940,8 +1297,28 @@ namespace TrFileTransfer
             if (!await GateAsync(ctx, fileName, totalSize, 0, false).ConfigureAwait(false))
                 return false;
 
+            // Tracker key includes the peer: two devices concurrently sending
+            // same-named chunked files must not share one reassembly tracker.
+            string trackerKey = (ctx.Session != null && !string.IsNullOrEmpty(ctx.Session.Peer)
+                ? ctx.Session.Peer : "") + "|" + fileName;
             ChunkTracker tracker = ChunkTracker.GetOrCreate(
-                ctx.ChunkTrackers, fileName, totalSize, ctx.SaveDirectory);
+                ctx.ChunkTrackers, trackerKey, fileName, totalSize, ctx.SaveDirectory);
+
+            // A tracker left behind by an aborted transfer of a DIFFERENT size under
+            // the same name must not be reused: mixing two files' chunks would corrupt
+            // the result and, in the coverage model, never complete. Evict it so this
+            // transfer gets a clean reassembly.
+            if (tracker.TotalSize != totalSize && !tracker.Complete)
+            {
+                ChunkTracker stale;
+                if (ctx.ChunkTrackers.TryRemove(trackerKey, out stale))
+                {
+                    try { stale.Dispose(); } catch { }
+                    ctx.Cb.RaiseLog(L.S_ChunkTrackerReset(fileName));
+                }
+                tracker = ChunkTracker.GetOrCreate(
+                    ctx.ChunkTrackers, trackerKey, fileName, totalSize, ctx.SaveDirectory);
+            }
 
             // Stream chunk data through a fixed-size buffer — no giant array allocation
             const int BufSize = 4194304;
@@ -988,7 +1365,7 @@ namespace TrFileTransfer
                 {
                     tracker.Dispose();
                     ChunkTracker removed;
-                    ctx.ChunkTrackers.TryRemove(fileName, out removed);
+                    ctx.ChunkTrackers.TryRemove(trackerKey, out removed);
                     ctx.Cb.RaiseLog(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
                     ctx.Cb.RaiseComplete();
                     ctx.Cb.RaiseFileReceived(tracker.SavePath, totalSize);
@@ -998,7 +1375,7 @@ namespace TrFileTransfer
             {
                 // Clean up tracker on hash failure
                 ChunkTracker removed;
-                if (ctx.ChunkTrackers.TryRemove(fileName, out removed))
+                if (ctx.ChunkTrackers.TryRemove(trackerKey, out removed))
                 {
                     try { removed.Dispose(); } catch { }
                 }
@@ -1021,7 +1398,7 @@ namespace TrFileTransfer
             long clientOffset = BitConverter.ToInt64(headerBuf, 24);
             int nameLen = BitConverter.ToInt32(headerBuf, 32);
 
-            if (totalSize <= 0 || clientOffset < 0 || clientOffset > totalSize || nameLen <= 0 || nameLen > 4096)
+            if (totalSize <= 0 || totalSize > Utils.MaxTransferSize || clientOffset < 0 || clientOffset > totalSize || nameLen <= 0 || nameLen > 4096)
             {
                 ctx.Cb.RaiseLog(L.S_InvalidHeader(totalSize, nameLen));
                 return false;
@@ -1044,6 +1421,27 @@ namespace TrFileTransfer
             if (!await GateAsync(ctx, fileName, totalSize, 0, false).ConfigureAwait(false))
                 return false;
 
+            // One connection at a time per session. Two connections carrying the same
+            // sessionId would otherwise share a single ResumeState/FileStream and
+            // interleave seeks — corrupting the file and the checkpoint. A retry after
+            // a dropped connection is fine: the old handler releases before the new
+            // one arrives (and the client retries again if it loses that race).
+            var sessionLock = ctx.ResumeLocks.GetOrAdd(sessionId, delegate (Guid g)
+            {
+                return new System.Threading.SemaphoreSlim(1, 1);
+            });
+            try
+            {
+                if (!await sessionLock.WaitAsync(0, ct).ConfigureAwait(false))
+                {
+                    ctx.Cb.RaiseLog(string.Format(
+                        "Resume: session {0} is already active on another connection — refusing",
+                        sessionId.ToString("N")));
+                    return false;
+                }
+            }
+            catch (OperationCanceledException) { return false; }
+
             // From here on, the session is ours: persist any incomplete state to disk
             // on the way out (connection drop / server restart) and clear it once the
             // transfer completes or is discarded.
@@ -1060,8 +1458,12 @@ namespace TrFileTransfer
                 {
                     // Flush so the persisted ReceivedBytes always matches what is on disk
                     try { if (st.WriteStream != null) st.WriteStream.Flush(); } catch { }
-                    ServerResumeStore.Save(st);
+                    // Guarded: Stop()'s Shutdown() may be saving the same file right
+                    // now, and an IOException escaping this finally would replace
+                    // the transfer's own exception on the way out.
+                    try { ServerResumeStore.Save(st); } catch { }
                 }
+                try { sessionLock.Release(); } catch { }
             }
         }
 
@@ -1079,18 +1481,21 @@ namespace TrFileTransfer
                 {
                     await SendResumeResponse(s, totalSize, 2, ct).ConfigureAwait(false);
                     ctx.Cb.RaiseLog(L.S_DuplicateSkipped(fileName));
+                    ctx.Cb.RaiseComplete();
                     ctx.Cb.RaiseFileReceived(basePath, totalSize);
                     return true;
                 }
             }
 
             // The preallocated file needs full size headroom
-            if (!Utils.HasFreeSpace(ctx.SaveDirectory, totalSize + Utils.DiskSpaceMargin))
+            if (!Utils.HasFreeSpaceFor(ctx.SaveDirectory, totalSize))
             {
                 ctx.Cb.RaiseLog(L.S_DiskFull(fileName, Utils.FormatSize(totalSize)));
                 ctx.Cb.RaiseError(L.S_DiskFull(fileName, Utils.FormatSize(totalSize)));
                 return false;
             }
+
+            string peer = ctx.Session != null ? ctx.Session.Peer : null;
 
             ResumeState state = null;
             ctx.ResumeStates.TryGetValue(sessionId, out state);
@@ -1160,6 +1565,7 @@ namespace TrFileTransfer
                     SessionId = sessionId,
                     TotalSize = totalSize,
                     FileName = fileName,
+                    Peer = peer,
                     ReceivedBytes = 0
                 };
                 newState.SavePath = Utils.GetUniqueSavePath(ctx.SaveDirectory, fileName);
@@ -1177,6 +1583,27 @@ namespace TrFileTransfer
                     try { File.Delete(newState.SavePath); } catch { }
                     ctx.ResumeStates.TryGetValue(sessionId, out state);
                     isNew = false;
+                }
+            }
+
+            // The resolved session (live or restored) belongs to exactly one peer and
+            // one file name. A peer that guesses/replays another sessionId must not be
+            // able to write into or finalize someone else's file. An empty Peer is a
+            // checkpoint written by an older build — adopt the current peer.
+            if (!isNew && state != null)
+            {
+                if (string.IsNullOrEmpty(state.Peer)) state.Peer = peer;
+                if (!string.Equals(state.Peer, peer, StringComparison.OrdinalIgnoreCase)
+                    || !string.Equals(state.FileName, fileName, StringComparison.Ordinal))
+                {
+                    ctx.Cb.RaiseLog(string.Format(
+                        "Resume: session {0} belongs to another peer/file — refusing",
+                        sessionId.ToString("N")));
+                    try { if (state.WriteStream != null) state.WriteStream.Dispose(); } catch { }
+                    state.WriteStream = null;
+                    ResumeState removedMismatch;
+                    ctx.ResumeStates.TryRemove(sessionId, out removedMismatch);
+                    return false;
                 }
             }
 
@@ -1208,20 +1635,38 @@ namespace TrFileTransfer
                 }
                 if (state.ReceivedBytes >= totalSize)
                 {
+                    // Payload fully on disk from an earlier connection that died before
+                    // the final handshake — finalize like the success path so the file
+                    // is not left locked by the abandoned write stream.
+                    try { state.WriteStream.Dispose(); } catch { }
+                    state.WriteStream = null;
+                    ResumeState removedDone;
+                    ctx.ResumeStates.TryRemove(sessionId, out removedDone);
+                    ServerResumeStore.Delete(sessionId);
                     status = 2;
                     resumeFrom = totalSize;
                     await SendResumeResponse(s, resumeFrom, status, ct).ConfigureAwait(false);
+                    ctx.Cb.RaiseComplete();
+                    ctx.Cb.RaiseFileReceived(state.SavePath, totalSize);
                     return true;
                 }
                 status = 1;
                 resumeFrom = state.ReceivedBytes;
             }
 
-            // Negotiate: use max of client's claim and server's actual received.
-            // When the server has no state for this session (e.g. server restarted),
-            // the client's offset claim is NOT trusted — restart from 0 so a fresh
-            // pre-allocated file is never zero-padded behind a stale client offset.
-            long actualStart = isNew ? 0 : Math.Max(clientOffset, resumeFrom);
+            // The server is authoritative: the transfer always continues from the bytes
+            // it has actually received and persisted. A client claiming to be further
+            // ahead must NOT be believed — accepting the larger offset would skip the
+            // gap [resumeFrom, clientOffset), and no hash covers those bytes, so a
+            // zero-filled (or stale) file would be reported as fully received.
+            // Claiming to be behind is harmless: the overlapping prefix is re-sent.
+            long actualStart = isNew ? 0 : resumeFrom;
+            if (clientOffset > actualStart)
+            {
+                ctx.Cb.RaiseLog(string.Format(
+                    "Resume: client claimed offset {0} but server has {1} for session {2} — re-sending the gap",
+                    clientOffset, actualStart, sessionId.ToString("N")));
+            }
             await SendResumeResponse(s, actualStart, status, ct).ConfigureAwait(false);
 
             // If client has less than server, it'll re-send from actualStart
@@ -1283,6 +1728,7 @@ namespace TrFileTransfer
                         ServerResumeStore.Delete(sessionId);
                         ctx.Cb.RaiseLog(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
                         await SendResumeResponse(s, totalSize, 2, ct).ConfigureAwait(false);
+                        ctx.Cb.RaiseComplete();
                         ctx.Cb.RaiseFileReceived(state.SavePath, totalSize);
                         return true;
                     }
@@ -1347,7 +1793,7 @@ namespace TrFileTransfer
         private static async Task<bool> ReceiveFilePayload(IWireStream s, ServerWireContext ctx, string savePath, string basePath,
             long fileSize, string displayName, CancellationToken ct)
         {
-            if (!Utils.HasFreeSpace(Path.GetDirectoryName(savePath), fileSize + Utils.DiskSpaceMargin))
+            if (!Utils.HasFreeSpaceFor(Path.GetDirectoryName(savePath), fileSize))
             {
                 ctx.Cb.RaiseLog(L.S_DiskFull(displayName, Utils.FormatSize(fileSize)));
                 ctx.Cb.RaiseError(L.S_DiskFull(displayName, Utils.FormatSize(fileSize)));
@@ -1360,18 +1806,35 @@ namespace TrFileTransfer
             var bufB = new byte[ctx.BufferSize];
             var progressTimer = System.Diagnostics.Stopwatch.StartNew();
 
+            // Receive into a sibling temp file and only move it to the final name once
+            // the trailing SHA256 verifies. Previously a dropped/failed transfer left a
+            // truncated file at the real name, which also pushed a later good transfer
+            // to a "_1" name — the user saw a corrupt file plus a good file.
+            string tempPath = savePath + ".part-" + Guid.NewGuid().ToString("N");
+            bool committed = false;
+            try
+            {
             using (var sha256 = System.Security.Cryptography.SHA256.Create())
-            using (var fileStream = new FileStream(savePath, FileMode.Create, FileAccess.Write,
+            using (var fileStream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write,
                 FileShare.None, ctx.BufferSize, FileOptions.SequentialScan))
             {
                 long remaining = fileSize;
+                byte[] computedHash;
                 if (remaining == 0)
                 {
                     // Empty file: only the 32-byte hash follows
                     var emptyHash = new byte[32];
                     await s.ReadExactAsync(emptyHash, 0, 32, ct).ConfigureAwait(false);
-                    return Utils.ConstantTimeEquals(emptyHash, sha256.ComputeHash(Utils.EmptyBytes));
+                    computedHash = sha256.ComputeHash(Utils.EmptyBytes);
+                    if (!Utils.ConstantTimeEquals(emptyHash, computedHash))
+                    {
+                        ctx.Cb.RaiseLog(L.S_HashFailed(displayName));
+                        ctx.Cb.RaiseError(L.S_HashFailed(displayName));
+                        return false;
+                    }
                 }
+                else
+                {
                 int toRead = (int)Math.Min(remaining, (long)bufA.Length);
                 int read = await s.ReadSomeAsync(bufA, 0, toRead, ct).ConfigureAwait(false);
                 if (read <= 0)
@@ -1395,17 +1858,17 @@ namespace TrFileTransfer
                     await fileStream.WriteAsync(cur, 0, read, ct);
                     bytesRead += read;
 
-                read = await nextReadTask.ConfigureAwait(false);
-                if (read <= 0)
-                    throw new IOException(L.S_ConnClosedPrematurely);
-                remaining -= read;
+                    read = await nextReadTask.ConfigureAwait(false);
+                    if (read <= 0)
+                        throw new IOException(L.S_ConnClosedPrematurely);
+                    remaining -= read;
 
-                // One paced bucket across all connections of this server: throttling
-                // the read paces the sender too via TCP/UDT flow control
-                if (ctx.ReceiveLimiter != null)
-                    await ctx.ReceiveLimiter.ThrottleAsync(read, ct).ConfigureAwait(false);
+                    // One paced bucket across all connections of this server: throttling
+                    // the read paces the sender too via TCP/UDT flow control
+                    if (ctx.ReceiveLimiter != null)
+                        await ctx.ReceiveLimiter.ThrottleAsync(read, ct).ConfigureAwait(false);
 
-                var tmp = cur; cur = nxt; nxt = tmp;
+                    var tmp = cur; cur = nxt; nxt = tmp;
 
                     if (progressTimer.ElapsedMilliseconds >= 100 || remaining == 0)
                     {
@@ -1441,7 +1904,7 @@ namespace TrFileTransfer
 
                 var receivedHash = new byte[32];
                 await s.ReadExactAsync(receivedHash, 0, 32, ct).ConfigureAwait(false);
-                var computedHash = sha256.Hash;
+                computedHash = sha256.Hash;
 
                 if (!Utils.ConstantTimeEquals(receivedHash, computedHash))
                 {
@@ -1449,6 +1912,7 @@ namespace TrFileTransfer
                     ctx.Cb.RaiseError(L.S_HashFailed(displayName));
                     return false;
                 }
+                } // end non-empty payload
 
                 // Skip-duplicates: an identical file already on disk wins; the freshly
                 // received copy is discarded. Only reached when the collision suffix
@@ -1467,14 +1931,25 @@ namespace TrFileTransfer
                         dup = await VerifyFullHashFile(basePath, computedHash, ct).ConfigureAwait(false);
                     if (dup)
                     {
-                        try { fileStream.Dispose(); } catch { }
-                        try { File.Delete(savePath); } catch { }
                         ctx.Cb.RaiseLog(L.S_DuplicateSkipped(displayName));
-                        return true;
+                        return true; // finally deletes the temp copy
                     }
                 }
+
+                // Hash verified — close the temp handle before moving it into place.
+                fileStream.Dispose();
+                File.Move(tempPath, savePath);
+                committed = true;
             }
             return true;
+            }
+            finally
+            {
+                if (!committed)
+                {
+                    try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+                }
+            }
         }
     }
 
@@ -1484,17 +1959,22 @@ namespace TrFileTransfer
 
     /// <summary>Sending side of the 0x00-0x03 protocol, shared by TCP and UDT clients.
     /// Connection setup (and its transport-specific logging) stays in the transport classes.</summary>
-    /// <summary>Result of the client-side 0x05/0x07 authentication handshake.</summary>
+    /// <summary>Result of the client-side 0x05/0x07/0x08 prelude negotiation.</summary>
     public class AuthResult
     {
-        /// <summary>The stream to run the protocol on — the raw stream, or an
-        /// EncryptedWireStream wrapping it after a successful 0x07 handshake.</summary>
+        /// <summary>The stream to run the protocol on — the raw stream, or the
+        /// compression/encryption decorators wrapping it after accepted preludes.</summary>
         public IWireStream Stream;
         /// <summary>True when the session is encrypted (0x07 accepted).</summary>
         public bool Encrypted;
+        /// <summary>True when the session is compressed (0x08 accepted).</summary>
+        public bool Compressed;
         /// <summary>True when the peer ignored the 0x07 frame (an older version) —
-        /// the caller must reconnect and retry with the plain 0x05 frame.</summary>
+        /// the caller must reconnect and retry with the plain 0x05 frame instead.</summary>
         public bool NeedPlainFallback;
+        /// <summary>True when the peer dropped the 0x08 compression offer (an older
+        /// version) — the caller must reconnect without the offer.</summary>
+        public bool NeedNoCompressionFallback;
     }
 
     public static class ClientWire
@@ -1525,7 +2005,42 @@ namespace TrFileTransfer
                 sw.Elapsed.TotalSeconds,
                 Utils.FormatSize((long)(fileSize / Math.Max(sw.Elapsed.TotalSeconds, 0.001)))));
 
+            await ConfirmCompletionAsync(s, cb, ct).ConfigureAwait(false);
             cb.RaiseComplete();
+        }
+
+        /// <summary>
+        /// TCP completion verdict for 0x00/0x01/0x06. A current server writes one status
+        /// byte through the live stream (0x01 accepted, 0x00 refused); older servers
+        /// close the connection instead. A refusal, or EOF before any byte, means the
+        /// receiver did NOT accept the transfer — reporting success there used to lose
+        /// files silently (e.g. disk full, receive confirmation denied, IP filter).
+        /// User cancellation is not an error.
+        /// </summary>
+        internal static async Task ConfirmCompletionAsync(IWireStream s, WireCallbacks cb, CancellationToken ct)
+        {
+            // UDT signals success with its own out-of-band 1-byte ACK (read by
+            // RunUdtTransfer), so there is nothing on the byte stream to wait for.
+            if (cb != null && !cb.CompletionAckOnStream) return;
+
+            var buf = new byte[1];
+            int n;
+            try
+            {
+                n = await s.ReadSomeAsync(buf, 0, 1, ct).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                if (ct.IsCancellationRequested) return; // user cancelled — not a failure
+                throw new IOException(L.C_NoCompletionAck);
+            }
+            if (n <= 0)
+            {
+                if (ct.IsCancellationRequested) return;
+                throw new IOException(L.C_NoCompletionAck);
+            }
+            if (buf[0] != 0x01)
+                throw new IOException(L.C_RejectedByPeer);
         }
 
         /// <summary>Sends a folder recursively (type 0x01), preserving relative paths.</summary>
@@ -1605,6 +2120,7 @@ namespace TrFileTransfer
                 sw.Elapsed.TotalSeconds,
                 Utils.FormatSize((long)(totalSize / Math.Max(sw.Elapsed.TotalSeconds, 0.001)))));
 
+            await ConfirmCompletionAsync(s, cb, ct).ConfigureAwait(false);
             cb.RaiseComplete();
         }
 
@@ -1757,69 +2273,192 @@ namespace TrFileTransfer
         }
 
         /// <summary>
-        /// Client side of the authentication handshake, shared by TCP and UDT.
-        /// With a pairing code and encryption enabled the client sends 0x07
-        /// (code hash + session salt); on 0x17 status 0 the returned stream encrypts
-        /// everything that follows. Status 2 (peer has no pairing code) continues in
-        /// plaintext on the same connection. No valid 0x17 answer means the peer is
-        /// an older version — NeedPlainFallback tells the caller to reconnect and run
-        /// the plain 0x05 frame instead. An explicit status 1 (wrong code) throws.
+        /// Client side of the connection prelude, shared by TCP and UDT. Order:
+        /// with a pairing code the 0x05 plain auth or the 0x07 encrypted auth first,
+        /// THEN the 0x08 compression offer — wrapping the (possibly encrypted)
+        /// stream last puts compression on the OUTSIDE, so the wire order is
+        /// encrypt(compress(plain)) and deflation sees plaintext, not ciphertext.
+        /// A peer that drops the 0x08 offer or never answers 0x17 is an older
+        /// version — the NeedNoCompression / NeedPlain fallback flags tell the
+        /// caller to reconnect without the feature. An explicit wrong code throws.
         /// </summary>
         public static async Task<AuthResult> AuthenticateAsync(IWireStream s, string pairingCode, bool tryEncryption,
+            bool tryCompression, WireCallbacks cb, CancellationToken ct)
+        {
+            return await AuthenticateAsync(s, pairingCode, tryEncryption, tryCompression, cb, ct, true).ConfigureAwait(false);
+        }
+
+        /// <param name="allowDowngrade">False forbids negotiating a weaker handshake:
+        /// if the peer does not answer the authenticated ECDH 0x09 frame, the transfer
+        /// is refused instead of silently continuing in plaintext (or with the legacy
+        /// 0x07 encryption whose key is derivable from the wire).</param>
+        public static async Task<AuthResult> AuthenticateAsync(IWireStream s, string pairingCode, bool tryEncryption,
+            bool tryCompression, WireCallbacks cb, CancellationToken ct, bool allowDowngrade)
+        {
+            IWireStream current = s;
+            bool encrypted = false;
+
+            if (!string.IsNullOrEmpty(pairingCode))
+            {
+                if (!tryEncryption)
+                {
+                    await SendAuthFrameAsync(current, pairingCode, cb, ct).ConfigureAwait(false);
+                }
+                else
+                {
+                    cb.RaiseLog(L.C_Authing);
+                    // Preferred: authenticated ECDH (0x09).
+                    var ecdh = await TryEcdhHandshakeAsync(current, pairingCode, cb, ct).ConfigureAwait(false);
+                    if (ecdh.Handled)
+                    {
+                        if (ecdh.Rejected) throw new IOException(L.C_AuthFailed);
+                        if (ecdh.Encrypted) { current = ecdh.Stream; encrypted = true; }
+                        // else: peer has no pairing code — continue plaintext on this connection
+                    }
+                    else
+                    {
+                        // The peer did not answer 0x09: either an older build, or an
+                        // on-path attacker forcing a weaker path. Fail closed unless
+                        // the caller explicitly allowed a downgrade; otherwise the
+                        // caller reconnects with encryption disabled (plain 0x05),
+                        // never with the legacy 0x07 whose key rides the wire.
+                        if (!allowDowngrade)
+                            throw new IOException(L.C_EncryptPeerTooOld);
+                        return new AuthResult { Stream = current, NeedPlainFallback = true };
+                    }
+                }
+            }
+
+            bool compressed = false;
+            if (tryCompression)
+            {
+                // The 16 random pad bytes make an older peer parse this frame as a
+                // corrupt transfer header and drop the connection — that drop IS the
+                // fallback signal (same trick the 0x07 prelude relies on).
+                var pad = new byte[16];
+                using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create())
+                    rng.GetBytes(pad);
+                var frame8 = new byte[17];
+                frame8[0] = 0x08;
+                Buffer.BlockCopy(pad, 0, frame8, 1, 16);
+                await current.WriteExactAsync(frame8, 0, frame8.Length, ct).ConfigureAwait(false);
+
+                var resp8 = new byte[2];
+                try
+                {
+                    await current.ReadExactAsync(resp8, 0, 2, ct).ConfigureAwait(false);
+                }
+                catch (IOException)
+                {
+                    return new AuthResult { Stream = current, Encrypted = encrypted, NeedNoCompressionFallback = true };
+                }
+                if (resp8[0] != 0x18)
+                    return new AuthResult { Stream = current, Encrypted = encrypted, NeedNoCompressionFallback = true };
+                if (resp8[1] == 0)
+                {
+                    // Wrapping LAST keeps compression outermost: deflate sees
+                    // plaintext and the inner decorator (if any) encrypts the result
+                    current = new CompressedWireStream(current);
+                    compressed = true;
+                    cb.RaiseLog(L.C_CompressedOn);
+                }
+                // Any other status: the peer declined — continue uncompressed
+            }
+
+            return new AuthResult { Stream = current, Encrypted = encrypted, Compressed = compressed };
+        }
+
+        /// <summary>
+        /// Attempts the authenticated ECDH handshake (0x09). Handled=false means the
+        /// peer did not answer with a 0x19 frame (older build, or an attacker cutting
+        /// the handshake) — the caller decides whether to downgrade or refuse. On the
+        /// wire: [0x09][codeHash 32][clientPub 72], then the server's 0x19 reply, then
+        /// the client's confirmation. The session keys come from the DH secret, never
+        /// from anything an eavesdropper can see.
+        /// </summary>
+        private static async Task<EcdhHandshakeResult> TryEcdhHandshakeAsync(IWireStream s, string pairingCode,
             WireCallbacks cb, CancellationToken ct)
         {
-            if (string.IsNullOrEmpty(pairingCode))
-                return new AuthResult { Stream = s };
-
-            if (!tryEncryption)
+            using (var clientKey = SessionCrypto.CreateEcdhKey())
             {
-                await SendAuthFrameAsync(s, pairingCode, cb, ct).ConfigureAwait(false);
-                return new AuthResult { Stream = s };
+                byte[] clientPub = SessionCrypto.EcdhPublicBlob(clientKey);
+                byte[] codeHash = WireAuth.HashCode(pairingCode);
+
+                var frame = new byte[1 + 32 + SessionCrypto.EcdhPublicBytes];
+                frame[0] = 0x09;
+                Buffer.BlockCopy(codeHash, 0, frame, 1, 32);
+                Buffer.BlockCopy(clientPub, 0, frame, 33, clientPub.Length);
+                await s.WriteExactAsync(frame, 0, frame.Length, ct).ConfigureAwait(false);
+
+                var resp = new byte[2 + SessionCrypto.EcdhPublicBytes + 32];
+                try
+                {
+                    await s.ReadExactAsync(resp, 0, resp.Length, ct).ConfigureAwait(false);
+                }
+                catch (IOException)
+                {
+                    return new EcdhHandshakeResult { Handled = false };
+                }
+                if (resp[0] != 0x19)
+                    return new EcdhHandshakeResult { Handled = false };
+
+                byte status = resp[1];
+                var serverPub = new byte[SessionCrypto.EcdhPublicBytes];
+                Buffer.BlockCopy(resp, 2, serverPub, 0, serverPub.Length);
+                var confirmS = new byte[32];
+                Buffer.BlockCopy(resp, 2 + serverPub.Length, confirmS, 0, 32);
+
+                if (status == 1)
+                    return new EcdhHandshakeResult { Handled = true, Rejected = true };
+                if (status == 2)
+                {
+                    // Server has pairing disabled and will not encrypt. Continuing
+                    // plaintext on this connection is the documented lenient path.
+                    cb.RaiseLog(L.C_EncryptUnsupported);
+                    return new EcdhHandshakeResult { Handled = true };
+                }
+                if (status != 0)
+                    return new EcdhHandshakeResult { Handled = false };
+
+                byte[] shared;
+                try { shared = SessionCrypto.EcdhDeriveShared(clientKey, serverPub); }
+                catch (Exception) { return new EcdhHandshakeResult { Handled = true, Rejected = true }; }
+
+                byte[] authKey = SessionCrypto.DeriveAuthKey(pairingCode, clientPub, serverPub, shared);
+                byte[] expectedS = SessionCrypto.Confirm(authKey, "s2c-confirm", clientPub, serverPub);
+                if (!Utils.ConstantTimeEquals(confirmS, expectedS))
+                {
+                    // The 0x19 reply was not produced by someone holding the code and
+                    // the matching private key — refuse (possible MITM).
+                    return new EcdhHandshakeResult { Handled = true, Rejected = true };
+                }
+
+                byte[] confirmC = SessionCrypto.Confirm(authKey, "c2s-confirm", clientPub, serverPub);
+                await s.WriteExactAsync(confirmC, 0, confirmC.Length, ct).ConfigureAwait(false);
+
+                byte[] c2sEnc, c2sMac, s2cEnc, s2cMac;
+                SessionCrypto.DeriveSessionKeys(authKey, new byte[SessionCrypto.SaltBytes],
+                    out c2sEnc, out c2sMac, out s2cEnc, out s2cMac);
+                cb.RaiseLog(L.C_EncryptedOn);
+                return new EcdhHandshakeResult
+                {
+                    Handled = true,
+                    Encrypted = true,
+                    // bindSequence:true — matches the server's 0x09 segment format
+                    Stream = new EncryptedWireStream(s, c2sEnc, c2sMac, s2cEnc, s2cMac, true, true)
+                };
             }
+        }
 
-            cb.RaiseLog(L.C_Authing);
-            byte[] codeHash = WireAuth.HashCode(pairingCode);
-            var salt = new byte[SessionCrypto.SaltBytes];
-            using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create())
-                rng.GetBytes(salt);
-
-            var frame = new byte[1 + 32 + SessionCrypto.SaltBytes];
-            frame[0] = 0x07;
-            Buffer.BlockCopy(codeHash, 0, frame, 1, 32);
-            Buffer.BlockCopy(salt, 0, frame, 1 + 32, salt.Length);
-            await s.WriteExactAsync(frame, 0, frame.Length, ct).ConfigureAwait(false);
-
-            var resp = new byte[2];
-            try
-            {
-                await s.ReadExactAsync(resp, 0, 2, ct).ConfigureAwait(false);
-            }
-            catch (IOException)
-            {
-                return new AuthResult { Stream = s, NeedPlainFallback = true };
-            }
-            if (resp[0] != 0x17)
-                return new AuthResult { Stream = s, NeedPlainFallback = true };
-
-            if (resp[1] == 1)
-                throw new IOException(L.C_AuthFailed);
-            if (resp[1] == 2)
-            {
-                cb.RaiseLog(L.C_EncryptUnsupported);
-                return new AuthResult { Stream = s };
-            }
-            if (resp[1] != 0)
-                return new AuthResult { Stream = s, NeedPlainFallback = true };
-
-            byte[] c2sEnc, c2sMac, s2cEnc, s2cMac;
-            SessionCrypto.DeriveSessionKeys(codeHash, salt, out c2sEnc, out c2sMac, out s2cEnc, out s2cMac);
-            cb.RaiseLog(L.C_EncryptedOn);
-            // The client sends with the c2s keys and receives with the s2c keys
-            return new AuthResult
-            {
-                Stream = new EncryptedWireStream(s, c2sEnc, c2sMac, s2cEnc, s2cMac),
-                Encrypted = true
-            };
+        private sealed class EcdhHandshakeResult
+        {
+            /// <summary>The peer answered the 0x09 frame (so no fallback is needed).</summary>
+            public bool Handled;
+            /// <summary>The peer answered but the handshake was refused/tampered.</summary>
+            public bool Rejected;
+            /// <summary>A session-encrypting decorator was installed.</summary>
+            public bool Encrypted;
+            public IWireStream Stream;
         }
 
         /// <summary>
@@ -1863,6 +2502,7 @@ namespace TrFileTransfer
                 await s.WriteExactAsync(payload, 0, payload.Length, ct).ConfigureAwait(false);
 
             cb.RaiseLog(L.C_SendingText(ServerWire.Preview(text), Utils.FormatSize(payload.Length)));
+            await ConfirmCompletionAsync(s, cb, ct).ConfigureAwait(false);
             cb.RaiseComplete();
         }
 
@@ -1993,8 +2633,11 @@ namespace TrFileTransfer
                 return;
             }
 
-            // Server is authoritative: use its offset
-            long actualStart = Math.Max(sentBytes, serverOffset);
+            // The server is authoritative — resume from exactly the offset it reports.
+            // Never take the max with the local checkpoint: if we (wrongly) believed we
+            // had sent more than the server received, that would skip bytes the server
+            // never got, leaving an unverified hole that no hash covers.
+            long actualStart = serverOffset;
             cb.RaiseLog(L.C_ResumeNegotiated(actualStart, serverOffset, sentBytes));
 
             // Send file data from actualStart (hash covers only the re-sent increment)

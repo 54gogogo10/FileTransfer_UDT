@@ -46,9 +46,18 @@ namespace TrFileTransfer
         /// Null/empty sends nothing (compatible with servers that don't require it).</summary>
         public string PairingCode { get; set; }
 
-        /// <summary>When a pairing code is set, try the 0x07 encrypted handshake first
-        /// (falls back to plain 0x05 against older peers). Default from Config "Encrypt".</summary>
+        /// <summary>When a pairing code is set, try the encrypted (0x09 ECDH) handshake
+        /// first. Default from Config "Encrypt".</summary>
         public bool EncryptionEnabled { get; set; }
+
+        /// <summary>Default true: if the peer cannot do the authenticated handshake
+        /// (older build), reconnect in plaintext so version-skew still works. Set false
+        /// (Config "EncryptStrict") to fail closed, so a downgrade cannot be forced.</summary>
+        public bool EncryptionDowngradeAllowed { get; set; }
+
+        /// <summary>Offer the 0x08 deflate transport before the transfer (falls back
+        /// to uncompressed against older peers). Default from Config "Compress".</summary>
+        public bool CompressionEnabled { get; set; }
 
         /// <summary>
         /// Creates a TCP client for sending files or folders.
@@ -78,6 +87,8 @@ namespace TrFileTransfer
             _localPort = localPort;
             _limiter = new SpeedLimiter(maxBytesPerSec);
             EncryptionEnabled = Config.GetBool("Encrypt", true);
+            EncryptionDowngradeAllowed = !Config.GetBool("EncryptStrict", false);
+            CompressionEnabled = Config.GetBool("Compress", true);
             _cb.Log = Log;
             _cb.Progress = delegate(TransferProgress p)
             {
@@ -159,7 +170,16 @@ namespace TrFileTransfer
                 _wasCancelled = true;
                 Log(L.C_TransferCancelled);
             }
-            catch (ObjectDisposedException) { }
+            catch (ObjectDisposedException)
+            {
+                // Cancel() during the connect phase disposes the socket, which
+                // surfaces as ODE rather than OCE — still a deliberate cancel
+                if (_cts != null && _cts.IsCancellationRequested)
+                {
+                    _wasCancelled = true;
+                    Log(L.C_TransferCancelled);
+                }
+            }
             catch (Exception ex)
             {
                 Log(L.C_Error(ex.Message));
@@ -197,7 +217,9 @@ namespace TrFileTransfer
             }
         }
 
-        /// <summary>Connects and returns the wire stream (disposing it closes the connection).</summary>
+        /// <summary>Connects and returns the wire stream (disposing it closes the connection).
+        /// The connect is cancellable: the token disposes the in-flight socket instead of
+        /// letting it hang until the OS connect timeout (~21 s).</summary>
         private async Task<TcpWireStream> ConnectAsync(CancellationToken ct)
         {
             var client = CreateClient();
@@ -208,7 +230,14 @@ namespace TrFileTransfer
                 client.ReceiveBufferSize = _bufferSize;
 
                 Log(L.C_Connecting(_serverIp, _port));
-                await client.ConnectAsync(_serverIp, _port).ConfigureAwait(false);
+                var connectTask = client.ConnectAsync(_serverIp, _port);
+                using (ct.Register(delegate
+                {
+                    try { client.Dispose(); } catch { }
+                }))
+                {
+                    await connectTask.ConfigureAwait(false);
+                }
                 Log(L.C_Connected(_serverIp, _port));
 
                 return new TcpWireStream(client.GetStream(), L.C_ResumeConnClosed);
@@ -221,33 +250,50 @@ namespace TrFileTransfer
         }
 
         /// <summary>
-        /// Connects and runs the auth handshake, wrapping the wire stream for encryption
-        /// when the peer accepts 0x07. Against an older peer (no 0x17 answer) the
-        /// connection is re-established once and the plain 0x05 frame is used instead.
+        /// Connects and runs the prelude negotiation: 0x08 compression offer, then the
+        /// 0x07/0x05 auth. Against an older peer each offer can fail independently —
+        /// the connection is re-established with that feature dropped (compression
+        /// first, then encryption), at most twice.
         /// </summary>
         private async Task<IWireStream> OpenAndAuthenticateAsync(CancellationToken ct)
         {
             bool allowEncrypt = EncryptionEnabled;
+            bool allowCompress = CompressionEnabled;
             for (int attempt = 0; ; attempt++)
             {
                 TcpWireStream raw = await ConnectAsync(ct).ConfigureAwait(false);
                 AuthResult auth;
                 try
                 {
-                    auth = await ClientWire.AuthenticateAsync(raw, PairingCode, allowEncrypt, _cb, ct).ConfigureAwait(false);
+                    auth = await ClientWire.AuthenticateAsync(raw, PairingCode, allowEncrypt, allowCompress, _cb, ct,
+                        EncryptionDowngradeAllowed).ConfigureAwait(false);
                 }
                 catch
                 {
                     raw.Dispose();
                     throw;
                 }
-                if (auth.NeedPlainFallback && allowEncrypt && attempt == 0)
+                if (auth.NeedNoCompressionFallback && allowCompress && attempt < 2)
                 {
                     raw.Dispose();
+                    allowCompress = false;
+                    _cb.RaiseLog(L.C_CompressFallback);
+                    continue;
+                }
+                if (auth.NeedPlainFallback && allowEncrypt && attempt < 2)
+                {
+                    raw.Dispose();
+                    // A peer too old for 0x17 is too old for 0x08 as well
                     allowEncrypt = false;
+                    allowCompress = false;
                     _cb.RaiseLog(L.C_EncryptFallback);
                     continue;
                 }
+                // A successful prelude (encryption or compression accepted) proves the
+                // peer is a current build, which means it sends the TCP completion
+                // verdict byte. Without that proof (no pairing and compression off, or
+                // an older peer) do not wait for a byte that may never come.
+                _cb.CompletionAckOnStream = auth.Encrypted || auth.Compressed;
                 return auth.Stream;
             }
         }

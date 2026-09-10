@@ -5,6 +5,7 @@ using System.Linq;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -43,6 +44,7 @@ namespace TrFileTransfer
         private WinForms.NotifyIcon _notifyIcon;
         private WinForms.ContextMenuStrip _trayMenu;
         private HttpShareServer _httpShare;
+        private QrDialog _qrDialog;
         private DiscoveryServer _discoveryServer;
         private bool _trayExit;
         private volatile bool _windowClosed;
@@ -56,6 +58,9 @@ namespace TrFileTransfer
         private TransferClient _client;
         private TransferUdtServer _serverUdt;
         private TransferUdtClient _clientUdt;
+        /// <summary>Active parallel (concurrency > 1) single-file send, held so the
+        /// Cancel button can actually stop it.</summary>
+        private ConcurrentTransfer _concurrent;
         private int _serverCount;
         private readonly Dictionary<IPEndPoint, Border> _tcpCards = new Dictionary<IPEndPoint, Border>();
         private readonly Dictionary<IPEndPoint, Border> _udtCards = new Dictionary<IPEndPoint, Border>();
@@ -68,6 +73,11 @@ namespace TrFileTransfer
         private CancellationTokenSource _monitorCts;
         private int _monitorSrcPort;
         private int _monitorSpeedBytesPerSec;
+        // Snapshot of the panel state taken on the UI thread when monitoring starts —
+        // the monitor loop runs on the threadpool and must never touch WPF controls
+        // (DependencyObjects enforce thread affinity even for reads)
+        private bool _monitorIsTcp;
+        private string _monitorPairing;
         private readonly List<string> _monitorQueue = new List<string>();
         private readonly object _monitorLock = new object();
 
@@ -120,6 +130,9 @@ namespace TrFileTransfer
             LoadKnownDevices();
 
             Application.Current.SessionEnding += (s, e) => { _trayExit = true; };
+            // The HWND exists from SourceInitialized on — that's where the
+            // WM_SETTINGCHANGE hook for live theme tracking can attach
+            SourceInitialized += (s, e) => HookSystemThemeChanges();
             AllowDrop = true;
             DragEnter += MainWindow_DragEnter;
             Drop += MainWindow_DragDrop;
@@ -142,6 +155,9 @@ namespace TrFileTransfer
             _chkEncrypt.IsChecked = Config.GetBool("Encrypt", true);
             _chkEncrypt.Checked += (s, e) => Config.SetBool("Encrypt", true);
             _chkEncrypt.Unchecked += (s, e) => Config.SetBool("Encrypt", false);
+            _chkCompress.IsChecked = Config.GetBool("Compress", true);
+            _chkCompress.Checked += (s, e) => Config.SetBool("Compress", true);
+            _chkCompress.Unchecked += (s, e) => Config.SetBool("Compress", false);
             _chkAutoRetry.IsChecked = Config.GetBool("AutoRetry", true);
             _chkAutoRetry.Checked += (s, e) => Config.SetBool("AutoRetry", true);
             _chkAutoRetry.Unchecked += (s, e) => Config.SetBool("AutoRetry", false);
@@ -309,11 +325,15 @@ namespace TrFileTransfer
         private void BtnTheme_Click(object sender, RoutedEventArgs e)
         {
             ThemeManager.Toggle();
+            // Cycle feedback in the log — the icon alone can't convey "auto"
+            AddLog(ThemeManager.Mode == "auto" ? L.ThemeModeAuto
+                : ThemeManager.Mode == "dark" ? L.ThemeModeDark : L.ThemeModeLight);
             UpdateThemeButton();
         }
 
         /// <summary>Sun glyph in dark mode (switch to light), moon in light mode;
-        /// text fallback on systems without an icon font.</summary>
+        /// text fallback on systems without an icon font. The tooltip names the mode
+        /// because the icon only shows the effective (resolved) theme.</summary>
         private void UpdateThemeButton()
         {
             if (IconFont.Available)
@@ -326,7 +346,35 @@ namespace TrFileTransfer
             {
                 _btnTheme.Content = L.ThemeBtn(ThemeManager.IsDark);
             }
-            _btnTheme.ToolTip = L.ThemeToggleTip;
+            _btnTheme.ToolTip = ThemeManager.Mode == "auto" ? L.ThemeModeAuto
+                : ThemeManager.Mode == "dark" ? L.ThemeModeDark : L.ThemeModeLight;
+        }
+
+        /// <summary>Live system-theme tracking: Windows broadcasts WM_SETTINGCHANGE
+        /// ("ImmersiveColorSet") when the personalization flips — re-resolve auto mode.</summary>
+        private void HookSystemThemeChanges()
+        {
+            var source = System.Windows.Interop.HwndSource.FromHwnd(
+                new System.Windows.Interop.WindowInteropHelper(this).Handle);
+            if (source == null) return;
+            source.AddHook(delegate (IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+            {
+                const int WM_SETTINGCHANGE = 0x001A;
+                if (msg == WM_SETTINGCHANGE)
+                {
+                    try
+                    {
+                        string section = Marshal.PtrToStringUni(lParam);
+                        if (section == "ImmersiveColorSet")
+                        {
+                            ThemeManager.SystemThemeChanged();
+                            UpdateThemeButton();
+                        }
+                    }
+                    catch { }
+                }
+                return IntPtr.Zero;
+            });
         }
 
         /// <summary>Marshals the action onto the UI thread; silently dropped once the
@@ -481,12 +529,14 @@ namespace TrFileTransfer
                 _btnHttpShare.Content = L.HttpShareBtn;
             else
                 _btnHttpShare.Content = L.HttpShareStop;
+            _btnShareQr.Content = L.ShareQrBtn;
             _btnRecvOptions.Content = L.RecvOptionsBtn;
             _btnStats.Content = L.StatsBtn;
             _btnHistory.Content = L.HistoryBtn;
             _btnDevices.Content = L.DevicesBtn;
             _btnPause.Content = _paused ? L.ResumeText : L.PauseBtn;
             _chkEncrypt.Content = L.EncryptLabel;
+            _chkCompress.Content = L.CompressLabel;
             _chkAutoRetry.Content = L.AutoRetryLabel;
 
             PopulateBindAddresses();
@@ -638,9 +688,15 @@ namespace TrFileTransfer
         /// and restart. Invoked on the UI thread.</summary>
         internal void ApplyUpdateAndRestart(string stagedPath)
         {
+            ApplyUpdateAndRestart(stagedPath, null);
+        }
+
+        internal void ApplyUpdateAndRestart(string stagedPath, string expectedSha256Hex)
+        {
             try
             {
-                Updater.Apply(stagedPath, App.ExePath);
+                // Re-verify the staged binary right before the swap (TOCTOU defence)
+                Updater.Apply(stagedPath, App.ExePath, expectedSha256Hex);
             }
             catch (Exception ex)
             {
@@ -709,8 +765,10 @@ namespace TrFileTransfer
             {
                 _httpShare.Stop();
                 _httpShare = null;
+                CloseShareQr();
                 AddLog(L.HttpShareOff);
                 _btnHttpShare.Content = L.HttpShareBtn;
+                _btnShareQr.IsEnabled = false;
                 return;
             }
 
@@ -731,17 +789,42 @@ namespace TrFileTransfer
                 share.Start(dir, port, token);
                 _httpShare = share;
                 _btnHttpShare.Content = L.HttpShareStop;
+                _btnShareQr.IsEnabled = true;
                 AddLog(L.HttpShareOn(share.LanUrl));
-                // QR code next to the plain URL — phones scan instead of typing
-                var qr = new QrDialog(share.LanUrl) { Owner = this };
-                qr.Show();
+                ShowShareQr();
             }
             catch (Exception ex)
             {
                 AddLog(L.HttpShareStartFailed(ex.Message));
-                MessageBox.Show(this, L.HttpShareStartFailed(ex.Message), L.DlgError,
-                    MessageBoxButton.OK, MessageBoxImage.Error);
+                MessageBox.Show(this, L.HttpShareStartFailed(ex.Message),
+                    L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
             }
+        }
+
+        private void BtnShareQr_Click(object sender, RoutedEventArgs e)
+        {
+            ShowShareQr();
+        }
+
+        /// <summary>Shows the share QR dialog, or just brings the existing one to the
+        /// front — lets the user reopen a closed QR without restarting the share.</summary>
+        private void ShowShareQr()
+        {
+            if (_httpShare == null || !_httpShare.IsRunning) return;
+            if (_qrDialog != null && _qrDialog.IsLoaded)
+            {
+                _qrDialog.Activate();
+                return;
+            }
+            _qrDialog = new QrDialog(HttpShareServer.LanAddresses(), _httpShare.Port) { Owner = this };
+            _qrDialog.Show();
+        }
+
+        private void CloseShareQr()
+        {
+            if (_qrDialog == null) return;
+            try { _qrDialog.Close(); } catch { }
+            _qrDialog = null;
         }
 
         private void BtnOpenDir_Click(object sender, RoutedEventArgs e)
@@ -1118,7 +1201,8 @@ namespace TrFileTransfer
                 client.OnLog += msg => RunOnUi(() => AddLog(msg));
                 client.OnError += msg => { error = new Exception(msg); };
                 client.OnStopped += () => done.TrySetResult(error == null);
-                await client.SendTextAsync(text).ConfigureAwait(true);
+                try { await client.SendTextAsync(text).ConfigureAwait(true); }
+                catch { /* failures propagate like TCP after OnError fired; OnStopped settles the task */ }
             }
             else
             {
@@ -1659,7 +1743,9 @@ namespace TrFileTransfer
                     var concurrent = new ConcurrentTransfer(ip, port, path, concurrency, isTcp, srcPort, speedLimit);
                     concurrent.PairingCode = _txtPairing.Text.Trim();
                     WireConcurrentEvents(concurrent);
-                    await concurrent.SendAsync();
+                    _concurrent = concurrent; // so BtnCancel_Click can stop it
+                    try { await concurrent.SendAsync(); }
+                    finally { _concurrent = null; }
                 }
                 else if (isTcp)
                 {
@@ -1979,6 +2065,8 @@ namespace TrFileTransfer
                 CancelFanOut();
                 return;
             }
+            if (_concurrent != null)
+                _concurrent.Cancel();
             if (_client != null)
                 _client.Cancel();
             if (_clientUdt != null)
@@ -2180,8 +2268,12 @@ namespace TrFileTransfer
 
         private static string FormatEta(TransferProgress p)
         {
-            if (p.SpeedBytesPerSecond <= 0) return "--:--";
+            if (p.SpeedBytesPerSecond <= 0 || p.TotalBytes <= 0) return "--:--";
             var remaining = TimeSpan.FromSeconds((p.TotalBytes - p.BytesTransferred) / p.SpeedBytesPerSecond);
+            if (remaining.Ticks <= 0) return "0:00";
+            // TimeSpan's "mm" is the minute COMPONENT (0-59) — spell out hours
+            // explicitly or a 2h05m ETA renders as "05:00"
+            if (remaining.TotalHours >= 1) return string.Format("{0:h\\:mm\\:ss}", remaining);
             return string.Format("{0:mm\\:ss}", remaining);
         }
 
@@ -2380,6 +2472,9 @@ namespace TrFileTransfer
             _monitorCts = new CancellationTokenSource();
             _monitorSrcPort = _numSrcPort.Value;
             _monitorSpeedBytesPerSec = _numSpeed.Value * 1024;
+            _monitorIsTcp = _rbClientTcp.IsChecked == true;
+            _monitorPairing = _txtPairing.Text.Trim();
+            lock (_monitorLock) { _monitorQueue.Clear(); } // stale entries from a previous session
 
             DisableClientInputs();
             _lblStatusC.Text = L.MonitorWaiting;
@@ -2393,10 +2488,17 @@ namespace TrFileTransfer
 
         private void StopMonitoring()
         {
-            if (_monitorCts != null)
+            // Clear the CTS: several UI guards test `_monitorCts != null` to mean
+            // "monitoring is active", so leaving it set here would permanently disable
+            // the queue/scan/fan-out buttons for the rest of the process lifetime.
+            var cts = _monitorCts;
+            _monitorCts = null;
+            if (cts != null)
             {
-                try { _monitorCts.Cancel(); } catch { }
+                try { cts.Cancel(); } catch { }
+                try { cts.Dispose(); } catch { }
             }
+            lock (_monitorLock) { _monitorQueue.Clear(); }
             _btnCancel.IsEnabled = false;
             _lblStatusC.Text = L.MonitorStopped;
             AddLog(L.MonitorLogStopped);
@@ -2407,18 +2509,22 @@ namespace TrFileTransfer
         {
             using (var watcher = new FileSystemWatcher(folderPath))
             {
-                // Scan existing files first
-                foreach (var file in Directory.GetFiles(folderPath))
-                {
-                    lock (_monitorLock) { _monitorQueue.Add(file); }
-                }
-
                 watcher.NotifyFilter = NotifyFilters.FileName;
                 watcher.Created += (s, e) =>
                 {
                     lock (_monitorLock) { _monitorQueue.Add(e.FullPath); }
                 };
+                // Events ON before the scan: a file created in between is caught by
+                // the watcher instead of falling through the scan-then-enable gap
                 watcher.EnableRaisingEvents = true;
+
+                foreach (var file in Directory.GetFiles(folderPath))
+                {
+                    lock (_monitorLock)
+                    {
+                        if (!_monitorQueue.Contains(file)) _monitorQueue.Add(file);
+                    }
+                }
 
                 while (!ct.IsCancellationRequested)
                 {
@@ -2451,7 +2557,11 @@ namespace TrFileTransfer
             if (!await WaitForFileReady(filePath, ct))
             {
                 RunOnUi(() => AddLog(L.MonitorFileNotReady(fileName)));
-                lock (_monitorLock) { _monitorQueue.Add(filePath); }
+                // Requeue only what still exists — a vanished file (deleted, or a
+                // duplicate of one already moved to the sent folder) would otherwise
+                // bounce through the queue forever in a tight loop
+                if (File.Exists(filePath))
+                    lock (_monitorLock) { _monitorQueue.Add(filePath); }
                 return;
             }
 
@@ -2461,9 +2571,9 @@ namespace TrFileTransfer
                 var tcs = new TaskCompletionSource<bool>();
 
                 var card = RunOnUiSync(() => CreateTransferCard(_progressPanelC));
-                if (_rbClientTcp.IsChecked == true)
+                if (_monitorIsTcp)
                 {
-                    var client = ClientFactory.CreateTcp(ip, port, filePath, _monitorSrcPort, _monitorSpeedBytesPerSec, _txtPairing.Text.Trim());
+                    var client = ClientFactory.CreateTcp(ip, port, filePath, _monitorSrcPort, _monitorSpeedBytesPerSec, _monitorPairing);
                     client.OnLog += msg => RunOnUi(() => AddLog(msg));
                     client.OnProgress += p => RunOnUi(() => UpdateCardProgress(card, p));
                     client.OnError += msg => RunOnUi(() => AddLog(L.MonitorFileSendFailed(fileName, msg)));
@@ -2473,7 +2583,7 @@ namespace TrFileTransfer
                 }
                 else
                 {
-                    var clientUdt = ClientFactory.CreateUdt(ip, port, filePath, _monitorSrcPort, _monitorSpeedBytesPerSec, _txtPairing.Text.Trim());
+                    var clientUdt = ClientFactory.CreateUdt(ip, port, filePath, _monitorSrcPort, _monitorSpeedBytesPerSec, _monitorPairing);
                     clientUdt.OnLog += msg => RunOnUi(() => AddLog(msg));
                     clientUdt.OnProgress += p => RunOnUi(() => UpdateCardProgress(card, p));
                     clientUdt.OnError += msg => RunOnUi(() => AddLog(L.MonitorFileSendFailed(fileName, msg)));
@@ -2500,7 +2610,7 @@ namespace TrFileTransfer
                 {
                     AddLog(L.MonitorFileSent(fileName));
                     _lblStatusC.Text = L.MonitorWaiting;
-                    RememberDevice(ip, port, _rbClientTcp.IsChecked != true);
+                    RememberDevice(ip, port, !_monitorIsTcp);
                 });
             }
         }

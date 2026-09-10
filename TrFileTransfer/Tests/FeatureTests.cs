@@ -15,11 +15,53 @@ namespace TrFileTransfer.Tests
         public static void RunUnit(TestRunner runner)
         {
             RunWireCrypto(runner);
+            RunWireCompress(runner);
+            RunChunkTracker(runner);
             RunIpFilter(runner);
             RunDiskSpace(runner);
             RunQr(runner);
             RunStatsStore(runner);
             RunSpeedLimiter(runner);
+        }
+
+        // ==================== Unit: chunk reassembly coverage ====================
+
+        private static void RunChunkTracker(TestRunner runner)
+        {
+            runner.Run("ChunkTracker_OverlappingChunks_NotComplete", () =>
+            {
+                // Duplicate/overlapping chunks inflate a naive byte SUM past TotalSize;
+                // completion must instead require real coverage of [0, TotalSize).
+                string dir = Path.Combine(TempBase(), "tr_ck_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    var t = new ChunkTracker { FileName = "f.bin", TotalSize = 100, SavePath = Path.Combine(dir, "f.bin") };
+                    var data = new byte[50];
+                    Assert.False(t.WriteChunk(0, data, 50), "first 50 bytes: not complete");
+                    // Same range again — sum would now be 100 but bytes 50..99 are missing
+                    Assert.False(t.WriteChunk(0, data, 50), "duplicate range must not complete");
+                    Assert.True(t.WriteChunk(50, data, 50), "covering the tail completes it");
+                    t.Dispose();
+                }
+                finally { try { Directory.Delete(dir, true); } catch { } }
+            });
+
+            runner.Run("ChunkTracker_OutOfOrder_CoverageCompletes", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_ck2_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    var t = new ChunkTracker { FileName = "g.bin", TotalSize = 90, SavePath = Path.Combine(dir, "g.bin") };
+                    var data = new byte[30];
+                    Assert.False(t.WriteChunk(60, data, 30), "tail first");
+                    Assert.False(t.WriteChunk(0, data, 30), "head second");
+                    Assert.True(t.WriteChunk(30, data, 30), "middle closes the gap");
+                    t.Dispose();
+                }
+                finally { try { Directory.Delete(dir, true); } catch { } }
+            });
         }
 
         public static void RunIntegration(TestRunner runner)
@@ -39,6 +81,127 @@ namespace TrFileTransfer.Tests
             runner.Run("Feature_TCP_SessionStats", TcpSessionStats);
             runner.Run("Feature_TCP_RecvSpeedLimit", TcpRecvSpeedLimit);
             runner.Run("Feature_TCP_PauseResume", TcpPauseResume);
+            runner.Run("Feature_TCP_Compressed", TcpCompressed);
+            runner.Run("Feature_TCP_CompressEncrypted", TcpCompressEncrypted);
+            runner.Run("Feature_TCP_CompressResume", TcpCompressResume);
+            runner.Run("Feature_TCP_CompressFallbackOldPeer", TcpCompressFallbackOldPeer);
+            runner.Run("Feature_UDT_Compressed", UdtCompressed, 1);
+            runner.Run("Feature_TCP_ResumeOffsetGap_Rejected", TcpResumeOffsetGapRejected);
+            runner.Run("Feature_TCP_AuthLockout", TcpAuthLockout);
+            runner.Run("Feature_TCP_CompletionAck_SurvivesCompression", TcpCompletionAckCompressed);
+        }
+
+        /// <summary>A client that declares a resume offset above what the server has
+        /// received must NOT be believed: the server resumes from its own byte count,
+        /// so the skipped region is actually transferred (and a zero-filled "complete"
+        /// file cannot be produced).</summary>
+        private static void TcpResumeOffsetGapRejected()
+        {
+            using (var fx = new TcpServerFixture())
+            {
+                string testFile = Path.Combine(fx.SendDir, "gap.bin");
+                var rng = new Random(7);
+                var content = new byte[200 * 1024];
+                rng.NextBytes(content);
+                File.WriteAllBytes(testFile, content);
+                fx.Start();
+
+                var sessionId = Guid.NewGuid();
+                var client = new TransferClient("127.0.0.1", fx.Port, testFile);
+                var done = new ManualResetEvent(false);
+                bool ok = false;
+                client.OnTransferComplete += () => { ok = true; done.Set(); };
+                client.OnError += _ => done.Set();
+                // The client declares its own offset from its saved state; seed the
+                // state with a bogus 100 KB so it claims to be ahead of the server.
+                var seed = new ResumeState
+                {
+                    SessionId = sessionId,
+                    TotalSize = content.Length,
+                    FileName = Path.GetFileName(testFile),
+                    FilePath = testFile,
+                    ServerIp = "127.0.0.1",
+                    Port = fx.Port,
+                    IsUdt = false,
+                    Created = DateTime.UtcNow,
+                    SentBytes = 100 * 1024
+                };
+                seed.Save();
+                client.SendResumableAsync(sessionId).Wait(30000);
+                Assert.True(done.WaitOne(30000), "client finished");
+
+                WaitForFileCount(fx, 1);
+                string[] files = RecvFiles(fx);
+                Assert.Equal(1, files.Length, "one file received");
+                byte[] saved = File.ReadAllBytes(files[0]);
+                Assert.Equal(content.Length, saved.Length, "full size");
+                // If the gap were skipped, the head would be zeros instead of content.
+                Assert.True(Utils.ConstantTimeEquals(content, saved), "no zero-filled gap");
+                Assert.True(ok, "transfer completed");
+            }
+        }
+
+        /// <summary>Repeated wrong pairing codes lock the peer out; even a correct code
+        /// is then refused until the server restarts (or the peer had succeeded first).</summary>
+        private static void TcpAuthLockout()
+        {
+            using (var fx = new TcpServerFixture())
+            {
+                fx.Server.PairingCode = "424242";
+                string testFile = Path.Combine(fx.SendDir, "lock.bin");
+                MakeTestFile(testFile, 4096);
+                fx.Start();
+
+                // Exhaust the allowance with wrong codes.
+                for (int i = 0; i < 12; i++)
+                {
+                    var bad = new TransferClient("127.0.0.1", fx.Port, testFile);
+                    bad.PairingCode = "000000";
+                    var d = new ManualResetEvent(false);
+                    bad.OnTransferComplete += () => d.Set();
+                    bad.OnError += _ => d.Set();
+                    bad.SendAsync();
+                    d.WaitOne(10000);
+                }
+
+                // Now a correct code must still be refused (locked out).
+                var good = new TransferClient("127.0.0.1", fx.Port, testFile);
+                good.PairingCode = "424242";
+                var goodDone = new ManualResetEvent(false);
+                bool goodOk = false;
+                good.OnTransferComplete += () => { goodOk = true; goodDone.Set(); };
+                good.OnError += _ => goodDone.Set();
+                good.SendAsync();
+                goodDone.WaitOne(15000);
+
+                Assert.False(goodOk, "correct code refused while locked out");
+                Assert.Equal(0, RecvFiles(fx).Length, "nothing saved under lockout");
+            }
+        }
+
+        /// <summary>With compression accepted (so the client knows the peer is a current
+        /// build), a refused transfer must surface as a client-side failure rather than
+        /// silent success — this is the TCP completion-ack path through the decorator.</summary>
+        private static void TcpCompletionAckCompressed()
+        {
+            using (var fx = new TcpServerFixture())
+            {
+                fx.Server.ConfirmRequest = (ip, name, size, files, isFolder) => Task.FromResult(false);
+                string testFile = Path.Combine(fx.SendDir, "denied_c.bin");
+                MakeTestFile(testFile, 64 * 1024);
+                fx.Start();
+
+                var client = new TransferClient("127.0.0.1", fx.Port, testFile);
+                client.CompressionEnabled = true;
+                var done = new ManualResetEvent(false);
+                bool failed = false;
+                client.OnTransferComplete += () => done.Set();
+                client.OnError += _ => { failed = true; done.Set(); };
+                client.SendAsync();
+                Assert.True(done.WaitOne(20000), "client finished");
+                Assert.True(failed, "refused transfer reported as failure on the client");
+                Assert.Equal(0, RecvFiles(fx).Length, "denied file not saved");
+            }
         }
 
         // ==================== Unit: session crypto ====================
@@ -101,6 +264,53 @@ namespace TrFileTransfer.Tests
                 SessionCrypto.DeriveSessionKeys(psk, MakeSecret(4, 16), out a1, out a2, out a3, out a4);
                 SessionCrypto.DeriveSessionKeys(psk, MakeSecret(5, 16), out b1, out b2, out b3, out b4);
                 Assert.False(Utils.ConstantTimeEquals(a1, b1), "different salt -> different key");
+            });
+
+            runner.Run("WireCrypto_EcdhSharedSecret_Agrees", () =>
+            {
+                using (var a = SessionCrypto.CreateEcdhKey())
+                using (var b = SessionCrypto.CreateEcdhKey())
+                {
+                    var apub = SessionCrypto.EcdhPublicBlob(a);
+                    var bpub = SessionCrypto.EcdhPublicBlob(b);
+                    Assert.Equal(SessionCrypto.EcdhPublicBytes, apub.Length, "P-256 blob size");
+                    var sab = SessionCrypto.EcdhDeriveShared(a, bpub);
+                    var sba = SessionCrypto.EcdhDeriveShared(b, apub);
+                    Assert.True(Utils.ConstantTimeEquals(sab, sba), "both sides derive the same secret");
+                }
+            });
+
+            runner.Run("WireCrypto_EcdhSharedSecret_RejectsBadBlob", () =>
+            {
+                using (var a = SessionCrypto.CreateEcdhKey())
+                {
+                    Assert.Throws(() => SessionCrypto.EcdhDeriveShared(a, new byte[SessionCrypto.EcdhPublicBytes]),
+                        "all-zero blob rejected");
+                    Assert.Throws(() => SessionCrypto.EcdhDeriveShared(a, new byte[10]),
+                        "short blob rejected");
+                }
+            });
+
+            runner.Run("WireCrypto_AuthKey_BindsCodeAndTranscript", () =>
+            {
+                using (var a = SessionCrypto.CreateEcdhKey())
+                using (var b = SessionCrypto.CreateEcdhKey())
+                {
+                    var apub = SessionCrypto.EcdhPublicBlob(a);
+                    var bpub = SessionCrypto.EcdhPublicBlob(b);
+                    var shared = SessionCrypto.EcdhDeriveShared(a, bpub);
+                    var k1 = SessionCrypto.DeriveAuthKey("123456", apub, bpub, shared);
+                    var k2 = SessionCrypto.DeriveAuthKey("123456", apub, bpub, shared);
+                    var k3 = SessionCrypto.DeriveAuthKey("654321", apub, bpub, shared);
+                    Assert.True(Utils.ConstantTimeEquals(k1, k2), "auth key deterministic");
+                    Assert.False(Utils.ConstantTimeEquals(k1, k3), "wrong code changes the auth key");
+                    // Confirms are label- and transcript-bound
+                    var c1 = SessionCrypto.Confirm(k1, "c2s-confirm", apub, bpub);
+                    var c2 = SessionCrypto.Confirm(k1, "s2c-confirm", apub, bpub);
+                    Assert.False(Utils.ConstantTimeEquals(c1, c2), "direction labels are domain-separated");
+                    Assert.True(Utils.ConstantTimeEquals(c1, SessionCrypto.Confirm(k1, "c2s-confirm", apub, bpub)),
+                        "confirm deterministic");
+                }
             });
 
             runner.Run("WireCrypto_Roundtrip_LargeMultiSegment", () =>
@@ -241,6 +451,196 @@ namespace TrFileTransfer.Tests
                     enc.WriteExactAsync(new byte[10], 0, 0, CancellationToken.None).Wait();
                 Assert.Equal(0L, wire.Buffer.Length, "zero-length write writes nothing");
             });
+
+            runner.Run("WireCrypto_BoundSequence_ReorderedSegmentsDetected", () =>
+            {
+                // With the sequence-bound format (0x09), reordering two equal-length
+                // records on the wire must fail authentication instead of decrypting.
+                byte[] c2sEnc, c2sMac, s2cEnc, s2cMac;
+                SessionCrypto.DeriveSessionKeys(MakeSecret(21, 32), MakeSecret(22, 16),
+                    out c2sEnc, out c2sMac, out s2cEnc, out s2cMac);
+
+                const int SegLen = 1000;
+                const int RecSize = 8 + 4 + SessionCrypto.WireMacBytes + SegLen;
+                byte[] raw;
+                {
+                    var wire = new MemoryWireStream();
+                    using (var enc = new EncryptedWireStream(wire, c2sEnc, c2sMac, s2cEnc, s2cMac, true, true))
+                    {
+                        var a = MakeSecret(23, SegLen);
+                        var b = MakeSecret(24, SegLen);
+                        enc.WriteExactAsync(a, 0, a.Length, CancellationToken.None).Wait();
+                        enc.WriteExactAsync(b, 0, b.Length, CancellationToken.None).Wait();
+                    }
+                    raw = wire.Buffer.ToArray();
+                }
+                Assert.Equal((long)(RecSize * 2), (long)raw.Length, "two records on the wire");
+
+                // Swap the two whole records: the reader sees seq 0/1 swapped against
+                // ciphertext, and the MAC (which covers seq) no longer matches.
+                var swapped = new byte[raw.Length];
+                Buffer.BlockCopy(raw, RecSize, swapped, 0, RecSize);
+                Buffer.BlockCopy(raw, 0, swapped, RecSize, RecSize);
+
+                var reader = new MemoryWireStream();
+                reader.Buffer.Write(swapped, 0, swapped.Length);
+                reader.Buffer.Position = 0;
+                bool threw = false;
+                try
+                {
+                    using (var dec = new EncryptedWireStream(reader, s2cEnc, s2cMac, c2sEnc, c2sMac, true, true))
+                        dec.ReadExactAsync(new byte[SegLen * 2], 0, SegLen * 2, CancellationToken.None).Wait();
+                }
+                catch (AggregateException) { threw = true; }
+
+                Assert.True(threw, "reordered records must fail authentication");
+            });
+        }
+
+        // ==================== Unit: transport compression ====================
+
+        private static void RunWireCompress(TestRunner runner)
+        {
+            runner.Run("WireCompress_Roundtrip_VariedSizes", () =>
+            {
+                // Writes shaped like the real pipeline: tiny header, big payload,
+                // random (stored) payload, odd sizes — read back across segment
+                // boundaries with a mix of ReadExact and ReadSome
+                var wire = new MemoryWireStream();
+                var parts = new System.Collections.Generic.List<byte[]>();
+                parts.Add(MakeSecret(101, 13));                    // tiny — stored
+                byte[] flat = new byte[1024 * 1024];                // compressible — deflated
+                for (int i = 0; i < flat.Length; i++) flat[i] = (byte)(i % 251);
+                parts.Add(flat);
+                parts.Add(MakeSecret(102, 300 * 1024));            // random — stored
+                parts.Add(MakeSecret(103, 1));
+                parts.Add(MakeSecret(104, 65537));
+
+                using (var comp = new CompressedWireStream(wire))
+                {
+                    foreach (var p in parts)
+                        comp.WriteExactAsync(p, 0, p.Length, CancellationToken.None).Wait();
+                }
+
+                wire.Buffer.Position = 0;
+                using (var dec = new CompressedWireStream(wire))
+                {
+                    // Read part 0 exactly, part 1 via ReadSome chunks, rest exactly
+                    var buf0 = new byte[parts[0].Length];
+                    dec.ReadExactAsync(buf0, 0, buf0.Length, CancellationToken.None).Wait();
+                    Assert.True(Utils.ConstantTimeEquals(parts[0], buf0), "tiny header segment roundtrips");
+
+                    var buf1 = new byte[parts[1].Length];
+                    int got1 = 0;
+                    while (got1 < buf1.Length)
+                    {
+                        int n = dec.ReadSomeAsync(buf1, got1, buf1.Length - got1, CancellationToken.None).Result;
+                        if (n <= 0) break;
+                        got1 += n;
+                    }
+                    Assert.Equal(buf1.Length, got1, "compressible payload fully read");
+                    Assert.True(Utils.ConstantTimeEquals(parts[1], buf1), "compressible payload roundtrips");
+
+                    for (int i = 2; i < parts.Count; i++)
+                    {
+                        var buf = new byte[parts[i].Length];
+                        dec.ReadExactAsync(buf, 0, buf.Length, CancellationToken.None).Wait();
+                        Assert.True(Utils.ConstantTimeEquals(parts[i], buf), "part " + i + " roundtrips");
+                    }
+                }
+            });
+
+            runner.Run("WireCompress_ShrinksCompressible_StoresRandom", () =>
+            {
+                var flat = new byte[1024 * 1024];
+                for (int i = 0; i < flat.Length; i++) flat[i] = (byte)'A';
+                var wire = new MemoryWireStream();
+                using (var comp = new CompressedWireStream(wire))
+                    comp.WriteExactAsync(flat, 0, flat.Length, CancellationToken.None).Wait();
+                Assert.True(wire.Buffer.Length < flat.Length / 8, "repetitive data compresses on the wire");
+
+                var rnd = MakeSecret(105, 200 * 1024);
+                var wire2 = new MemoryWireStream();
+                using (var comp2 = new CompressedWireStream(wire2))
+                    comp2.WriteExactAsync(rnd, 0, rnd.Length, CancellationToken.None).Wait();
+                // Stored fallback: raw bytes + a 4-byte header, never a blow-up
+                Assert.True(wire2.Buffer.Length <= rnd.Length + 4 + 64, "random data goes stored (no expansion)");
+
+                wire2.Buffer.Position = 0;
+                var back = new byte[rnd.Length];
+                using (var dec2 = new CompressedWireStream(wire2))
+                    dec2.ReadExactAsync(back, 0, back.Length, CancellationToken.None).Wait();
+                Assert.True(Utils.ConstantTimeEquals(rnd, back), "stored random data roundtrips");
+            });
+
+            runner.Run("WireCompress_CorruptSegment_Throws", () =>
+            {
+                // A segment length beyond the decompression cap must be refused
+                // deterministically (raw-deflate bit flips may or may not produce an
+                // invalid Huffman code, so corrupting the LENGTH is the stable probe;
+                // end-to-end payload integrity is covered by the protocol SHA256).
+                var raw = new byte[4 + 8];
+                Buffer.BlockCopy(BitConverter.GetBytes(0x04000001u), 0, raw, 0, 4); // > MaxSegment
+                bool threw = false;
+                using (var dec = new CompressedWireStream(new MemoryStreamWire(raw)))
+                {
+                    try
+                    {
+                        var buf = new byte[4096];
+                        dec.ReadSomeAsync(buf, 0, buf.Length, CancellationToken.None).Wait();
+                    }
+                    catch (AggregateException ex)
+                    {
+                        threw = ex.InnerException is IOException;
+                    }
+                }
+                Assert.True(threw, "oversized segment length must throw IOException");
+
+                // Zero length is equally invalid
+                var raw0 = new byte[4];
+                Buffer.BlockCopy(BitConverter.GetBytes(0u), 0, raw0, 0, 4);
+                bool threw0 = false;
+                using (var dec0 = new CompressedWireStream(new MemoryStreamWire(raw0)))
+                {
+                    try
+                    {
+                        var buf = new byte[16];
+                        dec0.ReadSomeAsync(buf, 0, buf.Length, CancellationToken.None).Wait();
+                    }
+                    catch (AggregateException ex)
+                    {
+                        threw0 = ex.InnerException is IOException;
+                    }
+                }
+                Assert.True(threw0, "zero-length segment must throw IOException");
+            });
+
+            runner.Run("WireCompress_LayeredUnderEncryption", () =>
+            {
+                // The real session stacking: compression wraps encryption, so the
+                // wire bytes are encrypt(compress(plain)) — deflate sees plaintext
+                var psk = MakeSecret(107, 32);
+                var salt = MakeSecret(108, 16);
+                byte[] c2sEnc, c2sMac, s2cEnc, s2cMac;
+                SessionCrypto.DeriveSessionKeys(psk, salt, out c2sEnc, out c2sMac, out s2cEnc, out s2cMac);
+
+                var wire = new MemoryWireStream();
+                byte[] flat = new byte[512 * 1024];
+                for (int i = 0; i < flat.Length; i++) flat[i] = (byte)(i % 7);
+                using (var enc = new EncryptedWireStream(wire, c2sEnc, c2sMac, s2cEnc, s2cMac))
+                using (var comp = new CompressedWireStream(enc))
+                    comp.WriteExactAsync(flat, 0, flat.Length, CancellationToken.None).Wait();
+                Assert.True(wire.Buffer.Length < flat.Length / 4, "compress-then-encrypt shrinks on the wire");
+
+                wire.Buffer.Position = 0;
+                using (var enc = new EncryptedWireStream(wire, s2cEnc, s2cMac, c2sEnc, c2sMac))
+                using (var dec = new CompressedWireStream(enc))
+                {
+                    var back = new byte[flat.Length];
+                    dec.ReadExactAsync(back, 0, back.Length, CancellationToken.None).Wait();
+                    Assert.True(Utils.ConstantTimeEquals(flat, back), "compress+encrypt roundtrip intact");
+                }
+            });
         }
 
         /// <summary>Read-only in-memory stream seeded from a byte array.</summary>
@@ -295,6 +695,15 @@ namespace TrFileTransfer.Tests
             runner.Run("DiskSpace_MissingDir_True", () =>
                 Assert.True(Utils.HasFreeSpace(Path.Combine(TempBase(), "does_not_exist_xyz"), 1024),
                     "falls back to the drive root"));
+            runner.Run("DiskSpace_Overflow_Rejected", () =>
+            {
+                // A declared size near long.MaxValue must not wrap size+margin into a
+                // negative requirement that trivially passes the check.
+                Assert.False(Utils.HasFreeSpaceFor(TempBase(), long.MaxValue), "max declared size rejected");
+                Assert.False(Utils.HasFreeSpaceFor(TempBase(), Utils.MaxTransferSize + 1), "over the cap rejected");
+                Assert.False(Utils.HasFreeSpace(TempBase(), -1), "negative requirement rejected");
+                Assert.True(Utils.HasFreeSpaceFor(TempBase(), 1024), "sane size still passes");
+            });
         }
 
         private static string TempBase()
@@ -426,6 +835,29 @@ namespace TrFileTransfer.Tests
 
                     Assert.True(StatsEntry.Parse("2026-09-07 10:00:00|S|10.0.0.1|1|1|1|only-detail") != null,
                         "7-field line (empty path) parses");
+                });
+
+                runner.Run("StatsStore_ClearAll", () =>
+                {
+                    string path = Path.Combine(dir, "stats_clear.log");
+                    var store = new StatsStore(path);
+                    DateTime now = DateTime.Now;
+                    store.Append(new StatsEntry { When = now, Direction = 'S', Peer = "10.0.0.1", Bytes = 1000, Files = 1, Seconds = 1 });
+                    store.Append(new StatsEntry { When = now, Direction = 'R', Peer = "10.0.0.2", Bytes = 500, Files = 1, Seconds = 1 });
+                    Assert.Equal(2, store.LoadAll().Count, "two entries before clear");
+
+                    store.ClearAll();
+                    Assert.Equal(0, store.LoadAll().Count, "log empty after clear");
+                    Assert.True(File.Exists(path), "log file kept in place");
+
+                    // The same instance keeps accepting new records after a clear
+                    store.Append(new StatsEntry { When = now, Direction = 'S', Peer = "10.0.0.3", Bytes = 7, Files = 1, Seconds = 0.1 });
+                    var after = store.LoadAll();
+                    Assert.Equal(1, after.Count, "append after clear works");
+                    Assert.Equal("10.0.0.3", after[0].Peer, "new entry intact");
+
+                    // A fresh instance (dialog pattern) sees the cleared state too
+                    Assert.Equal(1, new StatsStore(path).LoadAll().Count, "fresh instance agrees");
                 });
             }
             finally
@@ -1074,6 +1506,314 @@ namespace TrFileTransfer.Tests
                 byte[] saved = File.ReadAllBytes(files[0]);
                 Assert.Equal(content.Length, saved.Length, "resumed file is complete");
                 Assert.True(Utils.ConstantTimeEquals(content, saved), "resumed content matches the source");
+            }
+        }
+
+        // ==================== 2.11: transport compression (0x08) ====================
+
+        private static void TcpCompressed()
+        {
+            using (var fx = new TcpServerFixture())
+            {
+                string testFile = Path.Combine(fx.SendDir, "comp.bin");
+                // Compressible payload so the deflate path is genuinely exercised
+                var content = new byte[1200 * 1024];
+                var rng = new Random(77);
+                for (int i = 0; i < content.Length; i += 4096)
+                {
+                    byte b = (byte)rng.Next(256);
+                    int end = Math.Min(i + 4096, content.Length);
+                    for (int j = i; j < end; j++) content[j] = b;
+                }
+                File.WriteAllBytes(testFile, content);
+
+                var logs = new List<string>();
+                var serverDone = new ManualResetEvent(false);
+                bool serverOk = false;
+                fx.Server.OnTransferComplete += () => { serverOk = true; serverDone.Set(); };
+                fx.Server.OnError += _ => serverDone.Set();
+                fx.Start();
+
+                var client = new TransferClient("127.0.0.1", fx.Port, testFile);
+                client.CompressionEnabled = true;
+                client.EncryptionEnabled = false;
+                client.OnLog += msg => logs.Add(msg);
+                var clientDone = new ManualResetEvent(false);
+                bool clientOk = false;
+                client.OnTransferComplete += () => { clientOk = true; clientDone.Set(); };
+                client.OnError += _ => clientDone.Set();
+
+                var sendTask = client.SendAsync();
+                if (!serverDone.WaitOne(30000)) throw new Exception("server timeout");
+                if (!clientDone.WaitOne(5000)) throw new Exception("client timeout");
+                Assert.True(serverOk, "server completed");
+                Assert.True(clientOk, "client completed");
+                if (sendTask.Exception != null)
+                    throw sendTask.Exception.InnerException ?? sendTask.Exception;
+
+                bool sawOn = false;
+                foreach (var m in logs)
+                    if (m.Contains("compression enabled")) sawOn = true;
+                Assert.True(sawOn, "client log reports compression");
+
+                string[] received = WaitForFileCount(fx, 1);
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(received[0])),
+                    "compressed payload intact");
+            }
+        }
+
+        private static void TcpCompressEncrypted()
+        {
+            using (var fx = new TcpServerFixture())
+            {
+                fx.Server.PairingCode = "246810";
+                string testFile = Path.Combine(fx.SendDir, "ce.bin");
+                var content = new byte[900 * 1024];
+                for (int i = 0; i < content.Length; i++) content[i] = (byte)(i % 13);
+                File.WriteAllBytes(testFile, content);
+
+                var logs = new List<string>();
+                var serverDone = new ManualResetEvent(false);
+                bool serverOk = false;
+                fx.Server.OnTransferComplete += () => { serverOk = true; serverDone.Set(); };
+                fx.Server.OnError += _ => serverDone.Set();
+                fx.Start();
+
+                var client = new TransferClient("127.0.0.1", fx.Port, testFile);
+                client.PairingCode = "246810";
+                client.EncryptionEnabled = true;
+                client.CompressionEnabled = true;
+                client.OnLog += msg => logs.Add(msg);
+                var clientDone = new ManualResetEvent(false);
+                bool clientOk = false;
+                client.OnTransferComplete += () => { clientOk = true; clientDone.Set(); };
+                client.OnError += _ => clientDone.Set();
+
+                var sendTask = client.SendAsync();
+                if (!serverDone.WaitOne(30000)) throw new Exception("server timeout");
+                if (!clientDone.WaitOne(5000)) throw new Exception("client timeout");
+                Assert.True(serverOk && clientOk, "both sides completed");
+                if (sendTask.Exception != null)
+                    throw sendTask.Exception.InnerException ?? sendTask.Exception;
+
+                bool sawEnc = false, sawComp = false;
+                foreach (var m in logs)
+                {
+                    if (m.Contains("Encrypted session")) sawEnc = true;
+                    if (m.Contains("compression enabled")) sawComp = true;
+                }
+                Assert.True(sawEnc, "encryption active");
+                Assert.True(sawComp, "compression active");
+
+                string[] received = WaitForFileCount(fx, 1);
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(received[0])),
+                    "encrypted+compressed payload intact");
+            }
+        }
+
+        /// <summary>0x03 resume riding the compression decorator: offsets count
+        /// uncompressed logical bytes, so a cancelled-then-resumed session must
+        /// still finish byte-for-byte.</summary>
+        private static void TcpCompressResume()
+        {
+            using (var fx = new TcpServerFixture())
+            {
+                fx.Start();
+
+                string testFile = Path.Combine(fx.SendDir, "cres.bin");
+                byte[] content = new byte[6 * 1024 * 1024];
+                for (int i = 0; i < content.Length; i++) content[i] = (byte)(i % 11);
+                File.WriteAllBytes(testFile, content);
+                var session = Guid.NewGuid();
+
+                var client = new TransferClient("127.0.0.1", fx.Port, testFile, 0, 4194304, 2 * 1024 * 1024);
+                client.CompressionEnabled = true;
+                client.EncryptionEnabled = false;
+                var stopped = new ManualResetEvent(false);
+                client.OnStopped += () => stopped.Set();
+                var sendTask = client.SendResumableAsync(session, false);
+                if (!stopped.WaitOne(1500))
+                {
+                    client.Cancel();
+                    if (!stopped.WaitOne(10000))
+                        throw new Exception("client did not stop after cancel");
+                }
+                try { sendTask.Wait(15000); } catch { }
+                Thread.Sleep(600);
+
+                var client2 = new TransferClient("127.0.0.1", fx.Port, testFile);
+                client2.CompressionEnabled = true;
+                client2.EncryptionEnabled = false;
+                var done2 = new ManualResetEvent(false);
+                bool ok2 = false;
+                client2.OnTransferComplete += () => { ok2 = true; done2.Set(); };
+                client2.OnError += _ => done2.Set();
+                var resumeTask = client2.SendResumableAsync(session, false);
+                if (!done2.WaitOne(30000))
+                    throw new Exception("resume did not finish within 30s");
+                if (!ok2)
+                    throw new Exception("resume failed");
+                if (resumeTask.Exception != null)
+                    throw new Exception("resume task faulted: " + resumeTask.Exception.InnerException.Message);
+
+                Thread.Sleep(300);
+                var files = Directory.GetFiles(fx.RecvDir, "*", SearchOption.AllDirectories);
+                Assert.Equal(1, files.Length, "exactly one file after compressed resume");
+                byte[] saved = File.ReadAllBytes(files[0]);
+                Assert.True(Utils.ConstantTimeEquals(content, saved), "resumed compressed content matches");
+            }
+        }
+
+        /// <summary>Old-peer fallback: a server that never answers the 0x08 offer
+        /// drops the connection; the client must reconnect uncompressed and still
+        /// deliver the file. The scripted peer reads the offer on connection #1 and
+        /// drops; connection #2 carries NO 0x08 frame at all (the client turned the
+        /// offer off) — it just drains the plain 0x00 transfer.</summary>
+        private static void TcpCompressFallbackOldPeer()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_cf_s_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, port);
+            listener.Start();
+            try
+            {
+                string testFile = Path.Combine(sendDir, "fb.bin");
+                byte[] content = MakeTestFile(testFile, 200 * 1024);
+
+                var transferDrained = new ManualResetEvent(false);
+                var offerSeen = new ManualResetEvent(false);
+                System.Threading.Tasks.Task.Run(delegate
+                {
+                    // Connection #1: the 0x08 offer arrives first; an old peer would
+                    // read it as a corrupt header and drop without answering
+                    var s1 = listener.AcceptTcpClient();
+                    using (s1)
+                    using (var ns1 = s1.GetStream())
+                    {
+                        var offer = new byte[17]; // 0x08 + 16 pad
+                        ReadFully(ns1, offer);
+                        if (offer[0] == 0x08) offerSeen.Set();
+                        // no 0x18 answer — close instead
+                    }
+
+                    // Connection #2: fallback path — no offer, straight to the
+                    // plain 0x00 transfer; drain it to completion
+                    var s2 = listener.AcceptTcpClient();
+                    using (s2)
+                    using (var ns2 = s2.GetStream())
+                    {
+                        var first = new byte[1];
+                        ReadFully(ns2, first);
+                        if (first[0] == 0x00) // plain single-file transfer header
+                        {
+                            var buf = new byte[65536];
+                            try
+                            {
+                                int n;
+                                while ((n = ns2.Read(buf, 0, buf.Length)) > 0) { }
+                            }
+                            catch (System.Net.Sockets.SocketException) { }
+                            catch (IOException) { }
+                            transferDrained.Set();
+                        }
+                    }
+                });
+
+                var client = new TransferClient("127.0.0.1", port, testFile);
+                client.CompressionEnabled = true;
+                client.EncryptionEnabled = false;
+                var logs = new List<string>();
+                client.OnLog += msg => logs.Add(msg);
+                var clientDone = new ManualResetEvent(false);
+                bool clientOk = false;
+                client.OnTransferComplete += () => { clientOk = true; clientDone.Set(); };
+                client.OnError += _ => clientDone.Set();
+
+                var sendTask = client.SendAsync();
+                if (!clientDone.WaitOne(30000))
+                    throw new Exception("client did not finish within 30s");
+                Assert.True(clientOk, "client completed after fallback");
+                if (sendTask.Exception != null)
+                    throw sendTask.Exception.InnerException ?? sendTask.Exception;
+
+                Assert.True(offerSeen.WaitOne(5000), "peer saw the 0x08 offer on the first attempt");
+                bool sawFallback = false;
+                foreach (var m in logs)
+                    if (m.Contains("falling back to uncompressed")) sawFallback = true;
+                Assert.True(sawFallback, "client logged the compression fallback");
+                Assert.True(transferDrained.WaitOne(10000), "second connection carried the plain transfer");
+            }
+            finally
+            {
+                listener.Stop();
+                try { Directory.Delete(sendDir, true); } catch { }
+            }
+        }
+
+        private static void ReadFully(System.Net.Sockets.NetworkStream ns, byte[] buf)
+        {
+            int got = 0;
+            while (got < buf.Length)
+            {
+                int n = ns.Read(buf, got, buf.Length - got);
+                if (n <= 0) throw new IOException("fake peer connection closed early");
+                got += n;
+            }
+        }
+
+        private static void UdtCompressed()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_f_uc_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_f_uc_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+
+            TransferUdtServer server = null;
+            try
+            {
+                string testFile = Path.Combine(sendDir, "udt_comp.bin");
+                var content = new byte[600 * 1024];
+                for (int i = 0; i < content.Length; i++) content[i] = (byte)(i % 17);
+                File.WriteAllBytes(testFile, content);
+
+                server = new TransferUdtServer("127.0.0.1", port, recvDir);
+                var started = new ManualResetEvent(false);
+                var serverDone = new ManualResetEvent(false);
+                bool serverOk = false;
+                server.OnStarted += () => started.Set();
+                server.OnTransferComplete += () => { serverOk = true; serverDone.Set(); };
+                server.OnError += _ => serverDone.Set();
+                server.Start();
+                if (!started.WaitOne(5000)) throw new Exception("UDT server did not start");
+
+                var client = new TransferUdtClient("127.0.0.1", port, testFile);
+                client.CompressionEnabled = true;
+                client.EncryptionEnabled = false;
+                var clientDone = new ManualResetEvent(false);
+                bool clientOk = false;
+                client.OnTransferComplete += () => { clientOk = true; clientDone.Set(); };
+                client.OnError += _ => clientDone.Set();
+                var sendTask = client.SendAsync();
+
+                if (!serverDone.WaitOne(60000)) throw new Exception("UDT server timeout");
+                if (!clientDone.WaitOne(5000)) throw new Exception("UDT client timeout");
+                Assert.True(serverOk, "UDT server completed");
+                Assert.True(clientOk, "UDT client completed");
+                if (sendTask.Exception != null)
+                    throw sendTask.Exception.InnerException ?? sendTask.Exception;
+
+                string[] received = Directory.GetFiles(recvDir);
+                Assert.Equal(1, received.Length, "one file");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(received[0])),
+                    "UDT compressed payload intact");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
             }
         }
     }

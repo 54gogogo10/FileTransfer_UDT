@@ -23,6 +23,12 @@ namespace TrFileTransfer
         private long _totalBytes;
         private long _transferredBytes;
 
+        // Cancellation: each in-flight client is registered so Cancel() can reach it.
+        // A parallel transfer otherwise has no way to be stopped from the UI.
+        private readonly object _cancelLock = new object();
+        private readonly List<Action> _activeCancels = new List<Action>();
+        private volatile bool _cancelled;
+
         public event Action<string> OnLog;
         public event Action<TransferProgress> OnProgress;
         public event Action<string> OnError;
@@ -30,6 +36,49 @@ namespace TrFileTransfer
 
         /// <summary>Pairing code forwarded to every chunk connection (0x05 auth frame).</summary>
         public string PairingCode { get; set; }
+
+        /// <summary>True once Cancel() was requested — callers use it to report "cancelled"
+        /// rather than a failure when SendAsync/SendFolderAsync unwinds.</summary>
+        public bool WasCancelled { get { return _cancelled; } }
+
+        /// <summary>Cancels every in-flight chunk/file connection and stops scheduling
+        /// further ones. Safe to call from the UI thread.</summary>
+        public void Cancel()
+        {
+            _cancelled = true;
+            Action[] pending;
+            lock (_cancelLock)
+            {
+                pending = _activeCancels.ToArray();
+                _activeCancels.Clear();
+            }
+            foreach (var cancel in pending)
+            {
+                try { cancel(); } catch { }
+            }
+        }
+
+        /// <summary>Runs <paramref name="cancel"/> when Cancel() is (or already was) called.</summary>
+        private void RegisterCancel(Action cancel)
+        {
+            bool runNow = false;
+            lock (_cancelLock)
+            {
+                if (_cancelled) runNow = true;
+                else _activeCancels.Add(cancel);
+            }
+            if (runNow)
+            {
+                try { cancel(); } catch { }
+            }
+        }
+
+        /// <summary>Drops a finished client's cancel hook so long transfers do not
+        /// accumulate dead delegates.</summary>
+        private void UnregisterCancel(Action cancel)
+        {
+            lock (_cancelLock) { _activeCancels.Remove(cancel); }
+        }
 
         public ConcurrentTransfer(string serverIp, int port, string filePath,
             int concurrency, bool isTcp, int srcPort = 0, int maxBytesPerSec = 0)
@@ -68,6 +117,7 @@ namespace TrFileTransfer
 
             for (int i = 0; i < chunks; i++)
             {
+                if (_cancelled) break;
                 long offset = i * chunkSize;
                 long size = Math.Min(chunkSize, totalSize - offset);
                 if (size <= 0) break;
@@ -79,11 +129,13 @@ namespace TrFileTransfer
             try
             {
                 await Task.WhenAll(tasks);
+                if (_cancelled) return; // Cancel() reported the outcome; not a success
                 var completeHandler = OnTransferComplete;
                 if (completeHandler != null) completeHandler();
             }
             catch (Exception ex)
             {
+                if (_cancelled) return;
                 var errHandler = OnError;
                 if (errHandler != null) errHandler("Concurrent transfer failed: " + ex.Message);
             }
@@ -121,6 +173,7 @@ namespace TrFileTransfer
 
             for (int i = 0; i < files.Length; i++)
             {
+                if (_cancelled) break;
                 string file = files[i];
                 long fileSize = 0;
                 try { fileSize = new FileInfo(file).Length; } catch { }
@@ -130,6 +183,7 @@ namespace TrFileTransfer
                     await semaphore.WaitAsync();
                     try
                     {
+                        if (_cancelled) return;
                         await SendFileAsync(file, localPort);
                         long p, n;
                         do {
@@ -149,11 +203,13 @@ namespace TrFileTransfer
             try
             {
                 await Task.WhenAll(tasks);
+                if (_cancelled) return;
                 var completeHandler = OnTransferComplete;
                 if (completeHandler != null) completeHandler();
             }
             catch (Exception ex)
             {
+                if (_cancelled) return;
                 var errHandler = OnError;
                 if (errHandler != null) errHandler("Concurrent folder transfer failed: " + ex.Message);
             }
@@ -180,13 +236,17 @@ namespace TrFileTransfer
                         {
                             var client = new TransferUdtClient(_serverIp, _port, _filePath, localPort, 4194304, perConn);
                             client.PairingCode = PairingCode;
-                            await client.SendChunkedAsync(offset, size, totalSize);
+                            RegisterCancel(client.Cancel);
+                            try { await client.SendChunkedAsync(offset, size, totalSize); }
+                            finally { UnregisterCancel(client.Cancel); }
                         }
                         else
                         {
                             var client = new TransferClient(_serverIp, _port, _filePath, localPort, 4194304, perConn);
                             client.PairingCode = PairingCode;
-                            await client.SendChunkedAsync(offset, size, totalSize);
+                            RegisterCancel(client.Cancel);
+                            try { await client.SendChunkedAsync(offset, size, totalSize); }
+                            finally { UnregisterCancel(client.Cancel); }
                         }
                         break;
                     }
@@ -227,13 +287,17 @@ namespace TrFileTransfer
                     {
                         var client = new TransferUdtClient(_serverIp, _port, filePath, localPort, 4194304, perConn);
                         client.PairingCode = PairingCode;
-                        await client.SendAsync();
+                        RegisterCancel(client.Cancel);
+                        try { await client.SendAsync(); }
+                        finally { UnregisterCancel(client.Cancel); }
                     }
                     else
                     {
                         var client = new TransferClient(_serverIp, _port, filePath, localPort, 4194304, perConn);
                         client.PairingCode = PairingCode;
-                        await client.SendAsync();
+                        RegisterCancel(client.Cancel);
+                        try { await client.SendAsync(); }
+                        finally { UnregisterCancel(client.Cancel); }
                     }
                     return;
                 }
