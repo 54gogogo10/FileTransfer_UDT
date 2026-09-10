@@ -573,6 +573,53 @@ namespace TrFileTransfer.Tests
                 Assert.True(Utils.ConstantTimeEquals(rnd, back), "stored random data roundtrips");
             });
 
+            runner.Run("WireCompress_ProbeGate_SkipsMarginalData", () =>
+            {
+                // The conservative gate must decline data that only shrinks a little:
+                // such data would cost more deflate CPU than the bytes it saves. The
+                // segment must still arrive intact (stored), just not compressed.
+                // 50% zeros deflated to R~0.65 — above the 0.30 gate.
+                var marginal = MakeSecret(106, 512 * 1024);
+                for (int i = 0; i + 1 < marginal.Length; i += 2) marginal[i] = 0;
+
+                var wire = new MemoryWireStream();
+                using (var comp = new CompressedWireStream(wire))
+                    comp.WriteExactAsync(marginal, 0, marginal.Length, CancellationToken.None).Wait();
+
+                var back = new byte[marginal.Length];
+                wire.Buffer.Position = 0;
+                using (var dec = new CompressedWireStream(wire))
+                    dec.ReadExactAsync(back, 0, back.Length, CancellationToken.None).Wait();
+                Assert.True(Utils.ConstantTimeEquals(marginal, back), "gated-out segment roundtrips");
+
+                // And it really was sent stored: the wire is the payload plus framing,
+                // never a deflate of it (which would be ~0.65x and look "smaller")
+                Assert.True(wire.Buffer.Length >= marginal.Length,
+                    "marginal data sails through stored (no wasted deflate), got " + wire.Buffer.Length);
+            });
+
+            runner.Run("WireCompress_ProbeGate_StillsCompressesWell", () =>
+            {
+                // The gate must not be so strict that genuinely compressible data loses
+                // its benefit — a segment that clears MaxCompressedRatio is deflated.
+                var text = new byte[512 * 1024];
+                var line = System.Text.Encoding.ASCII.GetBytes(
+                    "2026-09-10 INFO transfer ok src=10.0.0.5 dst=10.0.0.9 bytes=1048576\n");
+                for (int i = 0; i < text.Length; i++) text[i] = line[i % line.Length];
+
+                var wire = new MemoryWireStream();
+                using (var comp = new CompressedWireStream(wire))
+                    comp.WriteExactAsync(text, 0, text.Length, CancellationToken.None).Wait();
+                Assert.True(wire.Buffer.Length < text.Length / 4,
+                    "well-compressible data still shrinks past the gate (got " + wire.Buffer.Length + ")");
+
+                var back = new byte[text.Length];
+                wire.Buffer.Position = 0;
+                using (var dec = new CompressedWireStream(wire))
+                    dec.ReadExactAsync(back, 0, back.Length, CancellationToken.None).Wait();
+                Assert.True(Utils.ConstantTimeEquals(text, back), "compressed segment roundtrips");
+            });
+
             runner.Run("WireCompress_CorruptSegment_Throws", () =>
             {
                 // A segment length beyond the decompression cap must be refused
