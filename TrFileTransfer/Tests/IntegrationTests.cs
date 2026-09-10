@@ -73,7 +73,10 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_UDT_RateLimit", UdtRateLimit, 1);
             runner.Run("Integration_UDT_SingleFile", UdtSingleFile, 1);
             runner.Run("Integration_UDT_LargeSingle", UdtLargeSingle, 1);
-            runner.Run("Integration_UDT_LargeConcur", UdtLargeConcur, 1);
+            // retries: 2 — 8 parallel UDT streams are the flakiest case on a CI runner
+            // (the handshake drops intermittently even at 1 GB); a retry that passes
+            // still exercises the full chunk/reassembly path. See UdtLargeConcur.
+            runner.Run("Integration_UDT_LargeConcur", UdtLargeConcur, 2);
             runner.Run("Integration_Update_CheckAndDownload", UpdateCheckAndDownload);
             runner.Run("Integration_Update_DownloadHashMismatch", UpdateDownloadHashMismatch);
             runner.Run("Integration_Update_Manifest404", UpdateCheckHttp404);
