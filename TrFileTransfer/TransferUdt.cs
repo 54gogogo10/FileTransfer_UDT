@@ -470,9 +470,11 @@ namespace TrFileTransfer
                     if (clientSocket < 0) break;
 
                     UdtNative.SetTimeout(clientSocket, 30000, 30000);
-                    int bufSize = 8 * 1024 * 1024; // 8 MB
-                    UdtNative.udt_setsockopt(clientSocket, 0, UdtNative.UDT_SNDBUF, ref bufSize, 4);
-                    UdtNative.udt_setsockopt(clientSocket, 0, UdtNative.UDT_RCVBUF, ref bufSize, 4);
+                    // No UDT_SNDBUF/UDT_RCVBUF here: UDT4 refuses buffer options once a
+                    // socket is open (core.cpp setOpt throws when m_bOpened), and the C
+                    // wrapper only returns -1 — these used to be silent no-ops. The
+                    // defaults (8192 packets ≈ 12 MB per direction) already exceed the
+                    // 8 MB they were trying to set.
                     lock (_clientSockets) { _clientSockets.Add(clientSocket); }
                     // sin_port needs a 16-bit NetworkToHostOrder byteswap. sin_addr must
                     // NOT be swapped: the struct's uint already little-endian-reads the
@@ -535,10 +537,12 @@ namespace TrFileTransfer
                         await Task.Run(() => UdtNative.udt_send(clientSocket, nackChunk, 1, 0), ct).ConfigureAwait(false);
                     }
                 }
-                else if (outcome.Success)
+                else if (outcome.Success && !outcome.HasOwnFinalResponse)
                 {
+                    // Flows with their own terminal response (0x03's final 0x10 status)
+                    // get NO transport ACK: the client is already synchronized on that
+                    // response, and a redundant ACK here would race the client's close.
                     RaiseSessionStats(outcome);
-                    // Application-level ACK only on verified success
                     var ack = new byte[1] { 0x01 };
                     await Task.Run(() => UdtNative.udt_send(clientSocket, ack, 1, 0), ct).ConfigureAwait(false);
                 }
@@ -731,7 +735,14 @@ namespace TrFileTransfer
         public async Task<Guid> SendResumableAsync(Guid? existingSessionId = null, bool verifyHash = false)
         {
             var sessionId = existingSessionId ?? Guid.NewGuid();
-            await RunUdtTransfer(ct => SendResumableUdtInternal(sessionId, ct, verifyHash)).ConfigureAwait(false);
+            // 0x03's final 0x10 status (success/verify-failed) is the verdict — the
+            // transport ACK is not sent for this flow, so don't wait for one.
+            _skipTransportAck = true;
+            try
+            {
+                await RunUdtTransfer(ct => SendResumableUdtInternal(sessionId, ct, verifyHash)).ConfigureAwait(false);
+            }
+            finally { _skipTransportAck = false; }
             return sessionId;
         }
 
@@ -741,8 +752,15 @@ namespace TrFileTransfer
             await RunUdtTransfer(ct => SendTextInternal(text, ct)).ConfigureAwait(false);
         }
 
+        /// <summary>True for flows whose verdict arrives in-protocol (0x03's final 0x10):
+        /// the transport-level ACK wait does not apply.</summary>
+        private bool _skipTransportAck;
+
         private async Task RunUdtTransfer(Func<CancellationToken, Task> transferAction)
         {
+            // Set per-flow before RunUdtTransfer (see SendResumableAsync): 0x03 ends
+            // with its own in-protocol verdict, so the 1-byte ACK wait does not apply.
+            bool skipAck = _skipTransportAck;
             _cts = new CancellationTokenSource();
             _isRunning = true;
             _wasCancelled = false;
@@ -757,13 +775,28 @@ namespace TrFileTransfer
                     throw new Exception("UDT library init failed");
                 await transferAction(_cts.Token).ConfigureAwait(false);
                 // Wait for server ACK before closing — confirms data was received
-                // (0x01 = success, 0x00 = refused by receiver policy)
-                var ackBuf = new byte[1];
-                int ackTimeout = 30000;
-                UdtNative.udt_setsockopt(_socket, 0, UdtNative.UDT_RCVTIMEO, ref ackTimeout, 4);
-                int ackRead = await Task.Run(() => UdtNative.udt_recv(_socket, ackBuf, 1, 0), _cts.Token).ConfigureAwait(false);
-                if (ackRead == 1 && ackBuf[0] == 0)
-                    throw new IOException(L.C_RejectedByPeer);
+                // (0x01 = success, 0x00 = refused by receiver policy). Anything else
+                // (EOF, timeout, broken connection) is an UNKNOWN outcome: the bytes
+                // may or may not be on the receiver's disk, so reporting success here
+                // silently lost files — this used to be the failure mode where an
+                // 8-way concurrent UDT send showed "client errors: (none)" while the
+                // server later died writing its ACK to a client that had gone.
+                // 0x03 skips this: its final 0x10 status was already read in-protocol.
+                if (!skipAck)
+                {
+                    var ackBuf = new byte[1];
+                    int ackTimeout = 30000;
+                    UdtNative.udt_setsockopt(_socket, 0, UdtNative.UDT_RCVTIMEO, ref ackTimeout, 4);
+                    int ackRead = await Task.Run(() => UdtNative.udt_recv(_socket, ackBuf, 1, 0), _cts.Token).ConfigureAwait(false);
+                    if (ackRead == 1 && ackBuf[0] == 0)
+                        throw new IOException(L.C_RejectedByPeer);
+                    if (ackRead != 1)
+                    {
+                        if (_cts != null && _cts.IsCancellationRequested)
+                            throw new OperationCanceledException(); // pause/cancel, not a failure
+                        throw new IOException(L.C_NoCompletionAck);
+                    }
+                }
             }
             catch (OperationCanceledException)
             {
@@ -829,10 +862,10 @@ namespace TrFileTransfer
                 throw new Exception("UDT connect failed: " + UdtNative.GetErrorDesc());
             Log(L.C_Connected(_serverIp, _port));
             UdtNative.SetTimeout(_socket, 30000, 30000);
-            // Set larger buffers for better throughput
-            int bufSize = 8 * 1024 * 1024; // 8 MB
-            UdtNative.udt_setsockopt(_socket, 0, UdtNative.UDT_SNDBUF, ref bufSize, 4);
-            UdtNative.udt_setsockopt(_socket, 0, UdtNative.UDT_RCVBUF, ref bufSize, 4);
+            // No UDT_SNDBUF/UDT_RCVBUF here: UDT4 refuses buffer options on an open
+            // socket (core.cpp throws once m_bOpened; the C wrapper returns -1), so
+            // these were silent no-ops. Defaults (8192 packets ≈ 12 MB) already exceed
+            // the 8 MB this used to attempt.
             await UdtIo.WaitForConnectionReady(_socket, ct).ConfigureAwait(false);
         }
 

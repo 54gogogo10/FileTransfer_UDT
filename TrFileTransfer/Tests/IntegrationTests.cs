@@ -97,6 +97,7 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_Auth_TCP_Lenient", TcpAuthLenient);
             runner.Run("Integration_Text_UDT", UdtTextMessage, 1);
             runner.Run("Integration_Auth_UDT", UdtAuthCorrectCode, 1);
+            runner.Run("Integration_UDT_AckLost_Fails", UdtAckLostFails);
             runner.Run("Integration_FolderSync_TCP", TcpFolderSync);
             runner.Run("Integration_FolderSync_UDT", UdtFolderSync, 1);
             runner.Run("Integration_HTTP_ListAndDownload", HttpShareListAndDownload);
@@ -363,7 +364,7 @@ namespace TrFileTransfer.Tests
                     tcpServer = new TransferServer("127.0.0.1", port, recvDir);
                     tcpServer.OnStarted += () => serverStarted.Set();
                     tcpServer.OnTransferComplete += () => { serverOk = true; serverDone.Set(); };
-                    tcpServer.OnError += msg => { lock (serverErrors) serverErrors.Add(msg); serverDone.Set(); };
+                    tcpServer.OnError += msg => { lock (serverErrors) serverErrors.Add(msg); };
                     tcpServer.Start();
                 }
                 else
@@ -371,7 +372,7 @@ namespace TrFileTransfer.Tests
                     udtServer = new TransferUdtServer("127.0.0.1", port, recvDir);
                     udtServer.OnStarted += () => serverStarted.Set();
                     udtServer.OnTransferComplete += () => { serverOk = true; serverDone.Set(); };
-                    udtServer.OnError += msg => { lock (serverErrors) serverErrors.Add(msg); serverDone.Set(); };
+                    udtServer.OnError += msg => { lock (serverErrors) serverErrors.Add(msg); };
                     udtServer.Start();
                 }
 
@@ -404,19 +405,29 @@ namespace TrFileTransfer.Tests
                     sendTask = client.SendAsync();
                 }
 
-                if (!serverDone.WaitOne(timeoutSec * 1000))
+                // A transient connection break makes the server log an error for the
+                // dead connection while ConcurrentTransfer retries it on a fresh one —
+                // only the FILE ASSEMBLED event (serverDone) means success. Fail fast
+                // when the client itself gave up (its retries were exhausted); give the
+                // full budget otherwise.
+                var waited = System.Diagnostics.Stopwatch.StartNew();
+                while (!serverDone.WaitOne(500))
                 {
-                    string detail;
-                    lock (serverErrors) detail = "server errors: " + (serverErrors.Count > 0 ? string.Join(" | ", serverErrors) : "(none)");
-                    lock (clientErrors) detail += " | client errors: " + (clientErrors.Count > 0 ? string.Join(" | ", clientErrors) : "(none)");
-                    throw new Exception("Server did not complete within " + timeoutSec + "s — " + detail);
+                    if (clientDone.WaitOne(0) && !clientOk) break; // client exhausted its retries
+                    if (waited.ElapsedMilliseconds > timeoutSec * 1000)
+                    {
+                        string detail;
+                        lock (serverErrors) detail = "server errors: " + (serverErrors.Count > 0 ? string.Join(" | ", serverErrors) : "(none)");
+                        lock (clientErrors) detail += " | client errors: " + (clientErrors.Count > 0 ? string.Join(" | ", clientErrors) : "(none)");
+                        throw new Exception("Server did not complete within " + timeoutSec + "s — " + detail);
+                    }
                 }
                 if (!serverOk)
                 {
                     string detail;
-                    lock (serverErrors) detail = string.Join(" | ", serverErrors);
+                    lock (serverErrors) detail = "server errors: " + (serverErrors.Count > 0 ? string.Join(" | ", serverErrors) : "(none)");
                     lock (clientErrors) detail += " | client errors: " + (clientErrors.Count > 0 ? string.Join(" | ", clientErrors) : "(none)");
-                    throw new Exception("Server errors: " + detail);
+                    throw new Exception("Transfer failed — " + detail);
                 }
 
                 sendTask.Wait(timeoutSec * 1000);
@@ -2921,6 +2932,95 @@ namespace TrFileTransfer.Tests
             {
                 if (server != null) { try { server.Stop(); } catch { } }
                 try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>A UDT peer that reads the whole transfer and then closes WITHOUT the
+        /// application ACK must surface as a client failure. The ACK read used to treat
+        /// EOF/error as success (only 0x00 was rejected), so a dead or starved receiver
+        /// produced "client errors: (none)" and a false "transfer complete".</summary>
+        private static void UdtAckLostFails()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_udt_ackl_s_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            var testFile = Path.Combine(sendDir, "acklost.bin");
+            MakeTestFile(testFile, 256 * 1024);
+
+            try
+            {
+                UdtDll.EnsureExtracted();
+                Assert.True(UdtNative.UdtStartup(), "UDT startup");
+
+                int listener = UdtNative.udt_socket(UdtNative.AF_INET, UdtNative.SOCK_STREAM, 0);
+                var saddr = UdtNative.BuildSockaddr("127.0.0.1", port);
+                Assert.True(UdtNative.udt_bind(listener, ref saddr, UdtNative.SockAddrSize) != UdtNative.ERROR, "bind");
+                Assert.True(UdtNative.udt_listen(listener, 4) != UdtNative.ERROR, "listen");
+
+                // Fake receiver: on the compression-probe connection just close (the
+                // client then retries uncompressed); on the real transfer connection
+                // read the full 0x00 frame (header + payload + hash) and close without
+                // ever sending the 1-byte ACK.
+                var serverTask = Task.Run(delegate
+                {
+                    while (true)
+                    {
+                        var addr = new sockaddr_in();
+                        int addrLen = UdtNative.SockAddrSize;
+                        int conn = UdtNative.udt_accept(listener, ref addr, ref addrLen);
+                        if (conn < 0) return;
+                        UdtNative.SetTimeout(conn, 15000, 15000);
+                        try
+                        {
+                            var one = new byte[1];
+                            UdtIo.UdtReadExactAsync(conn, one, 0, 1, CancellationToken.None).Wait();
+                            if (one[0] == 0x08) { try { UdtNative.udt_close(conn); } catch { } continue; }
+
+                            // 0x00 single file: type(1)+size(8)+nameLen(4) already 1 read
+                            var rest = new byte[12];
+                            UdtIo.UdtReadExactAsync(conn, rest, 0, 12, CancellationToken.None).Wait();
+                            long size = BitConverter.ToInt64(rest, 0);
+                            int nameLen = BitConverter.ToInt32(rest, 8);
+                            var nameBuf = new byte[nameLen];
+                            UdtIo.UdtReadExactAsync(conn, nameBuf, 0, nameLen, CancellationToken.None).Wait();
+                            var payload = new byte[size];
+                            UdtIo.UdtReadExactAsync(conn, payload, 0, (int)size, CancellationToken.None).Wait();
+                            var hash = new byte[32];
+                            UdtIo.UdtReadExactAsync(conn, hash, 0, 32, CancellationToken.None).Wait();
+                            // Park the client in its ACK wait before vanishing: the close
+                            // must land while it waits for the confirmation byte, not
+                            // during the send phase (which fails loudly either way).
+                            Thread.Sleep(300);
+                            // ... and vanish: no ACK
+                        }
+                        catch { }
+                        try { UdtNative.udt_close(conn); } catch { }
+                        return; // one real transfer is all this fake peer takes
+                    }
+                });
+
+                var client = new TransferUdtClient("127.0.0.1", port, testFile);
+                bool errored = false;
+                client.OnError += _ => { errored = true; };
+                // OnTransferComplete fires at the protocol layer (after the payload and
+                // hash are written, BEFORE the ACK read), so the reliable success/failure
+                // signal is the send task's outcome: RunUdtTransfer rethrows after the
+                // error event fired.
+                var sendTask = client.SendAsync();
+                bool taskFailed = false;
+                try { sendTask.Wait(60000); }
+                catch (AggregateException) { taskFailed = true; }
+
+                Assert.True(taskFailed, "missing ACK must fail the send task");
+                Assert.True(errored, "client raised an error");
+
+                serverTask.Wait(5000);
+                try { UdtNative.udt_close(listener); } catch { }
+                UdtNative.UdtCleanup();
+            }
+            finally
+            {
+                try { Directory.Delete(sendDir, true); } catch { }
             }
         }
 

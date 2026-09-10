@@ -259,6 +259,21 @@ namespace TrFileTransfer
                         Log(string.Format("Bind port {0} busy (attempt {1}/3), retrying chunk offset={2} on port {3}",
                             ex.Port, attempt, offset, localPort));
                     }
+                    catch (IOException ex)
+                    {
+                        // A dropped connection (broken/reset mid-chunk) is often
+                        // transient — e.g. 8 simultaneous UDT streams on a loaded
+                        // machine can starve the ACK path long enough for one
+                        // connection to die. The retry re-sends the SAME chunk over a
+                        // fresh connection, which is idempotent server-side: chunks
+                        // are written at their declared offsets into the shared
+                        // tracker, so the re-send overwrites the same region and
+                        // completion is decided by byte coverage. A user cancellation
+                        // is not a failure.
+                        if (_cancelled || attempt >= 3) throw;
+                        Log(string.Format("Chunk offset={0} lost its connection ({1}) — retry {2}/3",
+                            offset, ex.Message, attempt + 1));
+                    }
                 }
 
                 // Lock-free accumulation: add chunk size atomically, cap at _totalBytes
@@ -308,6 +323,14 @@ namespace TrFileTransfer
                     if (localPort == 0) throw;
                     Log(string.Format("Bind port {0} busy (attempt {1}/3), retrying {2} on port {3}",
                         ex.Port, attempt, Path.GetFileName(filePath), localPort));
+                }
+                catch (IOException)
+                {
+                    // Same transient-connection retry as chunks: a per-file connection
+                    // that died mid-send gets one more try before failing the folder.
+                    if (_cancelled || attempt >= 3) throw;
+                    Log(string.Format("Connection lost sending {0} — retry {1}/3",
+                        Path.GetFileName(filePath), attempt + 1));
                 }
             }
         }

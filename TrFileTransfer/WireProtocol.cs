@@ -170,6 +170,11 @@ namespace TrFileTransfer
         public bool Success;
         /// <summary>True when the request was a 0x02 chunk (transports ACK these differently).</summary>
         public bool IsChunked;
+        /// <summary>True when the transfer type carries its own terminal response the
+        /// client reads in-protocol (0x03's final 0x10 status). The UDT transport must
+        /// NOT send its 1-byte app ACK for these flows — the 0x10 IS the verdict — and
+        /// the client must not wait for an ACK after consuming it.</summary>
+        public bool HasOwnFinalResponse;
         /// <summary>True when the connection was refused by policy (IP filter, pairing
         /// code, receive confirmation). UDT answers these with a 0x00 NACK so the
         /// client fails fast instead of waiting out its ACK timeout.</summary>
@@ -544,7 +549,11 @@ namespace TrFileTransfer
                     return UpdateOutcome(outcome, await HandleChunkedFile(active, ctx, ct).ConfigureAwait(false));
                 }
                 if (transferType == 0x03)
-                    return UpdateOutcome(outcome, await HandleResumableFile(active, ctx, ct).ConfigureAwait(false));
+                {
+                    var o3 = UpdateOutcome(outcome, await HandleResumableFile(active, ctx, ct).ConfigureAwait(false));
+                    o3.HasOwnFinalResponse = true; // the final 0x10 status was the verdict
+                    return o3;
+                }
                 if (transferType == 0x04)
                     return UpdateOutcome(outcome, await HandleFolderResumableAsync(active, ctx, ct).ConfigureAwait(false));
                 if (transferType == 0x06)
