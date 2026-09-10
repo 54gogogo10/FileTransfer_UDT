@@ -28,7 +28,7 @@ cd TrFileTransfer
 build.bat
 ```
 
-生成 `TrFileTransfer.exe`。无需 Visual Studio——使用内置 `csc.exe` 编译器。
+生成带版本号的 `release\TrFileTransfer-<版本>.exe`（附 `.sha256`），另留一份不带版本号的 `TrFileTransfer.exe` 供 CI/发布工作流使用。需要 .NET SDK 8+。
 
 UDT DLL 编译（如更新原生代码）需 MinGW-w64，详见 CLAUDE.md。
 

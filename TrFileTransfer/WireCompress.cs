@@ -29,6 +29,30 @@ namespace TrFileTransfer
         /// header costs more framing than it could ever save.</summary>
         private const int MinCompressible = 64;
 
+        /// <summary>Bytes probed at the head of a segment to decide whether the whole
+        /// segment is worth deflating. Keeping it small bounds the probe cost even on
+        /// incompressible data (~1 ms at the measured ~51 MB/s, under 0.05% of a 4 MB
+        /// segment) — the probe only has to avoid the far larger cost of deflating a
+        /// segment that turns out to be stored anyway.</summary>
+        public const int SampleBytes = 64 * 1024;
+
+        /// <summary>A segment is deflated only when the probe predicts the result would
+        /// be at most this fraction of the input — a deliberately conservative gate
+        /// requiring at least 70% reduction.
+        ///
+        /// Why not "compress whenever it gets smaller": deflate measured on this exact
+        /// code path runs ~51 MB/s on incompressible data but only ~16 MB/s on the worst
+        /// semi-compressible data (repetitive enough to keep LZ77 searching, random
+        /// enough never to match). Compression only pays when the link is slower than
+        /// deflate divided by the saving, so a marginal win costs far more CPU than it
+        /// saves — and on a fast link (loopback/gigabit) it is a pure loss. Requiring
+        /// 70% keeps that pathological band out; the cost is declining to compress
+        /// borderline data, which is the safe direction to err.
+        ///
+        /// Measured effect: incompressible 64 MB over loopback TCP went from 1.4s
+        /// (deflate then fall back to stored) to ~0.2s (probe rejects, never deflates).</summary>
+        public const double MaxCompressedRatio = 0.30;
+
         private const uint StoredFlag = 0x80000000;
 
         private readonly IWireStream _inner;
@@ -61,8 +85,12 @@ namespace TrFileTransfer
         {
             if (count <= 0) return;
 
+            // Probe the head before deflating anything: if that sample does not shrink
+            // well, deflating the whole segment almost certainly will not either, so we
+            // skip it and send stored — avoiding a full-segment deflate on data we
+            // would only throw away (see MaxCompressedRatio).
             byte[] deflated = null;
-            if (count >= MinCompressible)
+            if (count >= MinCompressible && ProbeIsCompressible(buffer, offset, count))
                 deflated = TryDeflate(buffer, offset, count);
 
             if (deflated != null && deflated.Length < count)
@@ -83,13 +111,29 @@ namespace TrFileTransfer
             await _inner.WriteExactAsync(_lenBufOut, 0, 4, ct).ConfigureAwait(false);
         }
 
+        /// <summary>Deflates the head of the segment and reports whether it shrank by at
+        /// least (1 - MaxCompressedRatio). Small segments are probed whole. Fails closed:
+        /// any problem (or an unhelpful probe) means "not compressible", so a bad probe
+        /// can only cost compression efficiency, never correctness.</summary>
+        private static bool ProbeIsCompressible(byte[] buffer, int offset, int count)
+        {
+            int probeLen = count <= SampleBytes ? count : SampleBytes;
+            if (probeLen < MinCompressible) return false;
+            byte[] probe = TryDeflate(buffer, offset, probeLen);
+            if (probe == null) return false;
+            return probe.Length <= (long)(probeLen * MaxCompressedRatio);
+        }
+
         private static byte[] TryDeflate(byte[] buffer, int offset, int count)
         {
             try
             {
                 using (var ms = new MemoryStream(count / 4 + 64))
                 {
-                    using (var ds = new DeflateStream(ms, CompressionMode.Compress, true))
+                    // Fastest: measured ~2.5x the throughput of Optimal (and ~4x on
+                    // pathological data) for a compression-ratio change small enough
+                    // to be irrelevant next to the link speed (see MaxCompressedRatio).
+                    using (var ds = new DeflateStream(ms, CompressionLevel.Fastest, true))
                         ds.Write(buffer, offset, count);
                     // ds disposed above flushes the deflate tail into ms
                     return ms.ToArray();
