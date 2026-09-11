@@ -201,8 +201,17 @@ namespace TrFileTransfer
         {
             public const int ClientBufferSize = 4194304;
 
+            /// <summary>Sends hash the source file/folder through the shared digest cache,
+            /// so its Config policy (byte-for-byte mode, entry lifetime) is picked up here —
+            /// every send goes through this factory.</summary>
+            private static void ApplyHashCacheConfig()
+            {
+                FileHashCache.ForClient.ApplyConfig();
+            }
+
             public static TransferClient CreateTcp(string serverIp, int port, string filePath, int srcPort, int speedLimit, string pairingCode = null)
             {
+                ApplyHashCacheConfig();
                 var client = new TransferClient(serverIp, port, filePath, srcPort, ClientBufferSize, speedLimit);
                 client.PairingCode = pairingCode;
                 return client;
@@ -210,6 +219,7 @@ namespace TrFileTransfer
 
             public static TransferUdtClient CreateUdt(string serverIp, int port, string filePath, int srcPort, int speedLimit, string pairingCode = null)
             {
+                ApplyHashCacheConfig();
                 var client = new TransferUdtClient(serverIp, port, filePath, srcPort, ClientBufferSize, speedLimit);
                 client.PairingCode = pairingCode;
                 return client;
@@ -397,6 +407,31 @@ namespace TrFileTransfer
                 if (IsPortFree(p, tcp, udp)) return p;
             }
             return 0;
+        }
+
+        /// <summary>Deletes a file, retrying briefly: on Windows an antivirus or the search
+        /// indexer can hold a freshly written file open for a few milliseconds, and a plain
+        /// File.Delete then fails with a sharing violation — which silently left files that
+        /// the caller had already reported as discarded. Returns true when it is gone.</summary>
+        public static bool DeleteWithRetry(string path, int attempts = 3)
+        {
+            for (int i = 0; ; i++)
+            {
+                try
+                {
+                    File.Delete(path);
+                    return !File.Exists(path);
+                }
+                catch (IOException)
+                {
+                    if (i >= attempts) return !File.Exists(path);
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    if (i >= attempts) return !File.Exists(path);
+                }
+                System.Threading.Thread.Sleep(150);
+            }
         }
 
         /// <summary>Returns a unique file/directory path by appending _1, _2, etc. when collisions exist.</summary>

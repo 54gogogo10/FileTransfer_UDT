@@ -36,6 +36,12 @@ namespace TrFileTransfer.Tests
             return 0;
         }
 
+        /// <summary>Joins collected logs into one assertion message.</summary>
+        private static string Dump(System.Collections.Generic.List<string> logs)
+        {
+            lock (logs) return string.Join(" | ", logs.ToArray());
+        }
+
         private static string TempBase()
         {
             // Historical scratch root when present; %TEMP% keeps the suite portable (e.g. CI)
@@ -106,9 +112,27 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_HTTP_Upload", HttpShareUpload);
             runner.Run("Integration_HTTP_UploadTokenAndTraversalName", HttpShareUploadTokenAndTraversalName);
             runner.Run("Integration_HTTP_AuthLockout", HttpShareAuthLockout);
+            runner.Run("Integration_ResumeFullHash_BeforeConnect", () => ResumeFullHashBeforeConnect(false));
+            runner.Run("Integration_UDT_ResumeFullHash_BeforeConnect", () => ResumeFullHashBeforeConnect(true), 1);
+            runner.Run("Integration_FolderSync_HashCacheSkipsReread", FolderSyncHashCache);
+            runner.Run("Integration_FolderSync_ClientHashCacheSkipsReread", FolderSyncClientHashCache);
+            runner.Run("Integration_ResumeFullHash_StaleCacheSelfHeals", ResumeFullHashStaleCache);
+            runner.Run("Integration_TCP_DedupSkip_UsesCachedDigest", DedupSkipUsesCachedDigest);
+            runner.Run("Integration_FolderSync_ChangeEmptyDeleteWithCache", FolderSyncChangeMatrix);
+            runner.Run("Integration_TCP_FolderSync_DiscardedFileIsReported", FolderSyncDiscardReported);
+            // retries: 1 — same mitigation as the large/concurrent cases below: FindFreePort
+            // can lose the race against a Windows excluded port range on a busy machine
+            runner.Run("Integration_TCP_FolderSync_ManyFilesNested", FolderSyncManyNested, 1);
+            runner.Run("Integration_CLI_Sync", CliSync, 1);
+            runner.Run("Integration_CLI_Verify", CliVerify, 1);
+            runner.Run("Integration_TCP_CancelDuringFolderHash", CancelDuringFolderHash, 1);
+            runner.Run("Integration_TCP_FolderSync_PerFileSkip", () => FolderSyncPerFileSkip(false), 1);
+            runner.Run("Integration_UDT_FolderSync_PerFileSkip", () => FolderSyncPerFileSkip(true), 1);
+            runner.Run("Integration_HTTP_RangeResume", HttpShareRangeResume);
+            runner.Run("Integration_Auth_LongPairingCode", LongPairingCode);
         }
 
-        private static void TcpSingleFile()
+                private static void TcpSingleFile()
         {
             int port = FindFreePort();
             string sendDir = Path.Combine(TempBase(), "tr_it_send_" + Guid.NewGuid().ToString("N"));
@@ -3489,5 +3513,1180 @@ namespace TrFileTransfer.Tests
                 try { File.Delete(Path.Combine(parent, "evil.txt")); } catch { }
             }
         }
+
+        /// <summary>
+        /// The full-file hash pass (Config VerifyHash) must finish BEFORE the client opens
+        /// the connection. Hashing after the connect left the server silent through the pass,
+        /// and the UDT server's 30s receive timeout on the accepted socket then dropped the
+        /// connection before the 0x03 header ever arrived — with a large enough file the send
+        /// could not start at all, and the auto-retry repeated the same fate. Log order is
+        /// what pins the fix; the payload stays small so the test itself is fast.
+        /// </summary>
+        private static void ResumeFullHashBeforeConnect(bool isUdt)
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_hbc_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_hbc_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferServer tcpServer = null;
+            TransferUdtServer udtServer = null;
+            try
+            {
+                string file = Path.Combine(sendDir, "payload.bin");
+                var content = new byte[512 * 1024];
+                new Random(5).NextBytes(content);
+                File.WriteAllBytes(file, content);
+
+                var started = new ManualResetEvent(false);
+                if (isUdt)
+                {
+                    udtServer = new TransferUdtServer("127.0.0.1", port, recvDir);
+                    udtServer.OnStarted += () => started.Set();
+                    udtServer.Start();
+                }
+                else
+                {
+                    tcpServer = new TransferServer("127.0.0.1", port, recvDir);
+                    tcpServer.OnStarted += () => started.Set();
+                    tcpServer.Start();
+                }
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+
+                string hashLine = L.C_ComputingFullHash(Path.GetFileName(file));
+                string connectLine = L.C_Connected("127.0.0.1", port);
+                var logs = new System.Collections.Generic.List<string>();
+                Action<string> collect = msg => { lock (logs) logs.Add(msg); };
+
+                if (isUdt)
+                {
+                    var client = new TransferUdtClient("127.0.0.1", port, file);
+                    client.OnLog += collect;
+                    client.SendResumableAsync(null, true).Wait(60000);
+                }
+                else
+                {
+                    var client = new TransferClient("127.0.0.1", port, file);
+                    client.OnLog += collect;
+                    client.SendResumableAsync(null, true).Wait(30000);
+                }
+
+                int hashIdx, connectIdx;
+                string all;
+                lock (logs)
+                {
+                    // Log lines carry a timestamp prefix — match on the text, not equality
+                    hashIdx = logs.FindIndex(m => m.Contains(hashLine));
+                    connectIdx = logs.FindIndex(m => m.Contains(connectLine));
+                    all = string.Join(" | ", logs.ToArray());
+                }
+                Assert.True(hashIdx >= 0, "hash pass was logged (logs: " + all + ")");
+                Assert.True(connectIdx >= 0, "connection was logged (logs: " + all + ")");
+                Assert.True(hashIdx < connectIdx,
+                    "full-hash pass must be logged before the connect (else the server waits through it)");
+            }
+            finally
+            {
+                if (tcpServer != null) { try { tcpServer.Stop(); } catch { } }
+                if (udtServer != null) { try { udtServer.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// A repeat 0x04 sync must not re-read the files it already has. The server remembers
+        /// both the digests it verified and the ones it computed while writing a file it just
+        /// received, so the resume scan answers from that cache. Proved by holding the received
+        /// files open with FileShare.None before the second pass: a hash attempt would throw,
+        /// the server would read that as "content differs" and try to rewrite them.
+        /// </summary>
+        private static void FolderSyncHashCache()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_hc_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_hc_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferServer server = null;
+            Guid sessionId = Guid.Empty;
+            FileStream holdA = null;
+            FileStream holdB = null;
+            bool prevStrict = FileHashCache.ForServer.Strict;
+            try
+            {
+                var contentA = new byte[64 * 1024];
+                var contentB = new byte[48 * 1024];
+                new Random(31).NextBytes(contentA);
+                new Random(32).NextBytes(contentB);
+                File.WriteAllBytes(Path.Combine(sendDir, "a.bin"), contentA);
+                File.WriteAllBytes(Path.Combine(sendDir, "b.bin"), contentB);
+
+                var started = new ManualResetEvent(false);
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => started.Set();
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+                // Start() adopts the machine's Config, and this test is about the cache
+                // doing its job — pin it on regardless of what the developer's settings say.
+                FileHashCache.ForServer.Strict = false;
+
+                sessionId = FolderResumeState.DeriveSyncSession(sendDir, "127.0.0.1", port, false);
+                string sessionDir = ServerWire.GetFolderSessionDir(recvDir, Path.GetFileName(sendDir), sessionId);
+                Directory.CreateDirectory(sessionDir);
+
+                // a.bin is already on the server (identical) — pass 1 verifies it by hashing,
+                // which is the other way a digest gets remembered.
+                File.WriteAllBytes(Path.Combine(sessionDir, "a.bin"), contentA);
+
+                var client1 = new TransferClient("127.0.0.1", port, sendDir);
+                client1.SendFolderResumableAsync(sessionId, keepState: true).Wait(30000);
+                Thread.Sleep(300);
+                Assert.True(Utils.ConstantTimeEquals(contentB, File.ReadAllBytes(Path.Combine(sessionDir, "b.bin"))),
+                    "b.bin received in pass 1");
+
+                // Make both received files unreadable, then sync again: only the cache can
+                // answer, since hashing either file would fail.
+                holdA = new FileStream(Path.Combine(sessionDir, "a.bin"), FileMode.Open, FileAccess.Read, FileShare.None);
+                holdB = new FileStream(Path.Combine(sessionDir, "b.bin"), FileMode.Open, FileAccess.Read, FileShare.None);
+
+                var logs2 = new System.Collections.Generic.List<string>();
+                var client2 = new TransferClient("127.0.0.1", port, sendDir);
+                client2.OnLog += msg => logs2.Add(msg);
+                client2.SendFolderResumableAsync(sessionId, keepState: true).Wait(30000);
+                Thread.Sleep(300);
+                Assert.True(logs2.Exists(m => m.Contains("already fully received")),
+                    "pass 2 resolved from remembered digests without reading the files");
+            }
+            finally
+            {
+                FileHashCache.ForServer.Strict = prevStrict;
+                if (holdA != null) { try { holdA.Dispose(); } catch { } }
+                if (holdB != null) { try { holdB.Dispose(); } catch { } }
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+                if (sessionId != Guid.Empty) FolderResumeState.Delete(sessionId);
+            }
+        }
+
+        /// <summary>
+        /// The sending side keeps its own digest cache: re-syncing an unchanged source folder
+        /// must not re-hash it. Proved the same way as the server-side case — the source file
+        /// is held with FileShare.None before the second pass, so hashing it would fail and
+        /// take the whole manifest (and the sync) down with it.
+        /// </summary>
+        private static void FolderSyncClientHashCache()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_cch_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_cch_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferServer server = null;
+            Guid sessionId = Guid.Empty;
+            FileStream hold = null;
+            bool prevClientStrict = FileHashCache.ForClient.Strict;
+            FileHashCache.ForClient.Strict = false; // this test is about the cache doing its job
+            try
+            {
+                var content = new byte[96 * 1024];
+                new Random(41).NextBytes(content);
+                string source = Path.Combine(sendDir, "a.bin");
+                File.WriteAllBytes(source, content);
+
+                var started = new ManualResetEvent(false);
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => started.Set();
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+
+                sessionId = FolderResumeState.DeriveSyncSession(sendDir, "127.0.0.1", port, false);
+                string sessionDir = ServerWire.GetFolderSessionDir(recvDir, Path.GetFileName(sendDir), sessionId);
+
+                var client1 = new TransferClient("127.0.0.1", port, sendDir);
+                client1.SendFolderResumableAsync(sessionId, keepState: true).Wait(30000);
+                Thread.Sleep(300);
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(Path.Combine(sessionDir, "a.bin"))),
+                    "a.bin received in pass 1");
+
+                // The source becomes unreadable: only the client's digest cache can let the
+                // next pass build a manifest for it.
+                hold = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.None);
+
+                var logs = new System.Collections.Generic.List<string>();
+                var client2 = new TransferClient("127.0.0.1", port, sendDir);
+                client2.OnLog += msg => logs.Add(msg);
+                client2.SendFolderResumableAsync(sessionId, keepState: true).Wait(30000);
+                Thread.Sleep(300);
+                Assert.True(logs.Exists(m => m.Contains("files reused")),
+                    "pass 2 reused the cached digest instead of re-reading the source");
+                Assert.True(logs.Exists(m => m.Contains("already fully received")),
+                    "pass 2 found the folder already in sync");
+
+                // The strict switch (Config "SyncVerifyContent") must bypass that cache: the
+                // same pass now has to read the locked source and cannot.
+                FileHashCache.ForClient.Strict = true;
+                bool failed;
+                try
+                {
+                    var client3 = new TransferClient("127.0.0.1", port, sendDir);
+                    client3.SendFolderResumableAsync(sessionId, keepState: true).Wait(30000);
+                    failed = false;
+                }
+                catch (Exception) { failed = true; }
+                Assert.True(failed, "byte-for-byte mode re-reads the source (and fails here because it is locked)");
+            }
+            finally
+            {
+                FileHashCache.ForClient.Strict = prevClientStrict;
+                if (hold != null) { try { hold.Dispose(); } catch { } }
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+                if (sessionId != Guid.Empty) FolderResumeState.Delete(sessionId);
+            }
+        }
+
+        /// <summary>
+        /// A digest the peer contradicts must not survive: with a poisoned cache entry the
+        /// 0x03 full-hash check fails on the server (status 3, file discarded), the client
+        /// drops its entry, and the retry — which re-reads the file — delivers the right
+        /// bytes. Without that self-healing the same bogus digest would fail every attempt
+        /// until the entry aged out of the TTL.
+        /// </summary>
+        private static void ResumeFullHashStaleCache()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_shc_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_shc_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferServer server = null;
+            Guid session1 = Guid.NewGuid();
+            Guid session2 = Guid.NewGuid();
+            bool prevStrict = FileHashCache.ForClient.Strict;
+            FileHashCache.ForClient.Strict = false; // this test is about the cache being used
+            try
+            {
+                var content = new byte[128 * 1024];
+                new Random(51).NextBytes(content);
+                string file = Path.Combine(sendDir, "payload.bin");
+                File.WriteAllBytes(file, content);
+
+                var started = new ManualResetEvent(false);
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => started.Set();
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+
+                // Cache a digest that does not belong to this file's content
+                var bogus = new byte[32];
+                for (int i = 0; i < bogus.Length; i++) bogus[i] = 0x33;
+                FileHashCache.ForClient.Store(file, bogus);
+
+                var logs = new System.Collections.Generic.List<string>();
+                var client1 = new TransferClient("127.0.0.1", port, file);
+                client1.OnLog += msg => { lock (logs) logs.Add(msg); };
+                client1.SendResumableAsync(session1, true).Wait(30000);
+                Thread.Sleep(300);
+
+                string expected = L.C_VerifyFailed(Path.GetFileName(file));
+                bool reported;
+                lock (logs) reported = logs.Exists(m => m.Contains(expected));
+                Assert.True(reported, "the server rejected the stale digest (status 3)");
+                Assert.False(File.Exists(Path.Combine(recvDir, "payload.bin")),
+                    "and discarded the file it could not verify");
+
+                long size, mtime;
+                bool matches;
+                FileHashCache.Stat(file, out size, out mtime);
+                Assert.False(FileHashCache.ForClient.TryMatch(file, size, mtime, bogus, out matches),
+                    "the contradicted digest was dropped, so the retry re-reads the file");
+
+                // Retry with a fresh session: recomputes the digest and the transfer lands
+                var client2 = new TransferClient("127.0.0.1", port, file);
+                client2.SendResumableAsync(session2, true).Wait(30000);
+                Thread.Sleep(300);
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(Path.Combine(recvDir, "payload.bin"))),
+                    "the retry delivered the file with the right content");
+            }
+            finally
+            {
+                FileHashCache.ForClient.Strict = prevStrict;
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+                ResumeState.Delete(session1);
+                ResumeState.Delete(session2);
+            }
+        }
+
+        /// <summary>
+        /// Both duplicate checks compare an incoming file against one already on disk, and
+        /// both must be able to answer from the server's digest cache instead of re-reading
+        /// it. Proved by locking the on-disk copy: with the cache warm (it was recorded when
+        /// the server received that file) the skip still happens, so no read was attempted.
+        /// Covers 0x00 and 0x03, which reach the same verification by different routes.
+        /// </summary>
+        private static void DedupSkipUsesCachedDigest()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_dd_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_dd_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferServer server = null;
+            FileStream hold = null;
+            Guid sessionId = Guid.Empty;
+            bool prevStrict = FileHashCache.ForServer.Strict;
+            try
+            {
+                var content = new byte[64 * 1024];
+                new Random(61).NextBytes(content);
+                string file = Path.Combine(sendDir, "same.bin");
+                File.WriteAllBytes(file, content);
+
+                var started = new ManualResetEvent(false);
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.SkipDuplicateFiles = true;   // the option both dedup paths need
+                server.OnStarted += () => started.Set();
+                // The dedup verdict is the receiver's, so its log is where the evidence is
+                var serverLogs = new System.Collections.Generic.List<string>();
+                server.OnLog += msg => { lock (serverLogs) serverLogs.Add(msg); };
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+                FileHashCache.ForServer.Strict = false;   // pin the cache on: this test is about it
+
+                string skipped = L.S_DuplicateSkipped("same.bin");
+                // 0x00 first: it lands the file and records its digest as a side effect
+                var client1 = new TransferClient("127.0.0.1", port, file);
+                client1.SendAsync().Wait(30000);
+                Thread.Sleep(300);
+                string saved = Path.Combine(recvDir, "same.bin");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(saved)), "first copy received");
+
+                // Make the on-disk copy unreadable: only the cache can identify a duplicate now
+                hold = new FileStream(saved, FileMode.Open, FileAccess.Read, FileShare.None);
+
+                var client2 = new TransferClient("127.0.0.1", port, file);
+                client2.SendAsync().Wait(30000);
+                Thread.Sleep(300);
+                bool skippedVia00;
+                lock (serverLogs) skippedVia00 = serverLogs.Exists(m => m.Contains(skipped));
+                Assert.True(skippedVia00,
+                    "0x00 dedup answered from the cached digest (logs: " + Dump(serverLogs) + ")");
+                Assert.False(File.Exists(Path.Combine(recvDir, "same_1.bin")), "the duplicate copy was discarded");
+
+                // 0x03 reaches the same file through the resume shortcut
+                sessionId = Guid.NewGuid();
+                var client3 = new TransferClient("127.0.0.1", port, file);
+                client3.SendResumableAsync(sessionId, true).Wait(30000);
+                Thread.Sleep(300);
+                bool skippedVia03;
+                int seen;
+                lock (serverLogs)
+                {
+                    seen = 0;
+                    for (int i = 0; i < serverLogs.Count; i++)
+                        if (serverLogs[i].Contains(skipped)) seen++;
+                    skippedVia03 = seen >= 2;
+                }
+                Assert.True(skippedVia03,
+                    "0x03 dedup answered from the cached digest (logs: " + Dump(serverLogs) + ")");
+            }
+            finally
+            {
+                FileHashCache.ForServer.Strict = prevStrict;
+                if (hold != null) { try { hold.Dispose(); } catch { } }
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+                if (sessionId != Guid.Empty) ResumeState.Delete(sessionId);
+            }
+        }
+
+        /// <summary>
+        /// The four things a repeat sync can meet, with the digest cache in play: an unchanged
+        /// file (served from cache, proven by locking the source so a read would fail), a file
+        /// whose content changed (re-hashed and re-sent), a zero-byte file (its digest is
+        /// SHA256 of nothing and must be cached like any other), and a file deleted locally
+        /// (sync keeps the server's copy — the documented direction).
+        /// </summary>
+        private static void FolderSyncChangeMatrix()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_cm_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_cm_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferServer server = null;
+            Guid sessionId = Guid.Empty;
+            bool prevClientStrict = FileHashCache.ForClient.Strict;
+            bool prevServerStrict = FileHashCache.ForServer.Strict;
+            var holds = new System.Collections.Generic.List<FileStream>();
+            try
+            {
+                var keepContent = new byte[8 * 1024];
+                var before = new byte[16 * 1024];
+                var after = new byte[24 * 1024];
+                new Random(71).NextBytes(keepContent);
+                new Random(72).NextBytes(before);
+                new Random(73).NextBytes(after);
+
+                // Names sort so the unchanged file is scanned (and verify-skipped) first
+                string keep = Path.Combine(sendDir, "a_keep.bin");
+                string changed = Path.Combine(sendDir, "b_change.bin");
+                string empty = Path.Combine(sendDir, "c_empty.bin");
+                File.WriteAllBytes(keep, keepContent);
+                File.WriteAllBytes(changed, before);
+                File.WriteAllBytes(empty, new byte[0]);
+
+                var started = new ManualResetEvent(false);
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => started.Set();
+                var serverLogs = new System.Collections.Generic.List<string>();
+                server.OnLog += msg => { lock (serverLogs) serverLogs.Add(msg); };
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+                FileHashCache.ForClient.Strict = false;
+                FileHashCache.ForServer.Strict = false;
+
+                sessionId = FolderResumeState.DeriveSyncSession(sendDir, "127.0.0.1", port, false);
+                string sessionDir = ServerWire.GetFolderSessionDir(recvDir, Path.GetFileName(sendDir), sessionId);
+
+                // Pass 1: everything travels, and both sides learn every digest
+                var client1 = new TransferClient("127.0.0.1", port, sendDir);
+                client1.SendFolderResumableAsync(sessionId, keepState: true).Wait(30000);
+                Thread.Sleep(300);
+                Assert.True(Utils.ConstantTimeEquals(keepContent, File.ReadAllBytes(Path.Combine(sessionDir, "a_keep.bin"))),
+                    "pass 1: unchanged-so-far file received");
+                Assert.True(File.Exists(Path.Combine(sessionDir, "c_empty.bin")), "pass 1: zero-byte file received");
+                Assert.True(new FileInfo(Path.Combine(sessionDir, "c_empty.bin")).Length == 0, "pass 1: it is still empty");
+
+                // Pass 2: one file's content changes. The unchanged one must come from cache
+                // (its source is locked), the changed one must travel.
+                File.WriteAllBytes(changed, after);
+                holds.Add(new FileStream(keep, FileMode.Open, FileAccess.Read, FileShare.None));
+                var logs2 = new System.Collections.Generic.List<string>();
+                var client2 = new TransferClient("127.0.0.1", port, sendDir);
+                client2.OnLog += msg => logs2.Add(msg);
+                client2.SendFolderResumableAsync(sessionId, keepState: true).Wait(30000);
+                Thread.Sleep(300);
+                string landed = Path.Combine(sessionDir, "b_change.bin");
+                Assert.True(Utils.ConstantTimeEquals(after, File.ReadAllBytes(landed)),
+                    "pass 2: the changed content was re-sent (client: " + Dump(logs2) + ") (server: "
+                    + Dump(serverLogs) + ") (landed " + new FileInfo(landed).Length + " bytes, wanted " + after.Length + ")");
+                Assert.True(logs2.Exists(m => m.Contains("files reused")),
+                    "pass 2: the unchanged file came from the cache (logs: " + Dump(logs2) + ")");
+
+                // Pass 3: nothing changed at all, and now nothing may be read either
+                holds.Add(new FileStream(changed, FileMode.Open, FileAccess.Read, FileShare.None));
+                holds.Add(new FileStream(empty, FileMode.Open, FileAccess.Read, FileShare.None));
+                var logs3 = new System.Collections.Generic.List<string>();
+                var client3 = new TransferClient("127.0.0.1", port, sendDir);
+                client3.OnLog += msg => logs3.Add(msg);
+                client3.SendFolderResumableAsync(sessionId, keepState: true).Wait(30000);
+                Thread.Sleep(300);
+                Assert.True(logs3.Exists(m => m.Contains("already fully received")),
+                    "pass 3: everything (including the zero-byte file) was answered from cache (logs: " + Dump(logs3) + ")");
+                Assert.True(Utils.ConstantTimeEquals(keepContent, File.ReadAllBytes(Path.Combine(sessionDir, "a_keep.bin"))),
+                    "pass 3: nothing was rewritten");
+
+                // Pass 4: a file deleted on the sender stays on the receiver (sync semantics)
+                foreach (var h in holds) { h.Dispose(); }
+                holds.Clear();
+                File.Delete(empty);
+                var client4 = new TransferClient("127.0.0.1", port, sendDir);
+                client4.SendFolderResumableAsync(sessionId, keepState: true).Wait(30000);
+                Thread.Sleep(300);
+                Assert.True(File.Exists(Path.Combine(sessionDir, "c_empty.bin")),
+                    "pass 4: the receiver keeps files the sender deleted");
+            }
+            finally
+            {
+                foreach (var h in holds) { try { h.Dispose(); } catch { } }
+                FileHashCache.ForClient.Strict = prevClientStrict;
+                FileHashCache.ForServer.Strict = prevServerStrict;
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+                if (sessionId != Guid.Empty) FolderResumeState.Delete(sessionId);
+            }
+        }
+
+        /// <summary>
+        /// A stale partial file on the receiver (a leftover prefix that is NOT a prefix of the
+        /// sender's content) makes the server resume where it should have started over. The
+        /// assembled file then fails the full-file check: it must be discarded, the sender must
+        /// be TOLD (0x04 writes a completion verdict on TCP, like 0x00/0x01/0x06 — without it
+        /// the client reported success while nothing usable landed), and the retry must start
+        /// clean and deliver the right bytes.
+        /// </summary>
+        private static void FolderSyncDiscardReported()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_fd_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_fd_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferServer server = null;
+            Guid sessionId = Guid.Empty;
+            bool prevClientStrict = FileHashCache.ForClient.Strict;
+            bool prevServerStrict = FileHashCache.ForServer.Strict;
+            try
+            {
+                var content = new byte[64 * 1024];
+                new Random(81).NextBytes(content);
+                File.WriteAllBytes(Path.Combine(sendDir, "big.bin"), content);
+
+                var started = new ManualResetEvent(false);
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => started.Set();
+                var discardLogs = new System.Collections.Generic.List<string>();
+                server.OnLog += msg => { lock (discardLogs) discardLogs.Add(msg); };
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+                FileHashCache.ForClient.Strict = false;
+                FileHashCache.ForServer.Strict = false;
+
+                sessionId = FolderResumeState.DeriveSyncSession(sendDir, "127.0.0.1", port, false);
+                string sessionDir = ServerWire.GetFolderSessionDir(recvDir, Path.GetFileName(sendDir), sessionId);
+                Directory.CreateDirectory(sessionDir);
+
+                // A half file from some other content: the right prefix length, wrong bytes
+                var stale = new byte[32 * 1024];
+                new Random(82).NextBytes(stale);
+                string target = Path.Combine(sessionDir, "big.bin");
+                File.WriteAllBytes(target, stale);
+                // First attempt: the server appends the sender's tail to those bytes, the
+                // full-file check fails, and the sender must be told about it.
+                var client1 = new TransferClient("127.0.0.1", port, sendDir);
+                bool reported;
+                string message = null;
+                try
+                {
+                    client1.SendFolderResumableAsync(sessionId, keepState: true).Wait(30000);
+                    reported = false;
+                }
+                catch (Exception ex)
+                {
+                    reported = true;
+                    message = ex.Message;
+                }
+                Assert.True(reported, "a discarded file must be reported to the sender, not reported as success");
+                Thread.Sleep(300);
+                Assert.False(File.Exists(target),
+                    "and the spliced file is discarded instead of being left at the final path (error: " + message
+                    + ") (server: " + Dump(discardLogs) + ")");
+
+                // Second attempt: nothing is in the way, so it starts over and succeeds
+                var client2 = new TransferClient("127.0.0.1", port, sendDir);
+                client2.SendFolderResumableAsync(sessionId, keepState: true).Wait(30000);
+                Thread.Sleep(300);
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(target)),
+                    "the retry delivered the file");
+            }
+            finally
+            {
+                FileHashCache.ForClient.Strict = prevClientStrict;
+                FileHashCache.ForServer.Strict = prevServerStrict;
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+                if (sessionId != Guid.Empty) FolderResumeState.Delete(sessionId);
+            }
+        }
+
+        /// <summary>
+        /// A real-world sync shape: dozens of files across nested subfolders, synced three
+        /// times. Pass 1 transfers everything; pass 2 (untouched) is answered entirely from
+        /// the two digest caches — with every source locked, so any re-read would fail;
+        /// pass 3 adds one nested file and only that file travels.
+        /// </summary>
+        private static void FolderSyncManyNested()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_mn_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_mn_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferServer server = null;
+            Guid sessionId = Guid.Empty;
+            bool prevClientStrict = FileHashCache.ForClient.Strict;
+            bool prevServerStrict = FileHashCache.ForServer.Strict;
+            var holds = new System.Collections.Generic.List<FileStream>();
+            try
+            {
+                var rnd = new Random(91);
+                int total = 40;
+                for (int i = 0; i < total; i++)
+                {
+                    // three levels deep: sub/level2/level3
+                    string sub = Path.Combine(sendDir, "sub" + (i % 4), "level2_" + (i % 3), "level3_" + (i % 2));
+                    Directory.CreateDirectory(sub);
+                    var content = new byte[1024 + i * 64];
+                    rnd.NextBytes(content);
+                    File.WriteAllBytes(Path.Combine(sub, "f" + i + ".bin"), content);
+                }
+
+                var started = new ManualResetEvent(false);
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => started.Set();
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+                FileHashCache.ForClient.Strict = false;
+                FileHashCache.ForServer.Strict = false;
+
+                sessionId = FolderResumeState.DeriveSyncSession(sendDir, "127.0.0.1", port, false);
+                string sessionDir = ServerWire.GetFolderSessionDir(recvDir, Path.GetFileName(sendDir), sessionId);
+
+                var client1 = new TransferClient("127.0.0.1", port, sendDir);
+                client1.SendFolderResumableAsync(sessionId, keepState: true).Wait(60000);
+                Thread.Sleep(300);
+                Assert.Equal(total, Directory.GetFiles(sessionDir, "*", SearchOption.AllDirectories).Length,
+                    "pass 1 delivered every nested file");
+
+                // Pass 2: lock every source — the manifest can only be built from the cache
+                foreach (var f in Directory.GetFiles(sendDir, "*", SearchOption.AllDirectories))
+                    holds.Add(new FileStream(f, FileMode.Open, FileAccess.Read, FileShare.None));
+                var logs2 = new System.Collections.Generic.List<string>();
+                var client2 = new TransferClient("127.0.0.1", port, sendDir);
+                client2.OnLog += msg => logs2.Add(msg);
+                client2.SendFolderResumableAsync(sessionId, keepState: true).Wait(60000);
+                Thread.Sleep(300);
+                Assert.True(logs2.Exists(m => m.Contains("files reused")),
+                    "pass 2 built the manifest without reading any source (logs: " + Dump(logs2) + ")");
+                Assert.True(logs2.Exists(m => m.Contains("already fully received")),
+                    "pass 2 transferred nothing");
+
+                // Pass 3: one new nested file — only it may travel
+                foreach (var h in holds) h.Dispose();
+                holds.Clear();
+                string extraDir = Path.Combine(sendDir, "sub1", "level2_2", "level3_0");
+                Directory.CreateDirectory(extraDir);
+                var extra = new byte[2048];
+                rnd.NextBytes(extra);
+                File.WriteAllBytes(Path.Combine(extraDir, "new.bin"), extra);
+                var logs3 = new System.Collections.Generic.List<string>();
+                var client3 = new TransferClient("127.0.0.1", port, sendDir);
+                client3.OnLog += msg => logs3.Add(msg);
+                client3.SendFolderResumableAsync(sessionId, keepState: true).Wait(60000);
+                Thread.Sleep(300);
+                // Enumeration order decides where the new file lands, so pin the shape rather
+                // than a position: the manifest reused the 40 cached digests, the resume began
+                // somewhere inside the list (not at zero — the scan skipped everything before
+                // the insertion point), and the new file landed.
+                Assert.True(logs3.Exists(m => m.Contains("Hash cache: 40 files reused")),
+                    "pass 3 reused every cached digest (logs: " + Dump(logs3) + ")");
+                Assert.True(logs3.Exists(m => m.Contains("starting at file") && m.Contains("/41")),
+                    "pass 3 resumed mid-list at the new file (logs: " + Dump(logs3) + ")");
+                Assert.True(File.Exists(Path.Combine(sessionDir, "sub1", "level2_2", "level3_0", "new.bin")),
+                    "pass 3 delivered the new file");
+            }
+            finally
+            {
+                foreach (var h in holds) { try { h.Dispose(); } catch { } }
+                FileHashCache.ForClient.Strict = prevClientStrict;
+                FileHashCache.ForServer.Strict = prevServerStrict;
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+                if (sessionId != Guid.Empty) FolderResumeState.Delete(sessionId);
+            }
+        }
+
+        /// <summary>
+        /// The CLI sync verb drives the same 0x04 keepState path as the GUI sync mode, and
+        /// derives the same stable session — so the first run transfers everything and the
+        /// second run of the same command must be a no-op (the scheduled-backup contract).
+        /// </summary>
+        private static void CliSync()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_cli_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_cli_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferServer server = null;
+            try
+            {
+                var a = new byte[48 * 1024];
+                var b = new byte[24 * 1024];
+                new Random(121).NextBytes(a);
+                new Random(122).NextBytes(b);
+                Directory.CreateDirectory(Path.Combine(sendDir, "sub"));
+                File.WriteAllBytes(Path.Combine(sendDir, "a.bin"), a);
+                File.WriteAllBytes(Path.Combine(sendDir, "sub", "b.bin"), b);
+
+                var started = new ManualResetEvent(false);
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => started.Set();
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+                string sessionDir = ServerWire.GetFolderSessionDir(recvDir, Path.GetFileName(sendDir),
+                    FolderResumeState.DeriveSyncSession(sendDir, "127.0.0.1", port, false));
+                Directory.CreateDirectory(sessionDir);
+
+                var aPath = Path.Combine(sessionDir, "a.bin");
+                var bPath = Path.Combine(sessionDir, "sub", "b.bin");
+
+                int rc = Cli.Run(new[] { "sync", "--folder", sendDir, "--ip", "127.0.0.1", "--port", port.ToString() });
+                Assert.Equal(0, rc, "first sync exits 0");
+                Thread.Sleep(300);
+                Assert.True(Utils.ConstantTimeEquals(a, File.ReadAllBytes(aPath)), "nested file a.bin received");
+                Assert.True(Utils.ConstantTimeEquals(b, File.ReadAllBytes(bPath)), "nested file b.bin received");
+
+                // Second run: identical folder → zero transfer, still exit 0
+                rc = Cli.Run(new[] { "sync", "--folder", sendDir, "--ip", "127.0.0.1", "--port", port.ToString() });
+                Assert.Equal(0, rc, "second (no-op) sync exits 0");
+                Assert.True(Utils.ConstantTimeEquals(a, File.ReadAllBytes(aPath)), "content untouched by the no-op");
+
+                // A changed file re-travels on the next run
+                var a2 = new byte[48 * 1024];
+                new Random(123).NextBytes(a2);
+                File.WriteAllBytes(Path.Combine(sendDir, "a.bin"), a2);
+                rc = Cli.Run(new[] { "sync", "--folder", sendDir, "--ip", "127.0.0.1", "--port", port.ToString() });
+                Assert.Equal(0, rc, "sync after a change exits 0");
+                Thread.Sleep(300);
+                Assert.True(Utils.ConstantTimeEquals(a2, File.ReadAllBytes(aPath)), "the new version was delivered");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// The CLI verify verb over a real received-files directory: a file that arrived via a
+        /// transfer verifies; a foreign file shows as unverified without failing the run; a
+        /// file corrupted in place (same size, mtime restored) fails the run with exit code 1.
+        /// </summary>
+        private static void CliVerify()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_cvs_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_cvr_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferServer server = null;
+            try
+            {
+                var content = new byte[64 * 1024];
+                new Random(131).NextBytes(content);
+                string file = Path.Combine(sendDir, "payload.bin");
+                File.WriteAllBytes(file, content);
+
+                var started = new ManualResetEvent(false);
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => started.Set();
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+
+                var client = new TransferClient("127.0.0.1", port, file);
+                client.SendAsync().Wait(30000);
+                Thread.Sleep(300);
+                string received = Path.Combine(recvDir, "payload.bin");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(received)), "file received");
+
+                File.WriteAllBytes(Path.Combine(recvDir, "foreign.txt"), new byte[] { 1, 2, 3 });
+
+                int rc = Cli.Run(new[] { "verify", "--dir", recvDir });
+                Assert.Equal(0, rc, "unreceived foreign file does not fail the scan");
+
+                // In-place corruption: same size, timestamp restored — the scrub's core case
+                var damaged = new byte[64 * 1024];
+                new Random(132).NextBytes(damaged);
+                long sz, mt;
+                FileHashCache.Stat(received, out sz, out mt);
+                File.WriteAllBytes(received, damaged);
+                File.SetLastWriteTimeUtc(received, new DateTime(mt));
+
+                rc = Cli.Run(new[] { "verify", "--dir", recvDir });
+                Assert.Equal(1, rc, "a corrupted file fails the scan with exit code 1");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// Cancelling (or pausing) during the pre-connect hash pass must actually stop the
+        /// send: the token now runs through BuildFolderManifest, the OCE maps to
+        /// WasCancelled (pause semantics), and the server never sees a connection — the
+        /// transfer neither half-starts nor reports success.
+        /// </summary>
+        private static void CancelDuringFolderHash()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_chc_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_chc_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferServer server = null;
+            try
+            {
+                // Big enough that the hash pass trips the 100ms progress throttle
+                var content = new byte[192 * 1024 * 1024];
+                new Random(141).NextBytes(content);
+                File.WriteAllBytes(Path.Combine(sendDir, "big.bin"), content);
+
+                var started = new ManualResetEvent(false);
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.OnStarted += () => started.Set();
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+
+                Guid sessionId = Guid.NewGuid();
+                var client = new TransferClient("127.0.0.1", port, sendDir);
+                bool sawProgress = false;
+                client.OnProgress += delegate
+                {
+                    if (!sawProgress)
+                    {
+                        sawProgress = true;
+                        client.Cancel();
+                    }
+                };
+                var task = client.SendFolderResumableAsync(sessionId, keepState: true);
+                task.Wait(60000);
+                Assert.True(sawProgress, "hash progress reached the caller");
+                Assert.True(client.WasCancelled, "the cancel maps to pause semantics, not an error");
+                Thread.Sleep(300);
+                Assert.False(Directory.Exists(ServerWire.GetFolderSessionDir(recvDir,
+                    Path.GetFileName(sendDir), sessionId)), "the server never saw the transfer");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// With the 0x0A capability the receiver answers which of the remaining files it
+        /// already holds identically, so a change in the middle of the manifest no longer
+        /// re-sends its identical successors. Proven three ways: the skip is logged, the
+        /// skipped file's mtime is untouched (no rewrite happened), and everything still
+        /// byte-compares. Second pass: an inserted file only drags itself along. Third:
+        /// the same flow works over UDT.
+        /// </summary>
+        private static void FolderSyncPerFileSkip(bool isUdt)
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_pfs_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_pfs_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferServer tcpServer = null;
+            TransferUdtServer udtServer = null;
+            Guid sessionId = Guid.Empty;
+            bool prevClientStrict = FileHashCache.ForClient.Strict;
+            bool prevServerStrict = FileHashCache.ForServer.Strict;
+            try
+            {
+                var a = new byte[32 * 1024];
+                var b = new byte[48 * 1024];
+                var c = new byte[40 * 1024];
+                new Random(151).NextBytes(a);
+                new Random(152).NextBytes(b);
+                new Random(153).NextBytes(c);
+                File.WriteAllBytes(Path.Combine(sendDir, "a.bin"), a);
+                File.WriteAllBytes(Path.Combine(sendDir, "b.bin"), b);
+                File.WriteAllBytes(Path.Combine(sendDir, "c.bin"), c);
+
+                var started = new ManualResetEvent(false);
+                if (isUdt)
+                {
+                    udtServer = new TransferUdtServer("127.0.0.1", port, recvDir);
+                    udtServer.OnStarted += () => started.Set();
+                    udtServer.Start();
+                }
+                else
+                {
+                    tcpServer = new TransferServer("127.0.0.1", port, recvDir);
+                    tcpServer.OnStarted += () => started.Set();
+                    tcpServer.Start();
+                }
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+                FileHashCache.ForClient.Strict = false;
+                FileHashCache.ForServer.Strict = false;
+
+                sessionId = FolderResumeState.DeriveSyncSession(sendDir, "127.0.0.1", port, isUdt);
+                string sessionDir = ServerWire.GetFolderSessionDir(recvDir, Path.GetFileName(sendDir), sessionId);
+
+                // Pass 1 with a fresh client: full transfer, no skip possible
+                var client1 = isUdt
+                    ? (TransferClient)null
+                    : new TransferClient("127.0.0.1", port, sendDir);
+                if (isUdt)
+                {
+                    var u1 = new TransferUdtClient("127.0.0.1", port, sendDir);
+                    u1.SendFolderResumableAsync(sessionId, keepState: true).Wait(60000);
+                }
+                else
+                {
+                    client1.SendFolderResumableAsync(sessionId, keepState: true).Wait(60000);
+                }
+                Thread.Sleep(300);
+                Assert.True(Utils.ConstantTimeEquals(a, File.ReadAllBytes(Path.Combine(sessionDir, "a.bin"))),
+                    "pass 1: a.bin received");
+                string cPath = Path.Combine(sessionDir, "c.bin");
+                DateTime cMtimeBefore = File.GetLastWriteTimeUtc(cPath);
+
+                // Pass 2: b's content changes (same size). Old flow would re-send c after it;
+                // with per-file skip the receiver declares it holds c and only b travels.
+                var b2 = new byte[48 * 1024];
+                new Random(154).NextBytes(b2);
+                File.WriteAllBytes(Path.Combine(sendDir, "b.bin"), b2);
+
+                var logs2 = new System.Collections.Generic.List<string>();
+                if (isUdt)
+                {
+                    var u2 = new TransferUdtClient("127.0.0.1", port, sendDir);
+                    u2.OnLog += msg => logs2.Add(msg);
+                    u2.SendFolderResumableAsync(sessionId, keepState: true).Wait(60000);
+                }
+                else
+                {
+                    var c2 = new TransferClient("127.0.0.1", port, sendDir);
+                    c2.OnLog += msg => logs2.Add(msg);
+                    c2.SendFolderResumableAsync(sessionId, keepState: true).Wait(60000);
+                }
+                Thread.Sleep(300);
+                string skipLine = L.C_PerFileSkip(1, 0);
+                Assert.True(logs2.Exists(m => m.Contains(skipLine) || m.Contains("holds 1 file")),
+                    "pass 2: c.bin was skipped by per-file answer (logs: " + Dump(logs2) + ")");
+                Assert.True(Utils.ConstantTimeEquals(b2, File.ReadAllBytes(Path.Combine(sessionDir, "b.bin"))),
+                    "pass 2: the changed file travelled");
+                Assert.True(File.GetLastWriteTimeUtc(cPath).Ticks == cMtimeBefore.Ticks,
+                    "skipped file was not rewritten");
+
+                // Pass 3: change the first file AND insert a new one. The scan resumes at the
+                // first mismatch; everything identical after that point is skipped by the
+                // per-file answers (≥1 guaranteed — the new file and the changed one travel).
+                var a2 = new byte[32 * 1024];
+                new Random(156).NextBytes(a2);
+                File.WriteAllBytes(Path.Combine(sendDir, "a.bin"), a2);
+                var d = new byte[16 * 1024];
+                new Random(155).NextBytes(d);
+                File.WriteAllBytes(Path.Combine(sendDir, "d.bin"), d);
+                var logs3 = new System.Collections.Generic.List<string>();
+                if (isUdt)
+                {
+                    var u3 = new TransferUdtClient("127.0.0.1", port, sendDir);
+                    u3.OnLog += msg => logs3.Add(msg);
+                    u3.SendFolderResumableAsync(sessionId, keepState: true).Wait(60000);
+                }
+                else
+                {
+                    var c3 = new TransferClient("127.0.0.1", port, sendDir);
+                    c3.OnLog += msg => logs3.Add(msg);
+                    c3.SendFolderResumableAsync(sessionId, keepState: true).Wait(60000);
+                }
+                Thread.Sleep(300);
+                Assert.True(Utils.ConstantTimeEquals(d, File.ReadAllBytes(Path.Combine(sessionDir, "d.bin"))),
+                    "pass 3: the inserted file arrived");
+                Assert.True(Utils.ConstantTimeEquals(a2, File.ReadAllBytes(Path.Combine(sessionDir, "a.bin"))),
+                    "pass 3: the changed file arrived");
+                Assert.True(logs3.Exists(m => m.Contains("对端已持有") || m.Contains("Peer already holds")),
+                    "pass 3: identical successors were skipped (logs: " + Dump(logs3) + ")");
+            }
+            finally
+            {
+                FileHashCache.ForClient.Strict = prevClientStrict;
+                FileHashCache.ForServer.Strict = prevServerStrict;
+                if (tcpServer != null) { try { tcpServer.Stop(); } catch { } }
+                if (udtServer != null) { try { udtServer.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+                if (sessionId != Guid.Empty) FolderResumeState.Delete(sessionId);
+            }
+        }
+
+        /// <summary>Pairing codes are not hard-wired to six digits: an eight-digit code
+        /// (Config "PairingLength") must authenticate end to end.</summary>
+        private static void LongPairingCode()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_plc_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_plc_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferServer server = null;
+            try
+            {
+                var content = new byte[32 * 1024];
+                new Random(171).NextBytes(content);
+                string file = Path.Combine(sendDir, "payload.bin");
+                File.WriteAllBytes(file, content);
+
+                var started = new ManualResetEvent(false);
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.PairingCode = "9081726354"; // 10 digits
+                server.OnStarted += () => started.Set();
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+
+                var client = new TransferClient("127.0.0.1", port, file) { PairingCode = "9081726354" };
+                client.SendAsync().Wait(30000);
+                Thread.Sleep(300);
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(Path.Combine(recvDir, "payload.bin"))),
+                    "a long pairing code authenticates and the transfer lands");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+
+        /// <summary>HTTP share must serve single ranges (browsers resume large downloads
+        /// with them): 206 + Content-Range for open-ended and bounded ranges, correct byte
+        /// slices, and 416 for a range past EOF.</summary>
+        private static void HttpShareRangeResume()
+        {
+            int port = FindFreePort();
+            string root = Path.Combine(TempBase(), "tr_http_range_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            var server = new HttpShareServer();
+            try
+            {
+                var content = new byte[256 * 1024];
+                new Random(161).NextBytes(content);
+                File.WriteAllBytes(Path.Combine(root, "big.bin"), content);
+                server.Start(root, port, null);
+                string url = "http://127.0.0.1:" + port + "/?f=big.bin";
+
+                // Full download advertises range support
+                var full = HttpGet(url);
+                Assert.Equal(200, full.Item1, "full download 200");
+                Assert.Equal("bytes", full.Item3["Accept-Ranges"], "range support advertised");
+
+                // Open-ended range: bytes=100000-
+                var tail = HttpRangeGet(url, 100000, null);
+                Assert.Equal(206, tail.Item1, "open range 206");
+                Assert.Equal(content.Length - 100000, tail.Item2.Length, "open range length");
+                var expectTail = new byte[content.Length - 100000];
+                Buffer.BlockCopy(content, 100000, expectTail, 0, expectTail.Length);
+                Assert.True(Utils.ConstantTimeEquals(expectTail, tail.Item2), "open range bytes");
+                Assert.Equal("bytes " + 100000 + "-" + (content.Length - 1) + "/" + content.Length,
+                    tail.Item3["Content-Range"], "Content-Range header");
+
+                // Bounded range: bytes=100-199
+                var mid = HttpRangeGet(url, 100, 199);
+                Assert.Equal(206, mid.Item1, "bounded range 206");
+                Assert.Equal(100, mid.Item2.Length, "bounded range length");
+                var expectMid = new byte[100];
+                Buffer.BlockCopy(content, 100, expectMid, 0, 100);
+                Assert.True(Utils.ConstantTimeEquals(expectMid, mid.Item2), "bounded range bytes");
+
+                // Suffix range: bytes=-1024 (last 1 KB)
+                var lastKb = HttpRangeGet(url, -1024, null);
+                Assert.Equal(206, lastKb.Item1, "suffix range 206");
+                Assert.Equal(1024, lastKb.Item2.Length, "suffix range length");
+                var expectSuffix = new byte[1024];
+                Buffer.BlockCopy(content, content.Length - 1024, expectSuffix, 0, 1024);
+                Assert.True(Utils.ConstantTimeEquals(expectSuffix, lastKb.Item2), "suffix range bytes");
+
+                // Start past EOF -> 416
+                var beyond = HttpRangeGet(url, content.Length + 10, null);
+                Assert.Equal(416, beyond.Item1, "range past EOF 416");
+            }
+            finally
+            {
+                server.Stop();
+                try { Directory.Delete(root, true); } catch { }
+            }
+        }
+
+        /// <summary>GET with a raw single Range header over a raw socket (start >= 0, or
+        /// suffix when start < 0; end == null means "to EOF"). Returns status, body and the
+        /// headers the server actually wrote — bypasses HttpWebRequest's restricted Range.</summary>
+        private static System.Tuple<int, byte[], System.Collections.Generic.Dictionary<string, string>> HttpRangeGet(
+            string url, long start, long? end)
+        {
+            int p = url.LastIndexOf(':');
+            int port = int.Parse(url.Substring(p + 1, url.IndexOf('/', p) - p - 1));
+            string query = url.Substring(url.IndexOf('/', p + 1));
+            string spec = start >= 0
+                ? "bytes=" + start + "-" + (end.HasValue ? end.Value.ToString() : "")
+                : "bytes=-" + (-start);
+
+            var client = new TcpClient("127.0.0.1", port);
+            try
+            {
+                string crlf = "\r\n";
+                string reqText = "GET " + query + " HTTP/1.1" + crlf + "Host: 127.0.0.1" + crlf
+                    + "Range: " + spec + crlf + "Connection: close" + crlf + crlf;
+                byte[] reqBytes = System.Text.Encoding.ASCII.GetBytes(reqText);
+                var stream = client.GetStream();
+                stream.Write(reqBytes, 0, reqBytes.Length);
+
+                var ms = new MemoryStream();
+                var buf = new byte[65536];
+                int n;
+                while ((n = stream.Read(buf, 0, buf.Length)) > 0)
+                    ms.Write(buf, 0, n);
+                byte[] raw = ms.ToArray();
+
+                byte[] sep = System.Text.Encoding.ASCII.GetBytes(crlf + crlf);
+                int headerEnd = IndexOf(raw, sep);
+                if (headerEnd < 0) throw new IOException("no response header");
+                string head = System.Text.Encoding.ASCII.GetString(raw, 0, headerEnd);
+                int status = int.Parse(head.Split(' ')[1]);
+                var headers = new System.Collections.Generic.Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                string[] lines = head.Split(new[] { crlf }, StringSplitOptions.RemoveEmptyEntries);
+                for (int i = 1; i < lines.Length; i++)
+                {
+                    int colon = lines[i].IndexOf(':');
+                    if (colon > 0)
+                        headers[lines[i].Substring(0, colon).Trim()] = lines[i].Substring(colon + 1).Trim();
+                }
+                var body = new byte[raw.Length - headerEnd - 4];
+                Buffer.BlockCopy(raw, headerEnd + 4, body, 0, body.Length);
+                return System.Tuple.Create(status, body, headers);
+            }
+            finally
+            {
+                client.Close();
+            }
+        }
+
+        private static int IndexOf(byte[] hay, byte[] needle)
+        {
+            for (int i = 0; i <= hay.Length - needle.Length; i++)
+            {
+                bool ok = true;
+                for (int j = 0; j < needle.Length; j++)
+                {
+                    if (hay[i + j] != needle[j]) { ok = false; break; }
+                }
+                if (ok) return i;
+            }
+            return -1;
+        }
+
     }
 }

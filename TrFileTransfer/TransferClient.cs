@@ -222,6 +222,11 @@ namespace TrFileTransfer
         /// letting it hang until the OS connect timeout (~21 s).</summary>
         private async Task<TcpWireStream> ConnectAsync(CancellationToken ct)
         {
+            // A cancel that landed while the hash/manifest pass was still finishing would
+            // otherwise walk into connect with a dead token — and ct.Register then fires
+            // synchronously, disposing the client underneath its own pending EndConnect
+            // (which surfaces as an opaque NullReferenceException instead of a cancel).
+            ct.ThrowIfCancellationRequested();
             var client = CreateClient();
             try
             {
@@ -236,7 +241,17 @@ namespace TrFileTransfer
                     try { client.Dispose(); } catch { }
                 }))
                 {
-                    await connectTask.ConfigureAwait(false);
+                    try
+                    {
+                        await connectTask.ConfigureAwait(false);
+                    }
+                    catch (Exception connectFailure)
+                    {
+                        // The cancellation that disposed the client mid-connect must read
+                        // as a cancel, not as a connect error (C# 5: no exception filters)
+                        ct.ThrowIfCancellationRequested();
+                        throw connectFailure;
+                    }
                 }
                 Log(L.C_Connected(_serverIp, _port));
 
@@ -257,8 +272,18 @@ namespace TrFileTransfer
         /// </summary>
         private async Task<IWireStream> OpenAndAuthenticateAsync(CancellationToken ct)
         {
+            return (await OpenAndAuthenticateResultAsync(ct, false).ConfigureAwait(false)).Stream;
+        }
+
+        /// <summary>Same, returning the full negotiation result. wantPerFileSkip offers the
+        /// 0x0A capability frame so a 0x04 body can skip files the receiver already holds;
+        /// a peer that drops it costs one reconnect without the offer (budget 3 attempts —
+        /// encryption, compression and skip can each be discovered independently).</summary>
+        private async Task<AuthResult> OpenAndAuthenticateResultAsync(CancellationToken ct, bool wantPerFileSkip)
+        {
             bool allowEncrypt = EncryptionEnabled;
             bool allowCompress = CompressionEnabled;
+            int maxAttempts = wantPerFileSkip ? 3 : 2;
             for (int attempt = 0; ; attempt++)
             {
                 TcpWireStream raw = await ConnectAsync(ct).ConfigureAwait(false);
@@ -266,21 +291,21 @@ namespace TrFileTransfer
                 try
                 {
                     auth = await ClientWire.AuthenticateAsync(raw, PairingCode, allowEncrypt, allowCompress, _cb, ct,
-                        EncryptionDowngradeAllowed).ConfigureAwait(false);
+                        EncryptionDowngradeAllowed, wantPerFileSkip).ConfigureAwait(false);
                 }
                 catch
                 {
                     raw.Dispose();
                     throw;
                 }
-                if (auth.NeedNoCompressionFallback && allowCompress && attempt < 2)
+                if (auth.NeedNoCompressionFallback && allowCompress && attempt < maxAttempts)
                 {
                     raw.Dispose();
                     allowCompress = false;
                     _cb.RaiseLog(L.C_CompressFallback);
                     continue;
                 }
-                if (auth.NeedPlainFallback && allowEncrypt && attempt < 2)
+                if (auth.NeedPlainFallback && allowEncrypt && attempt < maxAttempts)
                 {
                     raw.Dispose();
                     // A peer too old for 0x17 is too old for 0x08 as well
@@ -289,12 +314,18 @@ namespace TrFileTransfer
                     _cb.RaiseLog(L.C_EncryptFallback);
                     continue;
                 }
+                if (auth.NeedNoPerFileSkipFallback && wantPerFileSkip && attempt < maxAttempts)
+                {
+                    raw.Dispose();
+                    wantPerFileSkip = false;
+                    continue;
+                }
                 // A successful prelude (encryption or compression accepted) proves the
                 // peer is a current build, which means it sends the TCP completion
                 // verdict byte. Without that proof (no pairing and compression off, or
                 // an older peer) do not wait for a byte that may never come.
                 _cb.CompletionAckOnStream = auth.Encrypted || auth.Compressed;
-                return auth.Stream;
+                return auth;
             }
         }
 
@@ -325,18 +356,36 @@ namespace TrFileTransfer
 
         private async Task SendFolderResumableInternal(Guid sessionId, CancellationToken ct, bool keepState)
         {
-            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
+            // Hash the whole folder before connecting, not after: the connect-then-hash
+            // order left the server idle through the hash pass, and a large enough folder
+            // made it drop the connection before the transfer could start.
+            var manifest = await Task.Run(
+                delegate { return ClientWire.BuildFolderManifest(_filePath, _cb, ct); }, ct).ConfigureAwait(false);
+            if (manifest == null) return;
+            var auth = await OpenAndAuthenticateResultAsync(ct, wantPerFileSkip: true).ConfigureAwait(false);
+            using (var ws = auth.Stream)
             {
-                await ClientWire.SendFolderResumableAsync(ws, _filePath, sessionId,
-                    _serverIp, _port, false, _bufferSize, _limiter, _cb, ct, keepState).ConfigureAwait(false);
+                await ClientWire.SendFolderResumableAsync(ws, manifest, sessionId,
+                    _serverIp, _port, false, _bufferSize, _limiter, _cb, ct, keepState, auth.PerFileSkip).ConfigureAwait(false);
             }
         }
 
         private async Task SendResumableInternal(Guid sessionId, CancellationToken ct, bool verifyHash)
         {
+            // Same reason as SendFolderResumableInternal for hashing before the connect;
+            // the cache keeps a retry from re-reading the file a second and third time.
+            byte[] fullHash = null;
+            if (verifyHash)
+            {
+                fullHash = await Task.Run(delegate
+                {
+                    bool computed;
+                    return FileHashCache.ForClient.GetOrCompute(_filePath, _cb, true, out computed, ct);
+                }, ct).ConfigureAwait(false);
+            }
             using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
             {
-                await ClientWire.SendResumableAsync(ws, _filePath, sessionId, verifyHash,
+                await ClientWire.SendResumableAsync(ws, _filePath, sessionId, fullHash,
                     _serverIp, _port, false, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
         }

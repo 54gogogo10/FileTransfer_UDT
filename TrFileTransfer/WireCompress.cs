@@ -159,8 +159,7 @@ namespace TrFileTransfer
 
         public async Task ReadExactAsync(byte[] buffer, int offset, int count, CancellationToken ct)
         {
-            int got = 0;
-            while (got < count)
+            int got = 0;            while (got < count)
             {
                 if (_plainPos >= _plainLen)
                     await FillPendingAsync(ct).ConfigureAwait(false);
@@ -171,6 +170,13 @@ namespace TrFileTransfer
                 _plainPos += take;
                 got += take;
             }
+        }
+
+        /// <summary>Forwarded: the raw socket underneath is the one that has a timeout, and
+        /// the caller must still be able to widen it (see IWireStream.SetReadTimeoutMs).</summary>
+        public void SetReadTimeoutMs(int milliseconds)
+        {
+            _inner.SetReadTimeoutMs(milliseconds);
         }
 
         /// <summary>Pulls the next wire segment and inflates it into the pending

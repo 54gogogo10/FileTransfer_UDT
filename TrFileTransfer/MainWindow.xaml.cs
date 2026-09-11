@@ -290,7 +290,8 @@ namespace TrFileTransfer
 
         private static void ValidateDigitsOnly(TextBox box)
         {
-            bool ok = box.Text.All(char.IsDigit);
+            // Pairing codes are 4-12 digits (Config "PairingLength" picks the generated length)
+            bool ok = box.Text.All(char.IsDigit) && box.Text.Length <= 12;
             SetFieldError(box, !ok, ok ? null : L.FieldDigitsOnly);
         }
 
@@ -534,6 +535,7 @@ namespace TrFileTransfer
             _btnStats.Content = L.StatsBtn;
             _btnHistory.Content = L.HistoryBtn;
             _btnDevices.Content = L.DevicesBtn;
+            _btnVerifyLib.Content = L.VerifyBtn;
             _btnPause.Content = _paused ? L.ResumeText : L.PauseBtn;
             _chkEncrypt.Content = L.EncryptLabel;
             _chkCompress.Content = L.CompressLabel;
@@ -751,9 +753,12 @@ namespace TrFileTransfer
 
         private void ChkPairing_CheckedChanged(object sender, RoutedEventArgs e)
         {
-            // Show a fresh code immediately; Start regenerates one per server session
+            // Show a fresh code immediately; Start regenerates one per server session.
+            // Length from Config "PairingLength" (4-12, default 6) — a longer code shrinks
+            // the offline brute-force space that PBKDF2 only slows down.
             if (_chkPairing.IsChecked == true)
-                _lblPairingCode.Text = WireAuth.GeneratePairingCode();
+                _lblPairingCode.Text = WireAuth.GeneratePairingCode(
+                    Math.Max(4, Math.Min(12, Config.GetInt("PairingLength", 6))));
             _lblPairingCode.Visibility = _chkPairing.IsChecked == true ? Visibility.Visible : Visibility.Collapsed;
         }
 
@@ -1276,7 +1281,8 @@ namespace TrFileTransfer
             string pairingCode = null;
             if (_chkPairing.IsChecked == true)
             {
-                pairingCode = WireAuth.GeneratePairingCode();
+                pairingCode = WireAuth.GeneratePairingCode(
+                    Math.Max(4, Math.Min(12, Config.GetInt("PairingLength", 6))));
                 _lblPairingCode.Text = pairingCode;
             }
 
@@ -1580,6 +1586,12 @@ namespace TrFileTransfer
         private void BtnStats_Click(object sender, RoutedEventArgs e)
         {
             var dlg = new StatsDialog(_stats) { Owner = this };
+            dlg.ShowDialog();
+        }
+
+        private void BtnVerifyLib_Click(object sender, RoutedEventArgs e)
+        {
+            var dlg = new LibraryVerifyDialog(_txtSaveDir.Text.Trim()) { Owner = this };
             dlg.ShowDialog();
         }
 

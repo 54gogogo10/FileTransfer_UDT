@@ -146,6 +146,9 @@ namespace TrFileTransfer
         {
             _cts = new CancellationTokenSource();
             ServerResumeStore.CleanupStale(7); // drop orphaned resume sessions from clients that never returned
+            // Receive-option policy (byte-for-byte verification, digest lifetime) applies from
+            // here on — the options dialog promises these take effect on the next server start.
+            FileHashCache.ForServer.ApplyConfig();
             IPAddress bindIp;
             if (!IPAddress.TryParse(_bindAddress, out bindIp))
                 bindIp = IPAddress.Any;

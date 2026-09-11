@@ -143,16 +143,18 @@
                                    Foreground="{DynamicResource Brush.AccentHover}" Visibility="Collapsed"/>
                     </StackPanel>
 
-                    <!-- Receive options: security gates + stats + history + devices -->
+                    <!-- Receive options: security gates + stats + history + devices + verify -->
                     <StackPanel Grid.Row="5" Orientation="Horizontal" Margin="0,0,0,0">
                         <Button x:Name="_btnRecvOptions" Style="{StaticResource BtnSecondary}" MinWidth="88"
                                 Click="BtnRecvOptions_Click"/>
-                        <Button x:Name="_btnStats" Style="{StaticResource BtnSecondary}" MinWidth="76"
-                                Margin="8,0,0,0" Click="BtnStats_Click"/>
-                        <Button x:Name="_btnHistory" Style="{StaticResource BtnSecondary}" MinWidth="76"
-                                Margin="8,0,0,0" Click="BtnHistory_Click"/>
-                        <Button x:Name="_btnDevices" Style="{StaticResource BtnSecondary}" MinWidth="76"
-                                Margin="8,0,0,0" Click="BtnDevices_Click"/>
+                        <Button x:Name="_btnStats" Style="{StaticResource BtnSecondary}" MinWidth="72"
+                                Margin="6,0,0,0" Click="BtnStats_Click"/>
+                        <Button x:Name="_btnHistory" Style="{StaticResource BtnSecondary}" MinWidth="72"
+                                Margin="6,0,0,0" Click="BtnHistory_Click"/>
+                        <Button x:Name="_btnDevices" Style="{StaticResource BtnSecondary}" MinWidth="72"
+                                Margin="6,0,0,0" Click="BtnDevices_Click"/>
+                        <Button x:Name="_btnVerifyLib" Style="{StaticResource BtnSecondary}" MinWidth="72"
+                                Margin="6,0,0,0" Click="BtnVerifyLib_Click"/>
                     </StackPanel>
                 </Grid>
             </Border>

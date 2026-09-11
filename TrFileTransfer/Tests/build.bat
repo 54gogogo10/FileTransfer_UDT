@@ -40,6 +40,8 @@ echo.
     ..\WireCompress.cs ^
     ..\QrCode.cs ^
     ..\StatsStore.cs ^
+    ..\Cli.cs ^
+    ..\LibraryVerifier.cs ^
     TestProgram.cs ^
     IntegrationTests.cs ^
     FeatureTests.cs
