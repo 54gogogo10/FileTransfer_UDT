@@ -251,6 +251,61 @@ namespace TrFileTransfer.Tests
                 // Default overload keeps the historic 6-digit shape
                 Assert.Equal(6, WireAuth.GeneratePairingCode().Length, "default stays 6");
             });
+
+            runner.Run("FileHashCache_RemoveByPrefix", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_rbp_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    // Two "session" subdirs, one file each, plus a file outside them
+                    string sessionA = Path.Combine(dir, "photos.1a2b3c4d");
+                    string sessionB = Path.Combine(dir, "docs.99887766");
+                    Directory.CreateDirectory(sessionA);
+                    Directory.CreateDirectory(sessionB);
+                    string a = Path.Combine(sessionA, "a.bin");
+                    string b = Path.Combine(sessionB, "b.bin");
+                    string keep = Path.Combine(dir, "keep.bin");
+                    File.WriteAllBytes(a, new byte[256]);
+                    File.WriteAllBytes(b, new byte[256]);
+                    File.WriteAllBytes(keep, new byte[256]);
+
+                    var cache = new FileHashCache(null);
+                    cache.Store(a, ClientWire.ComputeFileHash(a));
+                    cache.Store(b, ClientWire.ComputeFileHash(b));
+                    cache.Store(keep, ClientWire.ComputeFileHash(keep));
+
+                    // What a reset does: drop the session's digests, keep the rest
+                    cache.RemoveByPrefix(sessionA);
+                    long size, mtime;
+                    bool matches;
+                    Assert.True(FileHashCache.Stat(a, out size, out mtime), "stat a");
+                    Assert.False(cache.TryMatch(a, size, mtime, new byte[32], out matches),
+                        "reset session's digest is gone");
+                    Assert.True(FileHashCache.Stat(keep, out size, out mtime), "stat keep");
+                    Assert.True(cache.TryMatch(keep, size, mtime, new byte[32], out matches),
+                        "digest outside the session survives");
+                    Assert.True(FileHashCache.Stat(b, out size, out mtime), "stat b");
+                    Assert.True(cache.TryMatch(b, size, mtime, new byte[32], out matches),
+                        "other session's digest survives");
+
+                    // Prefix matching must not hit a sibling with the same name prefix
+                    string simA = Path.Combine(dir, "photos.1a2b3c4d5");
+                    Directory.CreateDirectory(simA);
+                    string sim = Path.Combine(simA, "s.bin");
+                    File.WriteAllBytes(sim, new byte[256]);
+                    cache.Store(sim, ClientWire.ComputeFileHash(sim));
+                    cache.RemoveByPrefix(sessionA + Path.DirectorySeparatorChar);
+                    long simSize, simMtime;
+                    Assert.True(FileHashCache.Stat(sim, out simSize, out simMtime), "stat sim");
+                    Assert.True(cache.TryMatch(sim, simSize, simMtime, new byte[32], out matches),
+                        "a directory whose name merely extends the prefix is untouched");
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
         }
 
 

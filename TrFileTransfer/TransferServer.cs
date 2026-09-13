@@ -49,6 +49,9 @@ namespace TrFileTransfer
         /// <summary>Whether the server is currently listening.</summary>
         public bool IsRunning { get { return _isRunning; } }
 
+        /// <summary>The directory received files land in (also the sync-session root).</summary>
+        public string SaveDirectory { get { return _saveDirectory; } }
+
         /// <summary>
         /// Creates a TCP server that listens for incoming file transfers.
         /// </summary>

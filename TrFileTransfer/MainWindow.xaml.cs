@@ -536,6 +536,7 @@ namespace TrFileTransfer
             _btnHistory.Content = L.HistoryBtn;
             _btnDevices.Content = L.DevicesBtn;
             _btnVerifyLib.Content = L.VerifyBtn;
+            _btnSyncSessions.Content = L.SyncSessionsBtn;
             _btnPause.Content = _paused ? L.ResumeText : L.PauseBtn;
             _chkEncrypt.Content = L.EncryptLabel;
             _chkCompress.Content = L.CompressLabel;
@@ -1592,6 +1593,16 @@ namespace TrFileTransfer
         private void BtnVerifyLib_Click(object sender, RoutedEventArgs e)
         {
             var dlg = new LibraryVerifyDialog(_txtSaveDir.Text.Trim()) { Owner = this };
+            dlg.ShowDialog();
+        }
+
+        private void BtnSyncSessions_Click(object sender, RoutedEventArgs e)
+        {
+            // Prefer a running server's (possibly archived) directory; fall back to the box
+            string dir = _server != null ? _server.SaveDirectory
+                : (_serverUdt != null ? _serverUdt.SaveDirectory : null);
+            if (string.IsNullOrEmpty(dir)) dir = _txtSaveDir.Text.Trim();
+            var dlg = new SyncSessionsDialog(GetArchiveDir(dir)) { Owner = this };
             dlg.ShowDialog();
         }
 

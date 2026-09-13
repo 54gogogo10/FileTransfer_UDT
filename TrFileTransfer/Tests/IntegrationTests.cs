@@ -130,6 +130,67 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_UDT_FolderSync_PerFileSkip", () => FolderSyncPerFileSkip(true), 1);
             runner.Run("Integration_HTTP_RangeResume", HttpShareRangeResume);
             runner.Run("Integration_Auth_LongPairingCode", LongPairingCode);
+            runner.Run("Integration_TCP_ChunkDigestRegistered", ChunkDigestRegistered);
+        }
+
+        /// <summary>
+        /// A concurrently-chunked receive carries only per-chunk hashes, so the server hashes
+        /// the assembled file once when it completes and records the digest — after which the
+        /// dedup check answers from the cache (proven by locking the file: no re-read).
+        /// </summary>
+        private static void ChunkDigestRegistered()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_ckd_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_ckd_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferServer server = null;
+            FileStream hold = null;
+            bool prevStrict = FileHashCache.ForServer.Strict;
+            try
+            {
+                // Large enough to split into chunks (> ChunkMinSize), small enough to be fast
+                var content = new byte[9 * 1024 * 1024];
+                new Random(181).NextBytes(content);
+                string file = Path.Combine(sendDir, "chunked.bin");
+                File.WriteAllBytes(file, content);
+
+                var started = new ManualResetEvent(false);
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                server.SkipDuplicateFiles = true;
+                server.OnStarted += () => started.Set();
+                var serverLogs = new System.Collections.Generic.List<string>();
+                server.OnLog += msg => { lock (serverLogs) serverLogs.Add(msg); };
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+                FileHashCache.ForServer.Strict = false;
+
+                var client = new TransferClient("127.0.0.1", port, file);
+                client.SendChunkedAsync(0, content.Length, content.Length).Wait(60000);
+                Thread.Sleep(300);
+                string saved = Path.Combine(recvDir, "chunked.bin");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(saved)), "chunked file assembled");
+
+                // The assembled file's digest is remembered: locked (unreadable) file, and
+                // only the cache can still answer "identical to expected".
+                hold = new FileStream(saved, FileMode.Open, FileAccess.Read, FileShare.None);
+                long size, mtime;
+                Assert.True(FileHashCache.Stat(saved, out size, out mtime), "stat the received file");
+                byte[] expected = ClientWire.ComputeFileHash(file); // the source's digest
+                bool matches;
+                Assert.True(FileHashCache.ForServer.TryMatch(saved, size, mtime, expected, out matches) && matches,
+                    "the server cached the assembled chunked file's digest (no re-read: the copy is locked)");
+            }
+            finally
+            {
+                FileHashCache.ForServer.Strict = prevStrict;
+                if (hold != null) { try { hold.Dispose(); } catch { } }
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
         }
 
                 private static void TcpSingleFile()

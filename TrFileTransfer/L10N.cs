@@ -1005,6 +1005,31 @@ namespace TrFileTransfer
         public static string ROHashCacheDaysLabel { get { return IsChinese ? "校验缓存有效期 天 (0=永不过期):" : "Digest cache TTL days (0 = never expire):"; } }
         public static string ROPairingLengthLabel { get { return IsChinese ? "配对码位数 (4-12):" : "Pairing code digits (4-12):"; } }
 
+        // ---- sync sessions (reset) ----
+        public static string SyncSessionsBtn { get { return IsChinese ? "同步会话" : "Sync Sessions"; } }
+        public static string SyncTitle { get { return IsChinese ? "同步会话（服务端）" : "Sync Sessions (server)"; } }
+        public static string SyncHint
+        {
+            get
+            {
+                return IsChinese
+                    ? "每个同步（或文件夹续传）会话在保存目录下对应一个文件夹，重复同步只传差异。" +
+                      "重置会删除该会话在服务端的全部文件与校验记录——下次同步将从零完整重传。仅当怀疑漂移时使用。"
+                    : "Each sync (or folder-resume) session maps to one folder under the save directory;\n" +
+                      "repeated syncs transfer only differences. Resetting deletes the server's copy of the\n" +
+                      "session — the next sync re-transfers everything from scratch. Use when drift is suspected.";
+            }
+        }
+        public static string SyncFilesWord { get { return IsChinese ? "个文件" : "files"; } }
+        public static string SyncReset { get { return IsChinese ? "重置会话" : "Reset session"; } }
+        public static string SyncResetDo { get { return IsChinese ? "确认删除" : "Delete"; } }
+        public static string SyncResetConfirm(object name, object files, object size)
+        {
+            return IsChinese
+                ? string.Format("将删除会话目录 \"{0}\"（{1} 个文件，共 {2}）及其校验记录。\n下次同步将完整重传全部内容。确定？", name, files, size)
+                : string.Format("Delete session directory \"{0}\" ({1} files, {2}) and its digests?\nThe next sync will re-transfer everything.", name, files, size);
+        }
+
         // ---- Transfer statistics ----
         public static string StatsBtn { get { return IsChinese ? "统计" : "Stats"; } }
         public static string StatsTitle { get { return IsChinese ? "传输统计" : "Transfer Stats"; } }
@@ -1129,16 +1154,24 @@ namespace TrFileTransfer
                   "· 发文本 —— 向对方发送一条即时消息\n" +
                   "· 加密 —— 双方都开配对码即自动加密传输（AES-256）\n" +
                   "· 接收选项 —— 接收前确认、IP 过滤、按设备分目录、\n" +
-                  "  相同文件跳过、接收限速；\"统计\"查看各设备传输量\n" +
+                  "  相同文件跳过、接收限速、校验缓存有效期、配对码位数；\n" +
+                  "  \"统计\"查看各设备传输量\n" +
+                  "· 校验 —— 重算已收文件与接收时的校验值比对，\n" +
+                  "  检出事后被改动或损坏的文件\n" +
                   "· 暂停/继续 —— 发送中可随时暂停，继续时自动从断点续传\n" +
                   "· 历史 —— 查看全部收发记录，可按方向筛选、导出 CSV\n" +
                   "· 设备 —— 管理自动记忆的设备列表\n" +
-                  "· HTTP 共享 —— 开启时显示二维码，手机扫码即访\n\n" +
+                  "· HTTP 共享 —— 开启时显示二维码，手机扫码即访；\n" +
+                  "  支持断点续传\n" +
+                  "· 命令行 —— sync 增量同步（定时备份）、verify 文件库\n" +
+                  "  校验；运行 TrFileTransfer --help 查看用法\n\n" +
                   "提示：所有设置自动保存；关闭窗口仅最小化到托盘，\n托盘右键菜单可开机自启、检查更新或真正退出。"
                 : "[Receive (server)]\n" +
                   "1. Pick the \"Save to\" folder, check TCP and/or UDT, press \"Start\".\n" +
-                  "2. With \"Pairing\" enabled the sender must enter the same 6-digit code.\n" +
-                  "3. \"HTTP Share\" turns the folder into a web page — browse, download and upload from a phone.\n\n" +
+                  "2. With \"Pairing\" enabled the sender must enter the same code\n" +
+                  "   (4-12 digits, set in Options).\n" +
+                  "3. \"HTTP Share\" turns the folder into a web page — browse, download and\n" +
+                  "   upload from a phone (large downloads can resume).\n\n" +
                   "[Send (client)]\n" +
                   "1. Enter the peer IP and port; use 127.0.0.1 to test on one machine.\n" +
                   "2. Pick a file/folder and press \"Send\", or just drop files onto the window.\n" +
@@ -1154,11 +1187,16 @@ namespace TrFileTransfer
                   "- Encrypt: with pairing codes on both sides the session is\n" +
                   "  automatically encrypted (AES-256)\n" +
                   "- Options: receive confirmation, IP filter, per-device folders,\n" +
-                  "  duplicate skipping, receive rate limit; \"Stats\" shows per-device volume\n" +
+                  "  duplicate skipping, receive rate limit, digest cache TTL, pairing\n" +
+                  "  code length; \"Stats\" shows per-device volume\n" +
+                  "- Verify: re-hash received files against the digests recorded on arrival,\n" +
+                  "  catching anything edited or corrupted afterwards\n" +
                   "- Pause/Resume: pause a send any time; Resume continues from the checkpoint\n" +
                   "- History: browse every transfer, filter by direction, export to CSV\n" +
                   "- Devices: manage the remembered device list\n" +
-                  "- HTTP share shows a QR code when started — scan to open\n\n" +
+                  "- HTTP share shows a QR code when started — scan to open\n" +
+                  "- Command line: \"sync\" for scheduled incremental backups, \"verify\"\n" +
+                  "  for a library check — see TrFileTransfer --help\n\n" +
                   "Tips: settings save automatically; closing the window hides to tray —\nuse the tray menu for auto-start, updates or a real exit.";
         }
 

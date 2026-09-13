@@ -1490,6 +1490,20 @@ namespace TrFileTransfer
                     ChunkTracker removed;
                     ctx.ChunkTrackers.TryRemove(trackerKey, out removed);
                     ctx.Cb.RaiseLog(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
+                    // The chunk protocol carries only per-chunk hashes, so the assembled
+                    // file's digest is not known from the wire — hash it now and remember
+                    // it, so dedup / scrub / 0x04 per-file skip recognise this file later
+                    // without reading it back.
+                    byte[] whole = null;
+                    try
+                    {
+                        whole = await Task.Run(() => ClientWire.ComputeFileHash(tracker.SavePath, ct), ct).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (IOException) { }
+                    catch (UnauthorizedAccessException) { }
+                    if (whole != null)
+                        ctx.FileHashes.Store(tracker.SavePath, whole);
                     ctx.Cb.RaiseComplete();
                     ctx.Cb.RaiseFileReceived(tracker.SavePath, totalSize);
                 }
@@ -3403,6 +3417,28 @@ namespace TrFileTransfer
             Entry removed;
             _current.TryRemove(path, out removed);
             _previous.TryRemove(path, out removed);
+        }
+
+        /// <summary>Forgets every digest whose path starts with the given prefix (Ordinal-
+        /// IgnoreCase). Used when a sync session directory is reset — the remembered digests
+        /// described files that were just deleted, and a stale "identical" answer would make
+        /// the next sync skip files the receiver no longer holds.</summary>
+        public void RemoveByPrefix(string prefix)
+        {
+            RemoveByPrefix(_current, prefix);
+            RemoveByPrefix(_previous, prefix);
+        }
+
+        private static void RemoveByPrefix(ConcurrentDictionary<string, Entry> map, string prefix)
+        {
+            foreach (var kv in map)
+            {
+                if (kv.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    Entry removed;
+                    map.TryRemove(kv.Key, out removed);
+                }
+            }
         }
 
         private void Insert(string path, long size, long mtime, byte[] hash)
