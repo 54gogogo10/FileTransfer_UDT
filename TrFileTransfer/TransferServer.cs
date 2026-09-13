@@ -153,6 +153,8 @@ namespace TrFileTransfer
             // here on — the options dialog promises these take effect on the next server start.
             FileHashCache.ForServer.ApplyConfig();
             IPAddress bindIp;
+            bool unspecified = string.IsNullOrEmpty(_bindAddress)
+                || _bindAddress == "0.0.0.0" || _bindAddress == "::";
             if (!IPAddress.TryParse(_bindAddress, out bindIp))
                 bindIp = IPAddress.Any;
 
@@ -163,9 +165,22 @@ namespace TrFileTransfer
 
             try
             {
-                _listener = new TcpListener(bindIp, _port);
-                _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-                _listener.Start();
+                if (unspecified)
+                {
+                    // Dual-mode listener: one socket accepts IPv4 AND IPv6 (v4 arrives as
+                    // IPv4-mapped addresses). Falls back to IPv4-any where dual-mode is
+                    // unavailable (XP-era) — same reachability as before.
+                    _listener = TcpListener.Create(_port);
+                    _listener.Server.DualMode = true;
+                    _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                    _listener.Start();
+                }
+                else
+                {
+                    _listener = new TcpListener(bindIp, _port);
+                    _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                    _listener.Start();
+                }
             }
             catch (Exception ex)
             {

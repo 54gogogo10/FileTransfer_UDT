@@ -94,6 +94,15 @@ namespace TrFileTransfer
 
         public async Task SendAsync()
         {
+            await SendAsync(null).ConfigureAwait(false);
+        }
+
+        /// <summary>Sends the file in parallel chunks. When chunkSession is provided, every
+        /// chunk header carries it (against a 0x0A-capable peer), so a paused group can be
+        /// resumed into exactly the gaps the server is missing (see <see cref="ResumeAsync"/>).
+        /// Against an older peer the id is simply not sent — chunks flow as before.</summary>
+        public async Task SendAsync(Guid? chunkSession)
+        {
             var fileInfo = new FileInfo(_filePath);
             long totalSize = fileInfo.Length;
             string fileName = fileInfo.Name;
@@ -122,7 +131,7 @@ namespace TrFileTransfer
                 long size = Math.Min(chunkSize, totalSize - offset);
                 if (size <= 0) break;
                 int localPort = FindLocalPort(i);
-                var task = SendChunkAsync(offset, size, totalSize, localPort);
+                var task = SendChunkAsync(offset, size, totalSize, localPort, chunkSession);
                 tasks.Add(task);
             }
 
@@ -139,6 +148,110 @@ namespace TrFileTransfer
                 var errHandler = OnError;
                 if (errHandler != null) errHandler("Concurrent transfer failed: " + ex.Message);
             }
+        }
+
+        /// <summary>Continues a paused chunk group: asks the server (0x0B) which ranges it
+        /// already holds and sends only the complement. A peer without chunk-group support
+        /// (null coverage) falls back to re-sending everything — identical to the historic
+        /// behaviour of a restarted concurrent send.</summary>
+        public async Task ResumeAsync(Guid chunkSession)
+        {
+            long totalSize = new FileInfo(_filePath).Length;
+            _totalBytes = totalSize;
+
+            long[][] covered = null;
+            try
+            {
+                covered = await QueryCoverage(chunkSession).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Log("Coverage query failed (" + ex.Message + ") — re-sending everything");
+            }
+
+            // Build the gaps: complement of the covered ranges within [0, totalSize)
+            var holes = new List<long[]>();
+            long cursor = 0;
+            if (covered != null)
+            {
+                foreach (var r in covered)
+                {
+                    if (r[0] > cursor) holes.Add(new long[] { cursor, Math.Min(r[0], totalSize) });
+                    if (r[1] > cursor) cursor = r[1];
+                    if (cursor >= totalSize) break;
+                }
+            }
+            if (cursor < totalSize) holes.Add(new long[] { cursor, totalSize });
+
+            // Split big holes so the send stays parallel
+            long maxPiece = Math.Max(ChunkMinSize, totalSize / _concurrency);
+            var pieces = new List<long[]>();
+            foreach (var hole in holes)
+            {
+                long start = hole[0];
+                while (start < hole[1])
+                {
+                    long size = Math.Min(maxPiece, hole[1] - start);
+                    pieces.Add(new long[] { start, size });
+                    start += size;
+                }
+            }
+
+            Log(string.Format("Chunk resume: {0} gap(s), {1} piece(s) to send",
+                holes.Count, pieces.Count));
+
+            var semaphore = new SemaphoreSlim(_concurrency);
+            var tasks = new List<Task>();
+            int pieceIndex = 0;
+            foreach (var piece in pieces)
+            {
+                if (_cancelled) break;
+                var p = piece;
+                // With no user source port, let the OS hand out distinct ephemeral ports:
+                // concurrent FindFreePort probes can converge on one port and the losing
+                // piece dies on a bind conflict (TOCTOU between probe and bind).
+                int localPort = _srcPort > 0 ? FindLocalPort(pieceIndex++) : 0;
+                tasks.Add(Task.Run(async delegate
+                {
+                    await semaphore.WaitAsync().ConfigureAwait(false);
+                    try
+                    {
+                        if (_cancelled) return;
+                        await SendChunkAsync(p[0], p[1], totalSize, localPort, chunkSession).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        semaphore.Release();
+                    }
+                }));
+            }
+
+            try
+            {
+                await Task.WhenAll(tasks);
+                if (_cancelled) return;
+                var completeHandler = OnTransferComplete;
+                if (completeHandler != null) completeHandler();
+            }
+            catch (Exception ex)
+            {
+                if (_cancelled) return;
+                var errHandler = OnError;
+                if (errHandler != null) errHandler("Concurrent resume failed: " + ex.Message);
+            }
+        }
+
+        private async Task<long[][]> QueryCoverage(Guid chunkSession)
+        {
+            if (_isUdt)
+            {
+                var client = new TransferUdtClient(_serverIp, _port, _filePath, 0, 4194304, 0);
+                client.PairingCode = PairingCode;
+                return await client.QueryChunkCoverageAsync(chunkSession).ConfigureAwait(false);
+            }
+            var tcp = new TransferClient(_serverIp, _port, _filePath, 0, 4194304, 0);
+            tcp.PairingCode = PairingCode;
+            return await tcp.QueryChunkCoverageAsync(chunkSession).ConfigureAwait(false);
         }
 
         public async Task SendFolderAsync()
@@ -223,7 +336,7 @@ namespace TrFileTransfer
         }
 
         private async Task SendChunkAsync(long offset, long size, long totalSize,
-            int localPort)
+            int localPort, Guid? chunkSession)
         {
             try
             {
@@ -236,6 +349,7 @@ namespace TrFileTransfer
                         {
                             var client = new TransferUdtClient(_serverIp, _port, _filePath, localPort, 4194304, perConn);
                             client.PairingCode = PairingCode;
+                            client.ChunkSessionId = chunkSession;
                             RegisterCancel(client.Cancel);
                             try { await client.SendChunkedAsync(offset, size, totalSize); }
                             finally { UnregisterCancel(client.Cancel); }
@@ -244,6 +358,7 @@ namespace TrFileTransfer
                         {
                             var client = new TransferClient(_serverIp, _port, _filePath, localPort, 4194304, perConn);
                             client.PairingCode = PairingCode;
+                            client.ChunkSessionId = chunkSession;
                             RegisterCancel(client.Cancel);
                             try { await client.SendChunkedAsync(offset, size, totalSize); }
                             finally { UnregisterCancel(client.Cancel); }

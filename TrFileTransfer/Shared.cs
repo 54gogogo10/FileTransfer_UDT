@@ -117,6 +117,24 @@ namespace TrFileTransfer
             return _ranges.Count == 1 && _ranges[0][0] <= 0 && _ranges[0][1] >= TotalSize;
         }
 
+        /// <summary>Snapshot of the received ranges (merged, sorted). Read under the lock —
+        /// this is what the 0x0B coverage query answers with, so a paused concurrent send
+        /// can resume into exactly the gaps that remain.</summary>
+        public long[][] GetRanges()
+        {
+            lock (Lock)
+            {
+                var copy = new long[_ranges.Count][];
+                for (int i = 0; i < _ranges.Count; i++)
+                    copy[i] = new long[] { _ranges[i][0], _ranges[i][1] };
+                return copy;
+            }
+        }
+
+        /// <summary>Peer that owns this session (session-keyed trackers refuse chunks from
+        /// anyone else — same protection the 0x03 resume sessions have).</summary>
+        public string Peer;
+
         /// <summary>Merges [start,end) into the sorted, non-overlapping range list —
         /// keeps the list tiny (a handful of entries for an out-of-order transfer).</summary>
         private void AddRange(long start, long end)

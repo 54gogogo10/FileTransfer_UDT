@@ -100,6 +100,9 @@ namespace TrFileTransfer
             public int SpeedLimit;
             public bool Sync;
             public Guid Session;
+            /// <summary>Chunk-group pause (concurrent single-file): resume sends only the
+            /// server's missing ranges via the 0x0B coverage query.</summary>
+            public bool Chunked;
         }
         private PauseState _pauseState;
         private bool _paused;                     // paused right now (resume button armed)
@@ -276,6 +279,13 @@ namespace TrFileTransfer
             SetFieldError(box, !ok, ok ? null : L.FieldIpInvalid);
         }
 
+        /// <summary>Accepts IPv4 and IPv6 literals (a host name is not an IP —
+        /// the transfers connect to addresses, not DNS names).</summary>
+        private static bool IsValidIp(string t)
+        {
+            IPAddress ip;
+            return IPAddress.TryParse(t, out ip);
+        }
         private static bool IsValidIpv4(string t)
         {
             return IPAddress.TryParse(t, out IPAddress ip) && ip.AddressFamily == AddressFamily.InterNetwork;
@@ -285,7 +295,7 @@ namespace TrFileTransfer
         {
             string t = box.Text.Trim();
             if (t.Length == 0) return;
-            SetFieldError(box, !IsValidIpv4(t), L.FieldIpInvalid);
+            SetFieldError(box, !IsValidIp(t), L.FieldIpInvalid);
         }
 
         private static void ValidateDigitsOnly(TextBox box)
@@ -308,7 +318,7 @@ namespace TrFileTransfer
         {
             string t = _txtServerIp.Text.Trim();
             if (t.Length == 0) return true;
-            bool ok = IsValidIpv4(t);
+            bool ok = IsValidIp(t);
             SetFieldError(_txtServerIp, !ok, ok ? null : L.FieldIpInvalid);
             return ok;
         }
@@ -610,6 +620,7 @@ namespace TrFileTransfer
             int previousSelection = _cmbBind.SelectedIndex;
 
             _cmbBind.Items.Clear();
+            // "All" is dual-mode since 2.13: one listener accepts IPv4 AND IPv6
             _cmbBind.Items.Add(allText);
 
             try
@@ -621,7 +632,12 @@ namespace TrFileTransfer
 
                     foreach (var addr in ni.GetIPProperties().UnicastAddresses)
                     {
-                        if (addr.Address.AddressFamily == AddressFamily.InterNetwork)
+                        // Skip autoconf/link-local v6 noise (fe80::/64); global and
+                        // site-local v6 addresses are listed.
+                        bool v4 = addr.Address.AddressFamily == AddressFamily.InterNetwork;
+                        bool v6 = addr.Address.AddressFamily == AddressFamily.InterNetworkV6
+                            && !addr.Address.IsIPv6LinkLocal && !addr.Address.IsIPv6SiteLocal;
+                        if (v4 || v6)
                         {
                             string ip = addr.Address.ToString();
                             if (!_cmbBind.Items.Contains(ip))
@@ -998,7 +1014,7 @@ namespace TrFileTransfer
                 return null;
             if (string.IsNullOrWhiteSpace(_txtServerIp.Text.Trim()))
                 return null;
-            if (!IsValidIpv4(_txtServerIp.Text.Trim()))
+            if (!IsValidIp(_txtServerIp.Text.Trim()))
                 return null;
             return new QueuedTask
             {
@@ -1707,7 +1723,8 @@ namespace TrFileTransfer
         /// (plus the 0x03/0x04 session id) so the resume click continues the checkpoint.
         /// </summary>
         private async Task<bool> StartTransfer(string path, bool isFolder, string ip, int port,
-            bool isTcp, int srcPort, int concurrency, bool verifyHash, int speedLimit, Guid? resumeSession)
+            bool isTcp, int srcPort, int concurrency, bool verifyHash, int speedLimit, Guid? resumeSession,
+            Guid? chunkSession = null)
         {
             try
             {
@@ -1737,8 +1754,11 @@ namespace TrFileTransfer
                 bool syncMode = isFolder && _chkSync.IsChecked == true;
                 Guid pauseSession = resumeSession.HasValue ? resumeSession.Value
                     : (syncMode ? FolderResumeState.DeriveSyncSession(path, ip, port, !isTcp)
-                                : Guid.NewGuid());
-                bool pausable = concurrency == 1; // chunked sends have no session to resume
+                                : (chunkSession ?? Guid.NewGuid()));
+                // Chunked single-file sends are pausable too: the chunk-group session lets
+                // "resume" send only the ranges the server is missing (0x0B query).
+                bool chunkedPause = !isFolder && concurrency > 1;
+                bool pausable = concurrency == 1 || chunkedPause;
                 if (pausable)
                 {
                     _pauseState = new PauseState
@@ -1753,7 +1773,8 @@ namespace TrFileTransfer
                         VerifyHash = verifyHash,
                         SpeedLimit = speedLimit,
                         Sync = syncMode,
-                        Session = pauseSession
+                        Session = pauseSession,
+                        Chunked = chunkedPause
                     };
                     _btnPause.IsEnabled = true;
                 }
@@ -1767,8 +1788,20 @@ namespace TrFileTransfer
                     concurrent.PairingCode = _txtPairing.Text.Trim();
                     WireConcurrentEvents(concurrent);
                     _concurrent = concurrent; // so BtnCancel_Click can stop it
-                    try { await concurrent.SendAsync(); }
+                    bool groupCancelled = false;
+                    try
+                    {
+                        await concurrent.SendAsync(chunkedPause ? (Guid?)pauseSession : null);
+                        groupCancelled = concurrent.WasCancelled;
+                    }
                     finally { _concurrent = null; }
+                    // A deliberate pause cancels every chunk connection — report it as
+                    // paused, with the group snapshot armed for the resume click
+                    if (_pauseRequested && groupCancelled)
+                    {
+                        FinalizePause();
+                        return false;
+                    }
                 }
                 else if (isTcp)
                 {
@@ -1910,6 +1943,15 @@ namespace TrFileTransfer
                 _btnPause.Content = L.PauseBtn;
                 _lblStatusC.Text = L.Ready;
 
+                if (st.Chunked)
+                {
+                    // Chunk-group resume: the 0x0B coverage query sends only the gaps
+                    AddLog(L.C_TransferResumed);
+                    var _ = StartTransfer(st.Path, st.IsFolder, st.Ip, st.Port, st.IsTcp, st.SrcPort,
+                        st.Concurrency, st.VerifyHash, st.SpeedLimit, null, st.Session);
+                    return;
+                }
+
                 // Sync folders re-derive their stable session on the way through;
                 // empty files cannot travel via 0x03, so resend them plainly
                 Guid? session = st.Sync ? (Guid?)null : st.Session;
@@ -1919,19 +1961,22 @@ namespace TrFileTransfer
                     catch { session = null; }
                 }
                 AddLog(L.C_TransferResumed);
-                var _ = StartTransfer(st.Path, st.IsFolder, st.Ip, st.Port, st.IsTcp, st.SrcPort,
+                var ignored = StartTransfer(st.Path, st.IsFolder, st.Ip, st.Port, st.IsTcp, st.SrcPort,
                     st.Concurrency, st.VerifyHash, st.SpeedLimit, session);
                 return;
             }
 
-            if (_pauseState == null || _pauseState.Concurrency > 1) return;
-            if (_client == null && _clientUdt == null) return;
+            if (_pauseState == null) return;
+            // Folder-concurrent sends still have no pause support (whole files, no coverage)
+            if (_pauseState.Concurrency > 1 && !_pauseState.Chunked) return;
+            if (_client == null && _clientUdt == null && _concurrent == null) return;
 
             _pauseRequested = true;
             _btnPause.IsEnabled = false;
             _lblStatusC.Text = L.PausingStatus;
             if (_client != null) _client.Cancel();
             if (_clientUdt != null) _clientUdt.Cancel();
+            if (_concurrent != null) _concurrent.Cancel();
         }
 
         private void WireClientEvents(TransferClient c)
@@ -2044,7 +2089,8 @@ namespace TrFileTransfer
             c.OnProgress += p => RunOnUi(() => UpdateCardProgress(card, p));
             c.OnError += msg => RunOnUi(() =>
             {
-                AddLog(L.ErrorPrefix + msg);
+                // A deliberate pause cancels the group on purpose — not an error
+                AddLog(_pauseRequested ? L.C_Paused : (L.ErrorPrefix + msg));
                 ResetClientUI();
                 UpdateCardComplete(card);
             });

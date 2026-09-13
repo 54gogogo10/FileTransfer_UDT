@@ -59,6 +59,10 @@ namespace TrFileTransfer
         /// to uncompressed against older peers). Default from Config "Compress".</summary>
         public bool CompressionEnabled { get; set; }
 
+        /// <summary>Chunk-group session for concurrent sends (0x02 headers + 0x0B query).
+        /// Null = the historic session-less chunk format.</summary>
+        public Guid? ChunkSessionId { get; set; }
+
         /// <summary>
         /// Creates a TCP client for sending files or folders.
         /// </summary>
@@ -202,13 +206,26 @@ namespace TrFileTransfer
             if (cts != null) cts.Cancel();
         }
 
+        /// <summary>Address family of the target — IPv6 targets need a v6 socket (a v4
+        /// TcpClient cannot connect to a v6 literal).</summary>
+        private AddressFamily TargetFamily()
+        {
+            IPAddress ip;
+            return IPAddress.TryParse(_serverIp, out ip) && ip.AddressFamily == AddressFamily.InterNetworkV6
+                ? AddressFamily.InterNetworkV6
+                : AddressFamily.InterNetwork;
+        }
+
         /// <summary>Creates the client socket; a busy source port raises PortBindException (no bytes sent yet).</summary>
         private TcpClient CreateClient()
         {
-            if (_localPort <= 0) return new TcpClient();
+            bool v6 = TargetFamily() == AddressFamily.InterNetworkV6;
+            if (_localPort <= 0)
+                return new TcpClient(v6 ? AddressFamily.InterNetworkV6 : AddressFamily.InterNetwork);
             try
             {
-                return new TcpClient(new IPEndPoint(IPAddress.Any, _localPort));
+                var localEnd = new IPEndPoint(v6 ? IPAddress.IPv6Any : IPAddress.Any, _localPort);
+                return new TcpClient(localEnd);
             }
             catch (SocketException ex)
             {
@@ -272,18 +289,18 @@ namespace TrFileTransfer
         /// </summary>
         private async Task<IWireStream> OpenAndAuthenticateAsync(CancellationToken ct)
         {
-            return (await OpenAndAuthenticateResultAsync(ct, false).ConfigureAwait(false)).Stream;
+            return (await OpenAndAuthenticateResultAsync(ct, 0).ConfigureAwait(false)).Stream;
         }
 
         /// <summary>Same, returning the full negotiation result. wantPerFileSkip offers the
         /// 0x0A capability frame so a 0x04 body can skip files the receiver already holds;
         /// a peer that drops it costs one reconnect without the offer (budget 3 attempts —
         /// encryption, compression and skip can each be discovered independently).</summary>
-        private async Task<AuthResult> OpenAndAuthenticateResultAsync(CancellationToken ct, bool wantPerFileSkip)
+        private async Task<AuthResult> OpenAndAuthenticateResultAsync(CancellationToken ct, byte capabilities)
         {
             bool allowEncrypt = EncryptionEnabled;
             bool allowCompress = CompressionEnabled;
-            int maxAttempts = wantPerFileSkip ? 3 : 2;
+            int maxAttempts = capabilities != 0 ? 3 : 2;
             for (int attempt = 0; ; attempt++)
             {
                 TcpWireStream raw = await ConnectAsync(ct).ConfigureAwait(false);
@@ -291,7 +308,7 @@ namespace TrFileTransfer
                 try
                 {
                     auth = await ClientWire.AuthenticateAsync(raw, PairingCode, allowEncrypt, allowCompress, _cb, ct,
-                        EncryptionDowngradeAllowed, wantPerFileSkip).ConfigureAwait(false);
+                        EncryptionDowngradeAllowed, capabilities).ConfigureAwait(false);
                 }
                 catch
                 {
@@ -314,10 +331,10 @@ namespace TrFileTransfer
                     _cb.RaiseLog(L.C_EncryptFallback);
                     continue;
                 }
-                if (auth.NeedNoPerFileSkipFallback && wantPerFileSkip && attempt < maxAttempts)
+                if (auth.NeedNoPerFileSkipFallback && capabilities != 0 && attempt < maxAttempts)
                 {
                     raw.Dispose();
-                    wantPerFileSkip = false;
+                    capabilities = 0;
                     continue;
                 }
                 // A successful prelude (encryption or compression accepted) proves the
@@ -347,10 +364,58 @@ namespace TrFileTransfer
 
         private async Task SendChunkedInternal(long offset, long chunkSize, long totalSize, CancellationToken ct)
         {
-            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
+            // A chunk-group session lets every chunk of one concurrent send land in the same
+            // server-side tracker — and a paused group resume into the gaps via 0x0B.
+            var auth = await OpenAndAuthenticateResultAsync(ct, ChunkSessionId.HasValue ? (byte)0x02 : (byte)0)
+                .ConfigureAwait(false);
+            using (var ws = auth.Stream)
             {
                 await ClientWire.SendChunkAsync(ws, _filePath, offset, chunkSize, totalSize,
-                    _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
+                    _bufferSize, _limiter, _cb, ct, ChunkSessionId, auth.ChunkSessions).ConfigureAwait(false);
+            }
+        }
+
+        /// <summary>
+        /// Queries which [start,end) ranges of a chunk group the server already holds
+        /// (0x0B). Returns null when the peer did not negotiate chunk-group support —
+        /// the caller then falls back to re-sending everything, exactly as before.
+        /// Opens its own short-lived connection.
+        /// </summary>
+        public async Task<long[][]> QueryChunkCoverageAsync(Guid chunkSession)
+        {
+            _cts = new CancellationTokenSource();
+            _isRunning = true;
+            _wasCancelled = false;
+            var startedHandler = OnStarted;
+            if (startedHandler != null) startedHandler();
+            try
+            {
+                var auth = await OpenAndAuthenticateResultAsync(_cts.Token, 0x02).ConfigureAwait(false);
+                if (!auth.ChunkSessions)
+                    return null;
+                using (var ws = auth.Stream)
+                {
+                    return await ClientWire.QueryChunkCoverage(ws, chunkSession, _cts.Token).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                _wasCancelled = true;
+                Log(L.C_TransferCancelled);
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Log(L.C_Error(ex.Message));
+                var handler = OnError;
+                if (handler != null) handler(ex.Message);
+                throw;
+            }
+            finally
+            {
+                _isRunning = false;
+                var stoppedHandler = OnStopped;
+                if (stoppedHandler != null) stoppedHandler();
             }
         }
 
@@ -362,7 +427,7 @@ namespace TrFileTransfer
             var manifest = await Task.Run(
                 delegate { return ClientWire.BuildFolderManifest(_filePath, _cb, ct); }, ct).ConfigureAwait(false);
             if (manifest == null) return;
-            var auth = await OpenAndAuthenticateResultAsync(ct, wantPerFileSkip: true).ConfigureAwait(false);
+            var auth = await OpenAndAuthenticateResultAsync(ct, 0x01).ConfigureAwait(false);
             using (var ws = auth.Stream)
             {
                 await ClientWire.SendFolderResumableAsync(ws, manifest, sessionId,

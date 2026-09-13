@@ -20,9 +20,11 @@ namespace TrFileTransfer
     internal static class UdtNative
     {
         public const int AF_INET = 2;
+        public const int AF_INET6 = 23; // Windows value (Linux uses 10; this build targets Windows)
         public const int SOCK_STREAM = 1;
         public const int ERROR = -1;
         public static readonly int SockAddrSize = Marshal.SizeOf(typeof(sockaddr_in));
+        public static readonly int SockAddr6Size = Marshal.SizeOf(typeof(sockaddr_in6));
 
         // getsockopt/setsockopt option names (must match udt.h UDTOpt enum)
         public const int UDT_MSS = 0;
@@ -83,13 +85,24 @@ namespace TrFileTransfer
         public static extern int udt_bind(int u, ref sockaddr_in name, int namelen);
 
         [DllImport("udt.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern int udt_bind(int u, ref sockaddr_in6 name, int namelen);
+
+        [DllImport("udt.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern int udt_listen(int u, int backlog);
 
         [DllImport("udt.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern int udt_accept(int u, ref sockaddr_in addr, ref int addrlen);
 
+        /// <summary>Family-agnostic accept: the caller passes a sockaddr_in6-sized buffer
+        /// (28 bytes) and reads the family the peer actually used (see ParsePeer).</summary>
+        [DllImport("udt.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern int udt_accept(int u, byte[] addr, ref int addrlen);
+
         [DllImport("udt.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern int udt_connect(int u, ref sockaddr_in name, int namelen);
+
+        [DllImport("udt.dll", CallingConvention = CallingConvention.Cdecl)]
+        public static extern int udt_connect(int u, ref sockaddr_in6 name, int namelen);
 
         [DllImport("udt.dll", CallingConvention = CallingConvention.Cdecl)]
         public static extern int udt_close(int u);
@@ -136,6 +149,42 @@ namespace TrFileTransfer
             addr.sin_addr = (uint)(ipBytes[3] << 24 | ipBytes[2] << 16 | ipBytes[1] << 8 | ipBytes[0]);
             return addr;
         }
+
+        public static sockaddr_in6 BuildSockaddr6(string ip, int port)
+        {
+            var addr = new sockaddr_in6();
+            addr.sin6_family = AF_INET6;
+            addr.sin6_port = (ushort)IPAddress.HostToNetworkOrder((short)port);
+            // sin6_addr is 16 network-order bytes; strip any zone index first
+            // (a scope id would go into sin6_scope_id, but link-local peers are
+            // out of scope for this LAN tool).
+            string literal = ip;
+            int percent = literal.IndexOf('%');
+            if (percent >= 0) literal = literal.Substring(0, percent);
+            byte[] ipBytes = IPAddress.Parse(literal).GetAddressBytes();
+            addr.addr0 = BitConverter.ToUInt64(ipBytes, 0);
+            addr.addr1 = BitConverter.ToUInt64(ipBytes, 8);
+            return addr;
+        }
+
+        /// <summary>Parses an accepted peer address out of a raw sockaddr buffer (either
+        /// family) — the accept buffer is always sockaddr_in6-sized, and the family field
+        /// in network byte order's first two bytes says which layout follows.</summary>
+        public static IPEndPoint ParsePeer(byte[] raw)
+        {
+            short family = BitConverter.ToInt16(raw, 0);
+            int port = (int)(ushort)IPAddress.NetworkToHostOrder((short)BitConverter.ToUInt16(raw, 2));
+            if (family == AF_INET6)
+            {
+                var bytes = new byte[16];
+                Buffer.BlockCopy(raw, 8, bytes, 0, 16);
+                return new IPEndPoint(new IPAddress(bytes), port);
+            }
+            // IPv4: 4 bytes at offset 4 in network order
+            var v4 = new byte[4];
+            Buffer.BlockCopy(raw, 4, v4, 0, 4);
+            return new IPEndPoint(new IPAddress(v4), port);
+        }
     }
 
     [StructLayout(LayoutKind.Sequential, Size = 16)]
@@ -144,6 +193,17 @@ namespace TrFileTransfer
         public short sin_family;
         public ushort sin_port;
         public uint sin_addr;
+    }
+
+    [StructLayout(LayoutKind.Sequential, Size = 28)]
+    internal struct sockaddr_in6
+    {
+        public short sin6_family;
+        public ushort sin6_port;
+        public uint sin6_flowinfo;
+        public ulong addr0;   // sin6_addr bytes 0-7
+        public ulong addr1;   // sin6_addr bytes 8-15
+        public uint sin6_scope_id;
     }
 
     #endregion
@@ -374,7 +434,14 @@ namespace TrFileTransfer
             }
             _startupOk = true;
 
-            _socket = UdtNative.udt_socket(UdtNative.AF_INET, UdtNative.SOCK_STREAM, 0);
+            // A specific IPv6 bind address (or "::") selects the v6 socket family;
+            // the historic "0.0.0.0" default stays on v4.
+            IPAddress bindIp;
+            bool isV6 = IPAddress.TryParse(_bindAddress, out bindIp)
+                && bindIp.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6;
+
+            _socket = UdtNative.udt_socket(isV6 ? UdtNative.AF_INET6 : UdtNative.AF_INET,
+                UdtNative.SOCK_STREAM, 0);
             if (_socket < 0)
             {
                 string err = "udt_socket failed";
@@ -387,19 +454,39 @@ namespace TrFileTransfer
                 return;
             }
 
-            var addr = UdtNative.BuildSockaddr(_bindAddress, _port);
-            if (UdtNative.udt_bind(_socket, ref addr, UdtNative.SockAddrSize) == UdtNative.ERROR)
+            if (isV6)
             {
-                string err = UdtNative.GetErrorDesc();
-                Log(L.S_BindFailed(_bindAddress, _port.ToString(), err));
-                UdtNative.udt_close(_socket);
-                _socket = -1;
-                Uninit();
-                var errHandler = OnError;
-                if (errHandler != null) errHandler(err);
-                var stoppedHandler = OnStopped;
-                if (stoppedHandler != null) stoppedHandler();
-                return;
+                var addr6 = UdtNative.BuildSockaddr6(_bindAddress == "::" ? "::" : _bindAddress, _port);
+                if (UdtNative.udt_bind(_socket, ref addr6, UdtNative.SockAddr6Size) == UdtNative.ERROR)
+                {
+                    string err = UdtNative.GetErrorDesc();
+                    Log(L.S_BindFailed(_bindAddress, _port.ToString(), err));
+                    UdtNative.udt_close(_socket);
+                    _socket = -1;
+                    Uninit();
+                    var errHandler = OnError;
+                    if (errHandler != null) errHandler(err);
+                    var stoppedHandler = OnStopped;
+                    if (stoppedHandler != null) stoppedHandler();
+                    return;
+                }
+            }
+            else
+            {
+                var addr = UdtNative.BuildSockaddr(_bindAddress, _port);
+                if (UdtNative.udt_bind(_socket, ref addr, UdtNative.SockAddrSize) == UdtNative.ERROR)
+                {
+                    string err = UdtNative.GetErrorDesc();
+                    Log(L.S_BindFailed(_bindAddress, _port.ToString(), err));
+                    UdtNative.udt_close(_socket);
+                    _socket = -1;
+                    Uninit();
+                    var errHandler = OnError;
+                    if (errHandler != null) errHandler(err);
+                    var stoppedHandler = OnStopped;
+                    if (stoppedHandler != null) stoppedHandler();
+                    return;
+                }
             }
 
             if (UdtNative.udt_listen(_socket, 32) == UdtNative.ERROR)
@@ -469,10 +556,12 @@ namespace TrFileTransfer
                 int clientSocket = -1;
                 try
                 {
-                    var addr = new sockaddr_in();
-                    int addrLen = UdtNative.SockAddrSize;
+                    // Family-agnostic buffer: v4 peers fill the first 16 bytes (AF_INET),
+                    // v6 peers all 28 (AF_INET6) — see UdtNative.ParsePeer.
+                    var raw = new byte[UdtNative.SockAddr6Size];
+                    int addrLen = raw.Length;
                     clientSocket = await Task.Run(() =>
-                        UdtNative.udt_accept(_socket, ref addr, ref addrLen), ct);
+                        UdtNative.udt_accept(_socket, raw, ref addrLen), ct);
                     if (clientSocket < 0) break;
 
                     UdtNative.SetTimeout(clientSocket, 30000, 30000);
@@ -482,14 +571,7 @@ namespace TrFileTransfer
                     // defaults (8192 packets ≈ 12 MB per direction) already exceed the
                     // 8 MB they were trying to set.
                     lock (_clientSockets) { _clientSockets.Add(clientSocket); }
-                    // sin_port needs a 16-bit NetworkToHostOrder byteswap. sin_addr must
-                    // NOT be swapped: the struct's uint already little-endian-reads the
-                    // network-order bytes into exactly the layout IPAddress(long) expects
-                    // on Windows (cf. IPAddress.Loopback == 0x0100007F) — swapping it
-                    // renders the address reversed (e.g. 1.0.0.127).
-                    var clientEp = new IPEndPoint(
-                        new IPAddress((long)addr.sin_addr),
-                        (int)(ushort)IPAddress.NetworkToHostOrder((short)addr.sin_port));
+                    var clientEp = UdtNative.ParsePeer(raw);
                     Log(L.S_ClientConnected(clientEp));
                     var _ = HandleClient(clientSocket, ct, clientEp);
                 }
@@ -660,6 +742,10 @@ namespace TrFileTransfer
         /// <summary>Offer the 0x08 deflate transport before the transfer (falls back
         /// to uncompressed against older peers). Default from Config "Compress".</summary>
         public bool CompressionEnabled { get; set; }
+
+        /// <summary>Chunk-group session for concurrent sends (0x02 headers + 0x0B query).
+        /// Null = the historic session-less chunk format.</summary>
+        public Guid? ChunkSessionId { get; set; }
 
         /// <summary>Creates a UDT client for sending files or folders.</summary>
         /// <param name="serverIp">Target server IPv4 address.</param>
@@ -851,22 +937,49 @@ namespace TrFileTransfer
             // Mirror of the TCP-side guard: a cancel that landed while the hash/manifest
             // pass was still finishing must not walk into connect with a dead token.
             ct.ThrowIfCancellationRequested();
-            _socket = UdtNative.udt_socket(UdtNative.AF_INET, UdtNative.SOCK_STREAM, 0);
+
+            // IPv6 targets get a v6 socket (AF_INET6) with a sockaddr_in6
+            IPAddress targetIp;
+            bool v6 = IPAddress.TryParse(_serverIp, out targetIp)
+                && targetIp.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6;
+
+            _socket = UdtNative.udt_socket(v6 ? UdtNative.AF_INET6 : UdtNative.AF_INET,
+                UdtNative.SOCK_STREAM, 0);
             if (_socket < 0)
                 throw new Exception("Failed to create UDT socket");
 
             if (_localPort > 0)
             {
-                var localAddr = UdtNative.BuildSockaddr("0.0.0.0", _localPort);
-                if (UdtNative.udt_bind(_socket, ref localAddr, UdtNative.SockAddrSize) == UdtNative.ERROR)
-                    throw new PortBindException(
-                        "UDT bind to port " + _localPort + " failed: " + UdtNative.GetErrorDesc(), null, _localPort);
+                if (v6)
+                {
+                    var localAddr6 = UdtNative.BuildSockaddr6("::", _localPort);
+                    if (UdtNative.udt_bind(_socket, ref localAddr6, UdtNative.SockAddr6Size) == UdtNative.ERROR)
+                        throw new PortBindException(
+                            "UDT bind to port " + _localPort + " failed: " + UdtNative.GetErrorDesc(), null, _localPort);
+                }
+                else
+                {
+                    var localAddr = UdtNative.BuildSockaddr("0.0.0.0", _localPort);
+                    if (UdtNative.udt_bind(_socket, ref localAddr, UdtNative.SockAddrSize) == UdtNative.ERROR)
+                        throw new PortBindException(
+                            "UDT bind to port " + _localPort + " failed: " + UdtNative.GetErrorDesc(), null, _localPort);
+                }
             }
 
             Log(L.UdtC_Connecting(_serverIp, _port));
-            var addr = UdtNative.BuildSockaddr(_serverIp, _port);
-            int connectResult = await Task.Run(
-                () => UdtNative.udt_connect(_socket, ref addr, UdtNative.SockAddrSize), ct).ConfigureAwait(false);
+            int connectResult;
+            if (v6)
+            {
+                var addr6 = UdtNative.BuildSockaddr6(_serverIp, _port);
+                connectResult = await Task.Run(
+                    () => UdtNative.udt_connect(_socket, ref addr6, UdtNative.SockAddr6Size), ct).ConfigureAwait(false);
+            }
+            else
+            {
+                var addr = UdtNative.BuildSockaddr(_serverIp, _port);
+                connectResult = await Task.Run(
+                    () => UdtNative.udt_connect(_socket, ref addr, UdtNative.SockAddrSize), ct).ConfigureAwait(false);
+            }
             if (connectResult == UdtNative.ERROR)
                 throw new Exception("UDT connect failed: " + UdtNative.GetErrorDesc());
             Log(L.C_Connected(_serverIp, _port));
@@ -886,18 +999,18 @@ namespace TrFileTransfer
         /// </summary>
         private async Task<IWireStream> OpenAndAuthenticateAsync(CancellationToken ct)
         {
-            return (await OpenAndAuthenticateResultAsync(ct, false).ConfigureAwait(false)).Stream;
+            return (await OpenAndAuthenticateResultAsync(ct, 0).ConfigureAwait(false)).Stream;
         }
 
         /// <summary>Same, returning the full negotiation result. wantPerFileSkip offers the
         /// 0x0A capability frame so a 0x04 body can skip files the receiver already holds;
         /// a peer that drops it costs one reconnect without the offer (budget 3 attempts —
         /// encryption, compression and skip can each be discovered independently).</summary>
-        private async Task<AuthResult> OpenAndAuthenticateResultAsync(CancellationToken ct, bool wantPerFileSkip)
+        private async Task<AuthResult> OpenAndAuthenticateResultAsync(CancellationToken ct, byte capabilities)
         {
             bool allowEncrypt = EncryptionEnabled;
             bool allowCompress = CompressionEnabled;
-            int maxAttempts = wantPerFileSkip ? 3 : 2;
+            int maxAttempts = capabilities != 0 ? 3 : 2;
             for (int attempt = 0; ; attempt++)
             {
                 await UdtConnect(ct).ConfigureAwait(false);
@@ -909,7 +1022,7 @@ namespace TrFileTransfer
                     // never answers, and waiting out the full 30s timeout would feel broken
                     UdtNative.SetTimeout(_socket, 8000, 30000);
                     auth = await ClientWire.AuthenticateAsync(raw, PairingCode, allowEncrypt, allowCompress, _cb, ct,
-                        EncryptionDowngradeAllowed, wantPerFileSkip).ConfigureAwait(false);
+                        EncryptionDowngradeAllowed, capabilities).ConfigureAwait(false);
                     UdtNative.SetTimeout(_socket, 30000, 30000);
                 }
                 catch
@@ -937,12 +1050,12 @@ namespace TrFileTransfer
                     _cb.RaiseLog(L.C_EncryptFallback);
                     continue;
                 }
-                if (auth.NeedNoPerFileSkipFallback && wantPerFileSkip && attempt < maxAttempts)
+                if (auth.NeedNoPerFileSkipFallback && capabilities != 0 && attempt < maxAttempts)
                 {
                     raw.Dispose();
                     try { UdtNative.udt_close(_socket); } catch { }
                     _socket = -1;
-                    wantPerFileSkip = false;
+                    capabilities = 0;
                     continue;
                 }
                 return auth;
@@ -967,10 +1080,62 @@ namespace TrFileTransfer
 
         private async Task SendChunkedInternal(long offset, long chunkSize, long totalSize, CancellationToken ct)
         {
-            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
+            // A chunk-group session lets every chunk of one concurrent send land in the same
+            // server-side tracker — and a paused group resume into the gaps via 0x0B.
+            var auth = await OpenAndAuthenticateResultAsync(ct, ChunkSessionId.HasValue ? (byte)0x02 : (byte)0)
+                .ConfigureAwait(false);
+            using (var ws = auth.Stream)
             {
                 await ClientWire.SendChunkAsync(ws, _filePath, offset, chunkSize, totalSize,
-                    _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
+                    _bufferSize, _limiter, _cb, ct, ChunkSessionId, auth.ChunkSessions).ConfigureAwait(false);
+            }
+        }
+
+        /// <summary>
+        /// Queries which [start,end) ranges of a chunk group the server already holds
+        /// (0x0B). Returns null when the peer did not negotiate chunk-group support —
+        /// the caller then falls back to re-sending everything, exactly as before.
+        /// Opens its own short-lived connection.
+        /// </summary>
+        public async Task<long[][]> QueryChunkCoverageAsync(Guid chunkSession)
+        {
+            _cts = new CancellationTokenSource();
+            _isRunning = true;
+            _wasCancelled = false;
+            var startedHandler = OnStarted;
+            if (startedHandler != null) startedHandler();
+            try
+            {
+                UdtDll.EnsureExtracted();
+                if (!UdtNative.UdtStartup())
+                    throw new Exception("UDT library init failed");
+                var auth = await OpenAndAuthenticateResultAsync(_cts.Token, 0x02).ConfigureAwait(false);
+                if (!auth.ChunkSessions)
+                    return null;
+                using (var ws = auth.Stream)
+                {
+                    return await ClientWire.QueryChunkCoverage(ws, chunkSession, _cts.Token).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                _wasCancelled = true;
+                Log(L.C_TransferCancelled);
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Log(L.C_Error(ex.Message));
+                var handler = OnError;
+                if (handler != null) handler(ex.Message);
+                throw;
+            }
+            finally
+            {
+                _isRunning = false;
+                UdtNative.UdtCleanup();
+                var stoppedHandler = OnStopped;
+                if (stoppedHandler != null) stoppedHandler();
             }
         }
 
@@ -982,7 +1147,7 @@ namespace TrFileTransfer
             var manifest = await Task.Run(
                 delegate { return ClientWire.BuildFolderManifest(_filePath, _cb, ct); }, ct).ConfigureAwait(false);
             if (manifest == null) return;
-            var auth = await OpenAndAuthenticateResultAsync(ct, wantPerFileSkip: true).ConfigureAwait(false);
+            var auth = await OpenAndAuthenticateResultAsync(ct, 0x01).ConfigureAwait(false);
             using (var ws = auth.Stream)
             {
                 await ClientWire.SendFolderResumableAsync(ws, manifest, sessionId,

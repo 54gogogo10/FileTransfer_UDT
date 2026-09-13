@@ -73,7 +73,7 @@ namespace TrFileTransfer
         public static string BrowseFolderDesc { get { return IsChinese ? "选择要发送的文件夹" : "Select folder to send"; } }
         public static string SendFolder { get { return IsChinese ? "发送文件夹" : "Send Folder"; } }
         public static string TransferTypeGroup { get { return IsChinese ? "传输类型" : "Transfer Type"; } }
-        public static string BindAll { get { return IsChinese ? "0.0.0.0 (所有接口)" : "0.0.0.0 (All interfaces)"; } }
+        public static string BindAll { get { return IsChinese ? "所有接口 (IPv4 + IPv6)" : "All interfaces (IPv4 + IPv6)"; } }
 
         // ---- Folder transfer log ----
         public static string S_ReceivingFolder(string name, int count, string sizeStr)

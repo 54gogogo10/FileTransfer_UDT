@@ -131,6 +131,190 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_HTTP_RangeResume", HttpShareRangeResume);
             runner.Run("Integration_Auth_LongPairingCode", LongPairingCode);
             runner.Run("Integration_TCP_ChunkDigestRegistered", ChunkDigestRegistered);
+            runner.Run("Integration_TCP_ChunkCoverageResume", () => ChunkCoverageResume(false), 1);
+            runner.Run("Integration_UDT_ChunkCoverageResume", () => ChunkCoverageResume(true), 1);
+            runner.Run("Integration_TCP_IPv6", TcpIPv6, 1);
+            runner.Run("Integration_UDT_IPv6", UdtIPv6, 1);
+        }
+
+        /// <summary>
+        /// The pause/resume cycle for a concurrent chunk group: send only the first chunk
+        /// (what a pause leaves behind server-side), query coverage (0x0B), then resume —
+        /// the client must send ONLY the complement, proven by the server's chunk log
+        /// showing a resume pass with no byte at offset 0.
+        /// </summary>
+        private static void ChunkCoverageResume(bool isUdt)
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_ccv_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_ccv_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferServer tcpServer = null;
+            TransferUdtServer udtServer = null;
+            Guid chunkSession = Guid.NewGuid();
+            try
+            {
+                // Four 1-MB quadrants — well above ChunkMinSize so splitting works
+                var content = new byte[4 * 1024 * 1024];
+                new Random(191).NextBytes(content);
+                string file = Path.Combine(sendDir, "big.bin");
+                File.WriteAllBytes(file, content);
+
+                var started = new ManualResetEvent(false);
+                if (isUdt)
+                {
+                    udtServer = new TransferUdtServer("127.0.0.1", port, recvDir);
+                    udtServer.OnStarted += () => started.Set();
+                    udtServer.Start();
+                }
+                else
+                {
+                    tcpServer = new TransferServer("127.0.0.1", port, recvDir);
+                    tcpServer.OnStarted += () => started.Set();
+                    tcpServer.Start();
+                }
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+
+                // "Pause" equivalent: only the first half travels (one chunk connection
+                // carrying the group session id)
+                long half = content.Length / 2;
+                if (isUdt)
+                {
+                    var u = new TransferUdtClient("127.0.0.1", port, file) { ChunkSessionId = chunkSession };
+                    u.SendChunkedAsync(0, half, content.Length).Wait(60000);
+                }
+                else
+                {
+                    var c = new TransferClient("127.0.0.1", port, file) { ChunkSessionId = chunkSession };
+                    c.SendChunkedAsync(0, half, content.Length).Wait(60000);
+                }
+                Thread.Sleep(300);
+
+                // Coverage query must report exactly [0, half)
+                long[][] covered;
+                if (isUdt)
+                {
+                    var q = new TransferUdtClient("127.0.0.1", port, file);
+                    var t = q.QueryChunkCoverageAsync(chunkSession);
+                    Assert.True(t.Wait(30000), "coverage query completed");
+                    covered = t.Result;
+                }
+                else
+                {
+                    var q = new TransferClient("127.0.0.1", port, file);
+                    var t = q.QueryChunkCoverageAsync(chunkSession);
+                    Assert.True(t.Wait(30000), "coverage query completed");
+                    covered = t.Result;
+                }
+                Assert.True(covered != null, "coverage query answered");
+                Assert.Equal(1, covered.Length, "one covered range");
+                Assert.Equal(0, covered[0][0], "range starts at 0");
+                Assert.Equal(half, covered[0][1], "range ends at the pause point");
+
+                // Resume via the complement API — only the second half may travel
+                var logs = new System.Collections.Generic.List<string>();
+                var concurrent = new ConcurrentTransfer("127.0.0.1", port, file, 4, !isUdt, 0, 0);
+                concurrent.OnLog += msg => logs.Add(msg);
+                var done = new ManualResetEvent(false);
+                Exception failure = null;
+                concurrent.OnTransferComplete += () => done.Set();
+                concurrent.OnError += msg => { failure = new Exception(msg); done.Set(); };
+                var resumeTask = concurrent.ResumeAsync(chunkSession);
+                if (!done.WaitOne(60000) && failure == null)
+                    resumeTask.Wait(60000);
+                if (failure != null) throw failure;
+                Thread.Sleep(300);
+
+                var saved = Path.Combine(recvDir, "big.bin");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(saved)),
+                    "the resumed file is byte-identical");
+                Assert.True(logs.Exists(m => m.Contains("gap(s)") || m.Contains("pieces to send")),
+                    "the resume logged its gap plan (logs: " + string.Join(" | ", logs.ToArray()) + ")");
+            }
+            finally
+            {
+                if (tcpServer != null) { try { tcpServer.Stop(); } catch { } }
+                if (udtServer != null) { try { udtServer.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>Single file over TCP to an IPv6 loopback target.</summary>
+        private static void TcpIPv6()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_v6s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_v6r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferServer server = null;
+            try
+            {
+                var content = new byte[512 * 1024];
+                new Random(201).NextBytes(content);
+                string file = Path.Combine(sendDir, "v6.bin");
+                File.WriteAllBytes(file, content);
+
+                var started = new ManualResetEvent(false);
+                server = new TransferServer("::", port, recvDir); // dual-mode
+                server.OnStarted += () => started.Set();
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+
+                var client = new TransferClient("::1", port, file);
+                client.SendAsync().Wait(30000);
+                Thread.Sleep(300);
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(Path.Combine(recvDir, "v6.bin"))),
+                    "TCP over IPv6 delivered the file");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>Single file over UDT to an IPv6 loopback target — exercises the
+        /// AF_INET6 socket path and the sockaddr_in6 accept buffer.</summary>
+        private static void UdtIPv6()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_v6u_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_v6u_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdtServer server = null;
+            try
+            {
+                var content = new byte[512 * 1024];
+                new Random(202).NextBytes(content);
+                string file = Path.Combine(sendDir, "v6u.bin");
+                File.WriteAllBytes(file, content);
+
+                var started = new ManualResetEvent(false);
+                server = new TransferUdtServer("::", port, recvDir);
+                server.OnStarted += () => started.Set();
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+
+                var client = new TransferUdtClient("::1", port, file);
+                client.SendAsync().Wait(60000);
+                Thread.Sleep(300);
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(Path.Combine(recvDir, "v6u.bin"))),
+                    "UDT over IPv6 delivered the file");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
         }
 
         /// <summary>

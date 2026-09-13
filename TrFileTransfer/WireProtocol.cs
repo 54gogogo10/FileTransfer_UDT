@@ -285,6 +285,16 @@ namespace TrFileTransfer
         /// a 0x04 body may send a confirmation manifest and only the files the server
         /// does not already hold. Connection-scoped (set on the BeginSession clone).</summary>
         public bool PerFileSkip;
+        /// <summary>True when this connection negotiated 0x0A bit 1: 0x02 chunk headers
+        /// carry a 16-byte group session id after the name, and the 0x0B coverage query
+        /// is accepted (what a paused concurrent send needs to resume into the gaps).
+        /// Connection-scoped (set on the BeginSession clone).</summary>
+        public bool ChunkSessions;
+        /// <summary>Chunk group session id → owning peer. Shared process-wide (like the
+        /// trackers themselves): a second connection resuming the same group must belong
+        /// to the same peer, or it would be writing into someone else's file.</summary>
+        public ConcurrentDictionary<string, string> ChunkSessionPeers
+            = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         /// <summary>Pairing failures allowed per peer IP before lockout. 0 disables.</summary>
         public int MaxAuthFailures = 10;
         /// <summary>Statistics for the CURRENT connection (set by BeginSession).</summary>
@@ -402,6 +412,9 @@ namespace TrFileTransfer
             // Pairing-failure counters are process-wide (per peer IP, across connections)
             clone.AuthFailures = ctx.AuthFailures;
             clone.MaxAuthFailures = ctx.MaxAuthFailures;
+            // Chunk group ownership is process-wide: the tracker a paused concurrent send
+            // resumes must be findable by a new connection and refuse foreign peers.
+            clone.ChunkSessionPeers = ctx.ChunkSessionPeers;
             // File digests are process-wide too: the point is that the NEXT connection
             // (a repeat sync) finds what this one already hashed or received.
             clone.FileHashes = ctx.FileHashes;
@@ -557,14 +570,17 @@ namespace TrFileTransfer
                         }
                         var capBuf = new byte[1];
                         await active.ReadExactAsync(capBuf, 0, 1, ct).ConfigureAwait(false);
-                        // We always have the digest cache, so bit 0 (per-file skip for
-                        // 0x04) is the only capability and it is always on. Flags let a
-                        // future build decline individual features without new frames.
+                        // bit0 = 0x04 per-file skip, bit1 = 0x02 chunk group sessions + the
+                        // 0x0B coverage query. Both are supported whenever the digest cache
+                        // exists (always); the client's request byte says what it will use,
+                        // and this connection's flags record that the pair is new enough
+                        // for the extended formats.
                         var respA = new byte[2];
                         respA[0] = 0x1A;
-                        respA[1] = 0x01;
+                        respA[1] = 0x03;
                         await active.WriteExactAsync(respA, 0, respA.Length, ct).ConfigureAwait(false);
                         ctx.PerFileSkip = true;
+                        ctx.ChunkSessions = true;
                     }
                     else
                     {
@@ -589,7 +605,8 @@ namespace TrFileTransfer
                 // header, which is confusing and lets a stray type byte look like a
                 // legitimate transfer.
                 if (transferType != 0x00 && transferType != 0x01 && transferType != 0x02 &&
-                    transferType != 0x03 && transferType != 0x04 && transferType != 0x06)
+                    transferType != 0x03 && transferType != 0x04 && transferType != 0x06 &&
+                    transferType != 0x0B)
                 {
                     ctx.Cb.RaiseLog(L.S_InvalidHeader(transferType, 0));
                     ctx.Cb.RaiseError(L.S_InvalidHeader(transferType, 0));
@@ -613,6 +630,50 @@ namespace TrFileTransfer
                     bool okFolder = await HandleFolderTransfer(active, ctx, ct).ConfigureAwait(false);
                     if (ctx.CompletionAck) await WriteCompletionAck(active, okFolder, ct).ConfigureAwait(false);
                     return UpdateOutcome(outcome, okFolder);
+                }
+                if (transferType == 0x0B)
+                {
+                    // Chunk coverage query (0x0A bit1): a paused concurrent send asks which
+                    // byte ranges of its group the server already holds, so "resume" sends
+                    // only the gaps. A pure query — answer and close; no transfer follows.
+                    if (!ctx.ChunkSessions)
+                    {
+                        ctx.Cb.RaiseLog(L.S_InvalidHeader(transferType, 0));
+                        outcome.Rejected = true;
+                        return outcome;
+                    }
+                    var idBuf = new byte[16];
+                    await active.ReadExactAsync(idBuf, 0, 16, ct).ConfigureAwait(false);
+                    string groupKey = new Guid(idBuf).ToString("N");
+
+                    // Peer binding, same as chunk writes: a foreign peer must not learn or
+                    // resume into another device's group.
+                    ChunkTracker tracker;
+                    string owner;
+                    if (ctx.ChunkSessionPeers.TryGetValue(groupKey, out owner)
+                        && !string.Equals(owner, ctx.Session != null ? ctx.Session.Peer : "",
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        ctx.Cb.RaiseLog("Chunk group " + groupKey + " belongs to another peer — query refused");
+                        outcome.Rejected = true;
+                        return outcome;
+                    }
+
+                    long[][] ranges = null;
+                    if (ctx.ChunkTrackers.TryGetValue("S|" + groupKey, out tracker))
+                        ranges = tracker.GetRanges();
+                    ranges = ranges ?? new long[0][];
+
+                    var respB = new byte[5 + ranges.Length * 16];
+                    respB[0] = 0x1B;
+                    Buffer.BlockCopy(BitConverter.GetBytes(ranges.Length), 0, respB, 1, 4);
+                    for (int i = 0; i < ranges.Length; i++)
+                    {
+                        Buffer.BlockCopy(BitConverter.GetBytes(ranges[i][0]), 0, respB, 5 + i * 16, 8);
+                        Buffer.BlockCopy(BitConverter.GetBytes(ranges[i][1]), 0, respB, 5 + i * 16 + 8, 8);
+                    }
+                    await active.WriteExactAsync(respB, 0, respB.Length, ct).ConfigureAwait(false);
+                    return UpdateOutcome(outcome, true);
                 }
                 if (transferType == 0x02)
                 {
@@ -1409,6 +1470,24 @@ namespace TrFileTransfer
             await s.ReadExactAsync(nameBuf, 0, nameLen, ct).ConfigureAwait(false);
             string fileName = SafeName(System.Text.Encoding.UTF8.GetString(nameBuf), L.S_ReceivedFile);
 
+            // Chunk-group session (0x0A bit1 negotiated): a 16-byte id follows the name, so
+            // every chunk of one concurrent send — across reconnects and pauses — lands in
+            // the same tracker, which is what a paused group resumes into. Only peers that
+            // negotiated on THIS connection send it; older clients don't, and old/new is
+            // unambiguous because the server only reads the extra bytes when it acked 0x0A.
+            string groupKey = null;
+            if (ctx.ChunkSessions)
+            {
+                var idBuf = new byte[17];
+                await s.ReadExactAsync(idBuf, 0, idBuf.Length, ct).ConfigureAwait(false);
+                if (idBuf[0] == 1)
+                {
+                    var idBytes = new byte[16];
+                    Buffer.BlockCopy(idBuf, 1, idBytes, 0, 16);
+                    groupKey = new Guid(idBytes).ToString("N");
+                }
+            }
+
             // The chunk file is preallocated at totalSize — require that much headroom
             if (!Utils.HasFreeSpaceFor(ctx.SaveDirectory, totalSize))
             {
@@ -1420,10 +1499,37 @@ namespace TrFileTransfer
             if (!await GateAsync(ctx, fileName, totalSize, 0, false).ConfigureAwait(false))
                 return false;
 
-            // Tracker key includes the peer: two devices concurrently sending
-            // same-named chunked files must not share one reassembly tracker.
-            string trackerKey = (ctx.Session != null && !string.IsNullOrEmpty(ctx.Session.Peer)
-                ? ctx.Session.Peer : "") + "|" + fileName;
+            // Tracker key: a chunk-group session keys on its id so a paused group resumes
+            // into the same tracker from a NEW connection; without a session, per-peer
+            // isolation keeps two devices' same-named chunked files apart (historic path).
+            string trackerKey = groupKey != null
+                ? "S|" + groupKey
+                : (ctx.Session != null && !string.IsNullOrEmpty(ctx.Session.Peer)
+                    ? ctx.Session.Peer : "") + "|" + fileName;
+
+            // Session-keyed groups bind to their first peer: a foreign peer that guesses
+            // (or replays) a group id must not write into someone else's reassembly.
+            if (groupKey != null)
+            {
+                string owner;
+                var peer = ctx.Session != null ? ctx.Session.Peer : "";
+                if (ctx.ChunkSessionPeers.TryGetValue(groupKey, out owner))
+                {
+                    if (!string.Equals(owner, peer, StringComparison.OrdinalIgnoreCase))
+                    {
+                        ctx.Cb.RaiseLog("Chunk group " + groupKey + " belongs to another peer — refusing");
+                        return false;
+                    }
+                }
+                else
+                {
+                    // A group already left a complete file behind must not be resurrected:
+                    // treat re-creation after completion as a fresh group (GetOrCreate below
+                    // rebuilds because the completed tracker was evicted).
+                    ctx.ChunkSessionPeers[groupKey] = peer;
+                }
+            }
+
             ChunkTracker tracker = ChunkTracker.GetOrCreate(
                 ctx.ChunkTrackers, trackerKey, fileName, totalSize, ctx.SaveDirectory);
 
@@ -1489,6 +1595,12 @@ namespace TrFileTransfer
                     tracker.Dispose();
                     ChunkTracker removed;
                     ctx.ChunkTrackers.TryRemove(trackerKey, out removed);
+                    if (groupKey != null)
+                    {
+                        // The group is finished — its ownership record goes with it
+                        string staleOwner;
+                        ctx.ChunkSessionPeers.TryRemove(groupKey, out staleOwner);
+                    }
                     ctx.Cb.RaiseLog(L.S_TransferDone(fileName, Utils.FormatSize(totalSize), 0.0, ""));
                     // The chunk protocol carries only per-chunk hashes, so the assembled
                     // file's digest is not known from the wire — hash it now and remember
@@ -2201,29 +2313,32 @@ namespace TrFileTransfer
     /// <summary>Sending side of the 0x00-0x03 protocol, shared by TCP and UDT clients.
     /// Connection setup (and its transport-specific logging) stays in the transport classes.</summary>
     /// <summary>Result of the client-side 0x05/0x07/0x08 prelude negotiation.</summary>
-    public class AuthResult
-    {
-        /// <summary>The stream to run the protocol on — the raw stream, or the
-        /// compression/encryption decorators wrapping it after accepted preludes.</summary>
-        public IWireStream Stream;
-        /// <summary>True when the session is encrypted (0x07 accepted).</summary>
-        public bool Encrypted;
-        /// <summary>True when the session is compressed (0x08 accepted).</summary>
-        public bool Compressed;
-        /// <summary>True when the peer ignored the 0x07 frame (an older version) —
-        /// the caller must reconnect and retry with the plain 0x05 frame instead.</summary>
-        public bool NeedPlainFallback;
-        /// <summary>True when the peer dropped the 0x08 compression offer (an older
-        /// version) — the caller must reconnect without the offer.</summary>
-        public bool NeedNoCompressionFallback;
-        /// <summary>True when the peer answered the 0x0A capability frame (0x1A, bit 0) —
-        /// a 0x04 body may use the per-file skip pass instead of re-sending every file
-        /// after the resume index.</summary>
-        public bool PerFileSkip;
-        /// <summary>True when the peer dropped the 0x0A capability frame (an older
-        /// version) — the caller must reconnect without the offer.</summary>
-        public bool NeedNoPerFileSkipFallback;
-    }
+        public class AuthResult
+        {
+            /// <summary>The stream to run the protocol on — the raw stream, or the
+            /// compression/encryption decorators wrapping it after accepted preludes.</summary>
+            public IWireStream Stream;
+            /// <summary>True when the session is encrypted (0x07 accepted).</summary>
+            public bool Encrypted;
+            /// <summary>True when the session is compressed (0x08 accepted).</summary>
+            public bool Compressed;
+            /// <summary>True when the peer ignored the 0x07 frame (an older version) —
+            /// the caller must reconnect and retry with the plain 0x05 frame instead.</summary>
+            public bool NeedPlainFallback;
+            /// <summary>True when the peer dropped the 0x08 compression offer (an older
+            /// version) — the caller must reconnect without the offer.</summary>
+            public bool NeedNoCompressionFallback;
+            /// <summary>True when the peer answered the 0x0A capability frame (0x1A, bit 0) —
+            /// a 0x04 body may use the per-file skip pass instead of re-sending every file
+            /// after the resume index.</summary>
+            public bool PerFileSkip;
+            /// <summary>True when the peer answered 0x0A bit 1 — 0x02 chunk headers may
+            /// carry a group session id and the 0x0B coverage query is accepted.</summary>
+            public bool ChunkSessions;
+            /// <summary>True when the peer dropped the 0x0A capability frame (an older
+            /// version) — the caller must reconnect without the offer.</summary>
+            public bool NeedNoPerFileSkipFallback;
+        }
 
     public static class ClientWire
     {
@@ -2678,7 +2793,7 @@ namespace TrFileTransfer
         public static async Task<AuthResult> AuthenticateAsync(IWireStream s, string pairingCode, bool tryEncryption,
             bool tryCompression, WireCallbacks cb, CancellationToken ct)
         {
-            return await AuthenticateAsync(s, pairingCode, tryEncryption, tryCompression, cb, ct, true, false).ConfigureAwait(false);
+            return await AuthenticateAsync(s, pairingCode, tryEncryption, tryCompression, cb, ct, true, 0).ConfigureAwait(false);
         }
 
         /// <param name="allowDowngrade">False forbids negotiating a weaker handshake:
@@ -2688,13 +2803,16 @@ namespace TrFileTransfer
         public static async Task<AuthResult> AuthenticateAsync(IWireStream s, string pairingCode, bool tryEncryption,
             bool tryCompression, WireCallbacks cb, CancellationToken ct, bool allowDowngrade)
         {
-            return await AuthenticateAsync(s, pairingCode, tryEncryption, tryCompression, cb, ct, allowDowngrade, false).ConfigureAwait(false);
+            return await AuthenticateAsync(s, pairingCode, tryEncryption, tryCompression, cb, ct, allowDowngrade, 0).ConfigureAwait(false);
         }
 
-        /// <param name="tryPerFileSkip">Offer the 0x0A capability frame (0x1A ack) so a 0x04
-        /// body can skip files the receiver already holds. Only folder-resumable senders ask.</param>
+        /// <summary>Optional capability negotiation (0x0A, v2.13+).
+        /// capabilities bit0 = 0x04 per-file skip, bit1 = 0x02 chunk-group sessions plus the
+        /// 0x0B coverage query. Callers request exactly what their body will use; a peer
+        /// that drops the frame (an older build) reports NeedNoPerFileSkipFallback so the
+        /// caller can reconnect without the offer.</summary>
         public static async Task<AuthResult> AuthenticateAsync(IWireStream s, string pairingCode, bool tryEncryption,
-            bool tryCompression, WireCallbacks cb, CancellationToken ct, bool allowDowngrade, bool tryPerFileSkip)
+            bool tryCompression, WireCallbacks cb, CancellationToken ct, bool allowDowngrade, byte capabilities)
         {
             IWireStream current = s;
             bool encrypted = false;
@@ -2767,13 +2885,14 @@ namespace TrFileTransfer
             }
 
             bool perFileSkip = false;
-            if (tryPerFileSkip)
+            bool chunkSessions = false;
+            if (capabilities != 0)
             {
                 // Same drop-is-the-signal pattern: an older server sees 0x0A as an unknown
                 // transfer type, rejects and closes — the EOF here means "retry without it".
                 var frameA = new byte[2];
                 frameA[0] = 0x0A;
-                frameA[1] = 0x01;
+                frameA[1] = capabilities;
                 await current.WriteExactAsync(frameA, 0, frameA.Length, ct).ConfigureAwait(false);
 
                 var respA = new byte[2];
@@ -2785,12 +2904,20 @@ namespace TrFileTransfer
                 {
                     return new AuthResult { Stream = current, Encrypted = encrypted, Compressed = compressed, NeedNoPerFileSkipFallback = true };
                 }
-                if (respA[0] != 0x1A || (respA[1] & 0x01) == 0)
+                if (respA[0] != 0x1A || (respA[1] & capabilities) != capabilities)
                     return new AuthResult { Stream = current, Encrypted = encrypted, Compressed = compressed, NeedNoPerFileSkipFallback = true };
-                perFileSkip = true;
+                perFileSkip = (capabilities & 0x01) != 0;
+                chunkSessions = (capabilities & 0x02) != 0;
             }
 
-            return new AuthResult { Stream = current, Encrypted = encrypted, Compressed = compressed, PerFileSkip = perFileSkip };
+            return new AuthResult
+            {
+                Stream = current,
+                Encrypted = encrypted,
+                Compressed = compressed,
+                PerFileSkip = perFileSkip,
+                ChunkSessions = chunkSessions
+            };
         }
 
         /// <summary>
@@ -2935,18 +3062,38 @@ namespace TrFileTransfer
         public static async Task SendChunkAsync(IWireStream s, string filePath, long offset, long chunkSize,
             long totalSize, int bufferSize, SpeedLimiter limiter, WireCallbacks cb, CancellationToken ct)
         {
+            await SendChunkAsync(s, filePath, offset, chunkSize, totalSize, bufferSize, limiter, cb, ct, null, false)
+                .ConfigureAwait(false);
+        }
+
+        /// <summary>Sends one chunk (type 0x02). When the peer negotiated 0x0A bit 1, a
+        /// chunk-group session id rides after the name — every chunk of one concurrent send
+        /// (across reconnects and pauses) lands in the same server-side tracker, which is
+        /// what the 0x0B coverage query a resume depends on answers from.</summary>
+        public static async Task SendChunkAsync(IWireStream s, string filePath, long offset, long chunkSize,
+            long totalSize, int bufferSize, SpeedLimiter limiter, WireCallbacks cb, CancellationToken ct,
+            Guid? chunkSession, bool chunkSessionsNegotiated)
+        {
             var fileInfo = new FileInfo(filePath);
             string fileName = fileInfo.Name;
             byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(fileName);
 
             // Header: type(1) + totalSize(8) + chunkOffset(8) + chunkSize(8) + nameLen(4) + name
-            var header = new byte[1 + 28 + nameBytes.Length];
+            //         + [flag(1) + groupId(16)] when a group session was negotiated
+            bool withGroup = chunkSessionsNegotiated && chunkSession.HasValue;
+            var header = new byte[1 + 28 + nameBytes.Length + (withGroup ? 17 : 0)];
             header[0] = 0x02;
             Buffer.BlockCopy(BitConverter.GetBytes(totalSize), 0, header, 1, 8);
             Buffer.BlockCopy(BitConverter.GetBytes(offset), 0, header, 9, 8);
             Buffer.BlockCopy(BitConverter.GetBytes(chunkSize), 0, header, 17, 8);
             Buffer.BlockCopy(BitConverter.GetBytes(nameBytes.Length), 0, header, 25, 4);
             Buffer.BlockCopy(nameBytes, 0, header, 29, nameBytes.Length);
+            if (withGroup)
+            {
+                int p = 29 + nameBytes.Length;
+                header[p++] = 1;
+                Buffer.BlockCopy(chunkSession.Value.ToByteArray(), 0, header, p, 16);
+            }
             await s.WriteExactAsync(header, 0, header.Length, ct).ConfigureAwait(false);
 
             cb.RaiseLog(string.Format("Chunk sending: {0} offset={1} size={2}",
@@ -2955,6 +3102,34 @@ namespace TrFileTransfer
             await SendFilePayload(s, filePath, chunkSize, fileName, bufferSize, limiter, cb, ct, offset).ConfigureAwait(false);
 
             cb.RaiseComplete();
+        }
+
+        /// <summary>Queries the chunk-group coverage (0x0B): which [start,end) ranges of the
+        /// group's file the server already holds. The caller resumes by sending the complement.
+        /// Requires a connection whose prelude negotiated 0x0A bit 1; the peer binding means
+        /// only the group's owner gets an answer.</summary>
+        public static async Task<long[][]> QueryChunkCoverage(IWireStream s, Guid chunkSession, CancellationToken ct)
+        {
+            var req = new byte[17];
+            req[0] = 0x0B;
+            Buffer.BlockCopy(chunkSession.ToByteArray(), 0, req, 1, 16);
+            await s.WriteExactAsync(req, 0, req.Length, ct).ConfigureAwait(false);
+
+            var head = new byte[5];
+            await s.ReadExactAsync(head, 0, head.Length, ct).ConfigureAwait(false);
+            if (head[0] != 0x1B)
+                throw new InvalidDataException(string.Format("Unexpected coverage response type: {0}", head[0]));
+            int count = BitConverter.ToInt32(head, 1);
+            if (count < 0 || count > 65536)
+                throw new InvalidDataException("corrupt coverage response");
+
+            var resp = new byte[count * 16];
+            if (resp.Length > 0)
+                await s.ReadExactAsync(resp, 0, resp.Length, ct).ConfigureAwait(false);
+            var ranges = new long[count][];
+            for (int i = 0; i < count; i++)
+                ranges[i] = new long[] { BitConverter.ToInt64(resp, i * 16), BitConverter.ToInt64(resp, i * 16 + 8) };
+            return ranges;
         }
 
         /// <summary>Sends a file with resume support (type 0x03), negotiating the offset with the server.

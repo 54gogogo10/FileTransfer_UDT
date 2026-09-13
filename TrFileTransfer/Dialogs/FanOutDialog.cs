@@ -92,13 +92,16 @@ namespace TrFileTransfer
             e.Handled = e.Text.Any(c => !char.IsDigit(c) && c != '.');
         }
 
-        private static bool IsValidIpv4(string t)
+        private static bool IsValidIp(string t)
         {
-            return IPAddress.TryParse(t, out IPAddress ip) && ip.AddressFamily == AddressFamily.InterNetwork;
+            // IPv4 and IPv6 literals both work — the transports pick the socket family
+            IPAddress ip;
+            return IPAddress.TryParse(t, out ip);
         }
 
-        /// <summary>While typing, only judge complete-looking addresses (3+ dots);
-        /// a failed live check paints the field red via the shared template trigger.</summary>
+        /// <summary>While typing, only judge complete-looking addresses (a v4 candidate
+        /// with 3+ dots, or a v6 candidate containing ':'); a failed live check paints
+        /// the field red via the shared template trigger.</summary>
         private void ValidateIpLive()
         {
             string t = _ipBox.Text.Trim();
@@ -107,7 +110,8 @@ namespace TrFileTransfer
                 SetIpError(false);
                 return;
             }
-            bool ok = t.Count(c => c == '.') < 3 || IsValidIpv4(t);
+            bool complete = t.Count(c => c == '.') >= 3 || t.Contains(':');
+            bool ok = !complete || IsValidIp(t);
             SetIpError(!ok);
         }
 
@@ -120,7 +124,7 @@ namespace TrFileTransfer
         private void BtnAddIp_Click(object sender, RoutedEventArgs e)
         {
             string ip = _ipBox.Text.Trim();
-            if (!IsValidIpv4(ip))
+            if (!IsValidIp(ip))
             {
                 SetIpError(true);
                 return;
