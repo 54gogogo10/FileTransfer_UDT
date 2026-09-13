@@ -27,11 +27,21 @@ namespace TrFileTransfer
 
         /// <summary>Reads whatever is available (at most count). Returns 0 on EOF.</summary>
         Task<int> ReadSomeAsync(byte[] buffer, int offset, int count, CancellationToken ct);
+
+        /// <summary>Sets the read timeout, for waits where the peer is legitimately busy
+        /// rather than stalled (see ClientWire.LongReadWindowMs). Streams that have no read
+        /// timeout — TCP, and decorators wrapping it — make this a no-op.</summary>
+        void SetReadTimeoutMs(int milliseconds);
     }
 
     /// <summary>IWireStream over a TCP NetworkStream.</summary>
     public class TcpWireStream : IWireStream
     {
+        // TCP reads block until the socket is closed by the remote end or by our own
+        // Cancel(), so there is no timeout to adjust; a stalled peer is only ever
+        // surfaced by the OS or by the caller cancelling.
+        public void SetReadTimeoutMs(int milliseconds) { }
+
         private readonly NetworkStream _stream;
         private readonly string _eofMessage;
         private bool _disposed;
@@ -103,6 +113,17 @@ namespace TrFileTransfer
             return UdtIo.UdtReadAsync(_socket, buffer, offset, count, ct);
         }
 
+        /// <summary>UDT_RCVTIMEO — the send timeout is left alone.</summary>
+        public void SetReadTimeoutMs(int milliseconds)
+        {
+            try
+            {
+                int ms = milliseconds;
+                UdtNative.udt_setsockopt(_socket, 0, UdtNative.UDT_RCVTIMEO, ref ms, 4);
+            }
+            catch { }
+        }
+
         public void Dispose()
         {
             if (_disposed) return;
@@ -129,14 +150,27 @@ namespace TrFileTransfer
                 return sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(code ?? ""));
         }
 
-        /// <summary>Cryptographically random 6-digit pairing code for the server UI.</summary>
+        /// <summary>Cryptographically random pairing code for the server UI. length 4-12
+        /// (Config "PairingLength", default 6) — a longer code directly shrinks the offline
+        /// brute-force space that the PBKDF2 stretching only slows down.</summary>
         public static string GeneratePairingCode()
         {
-            var buf = new byte[4];
+            return GeneratePairingCode(6);
+        }
+
+        public static string GeneratePairingCode(int length)
+        {
+            if (length < 4) length = 4;
+            if (length > 12) length = 12;
+            var buf = new byte[8];
             using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create())
                 rng.GetBytes(buf);
-            int v = BitConverter.ToInt32(buf, 0) & 0x7FFFFFFF;
-            return (v % 1000000).ToString("D6");
+            // 10^length max is tiny against 2^64, so the modulo bias is negligible — and
+            // the code is only a pairing secret stretched by PBKDF2, never a key itself.
+            ulong range = 1;
+            for (int i = 0; i < length; i++) range *= 10UL;
+            ulong v = BitConverter.ToUInt64(buf, 0) % range;
+            return v.ToString(new string('0', length));
         }
     }
 
@@ -243,6 +277,14 @@ namespace TrFileTransfer
         /// successfully (or the server restarts).</summary>
         public ConcurrentDictionary<string, int> AuthFailures
             = new ConcurrentDictionary<string, int>();
+        /// <summary>Digests of files already on disk, so re-verifying them (every 0x04
+        /// sync re-checks its whole corpus) costs no disk reads — see FileHashCache.
+        /// The process-wide instance, so every server and connection shares one cache.</summary>
+        public FileHashCache FileHashes = FileHashCache.ForServer;
+        /// <summary>True when this connection negotiated the 0x0A capability (0x1A ack):
+        /// a 0x04 body may send a confirmation manifest and only the files the server
+        /// does not already hold. Connection-scoped (set on the BeginSession clone).</summary>
+        public bool PerFileSkip;
         /// <summary>Pairing failures allowed per peer IP before lockout. 0 disables.</summary>
         public int MaxAuthFailures = 10;
         /// <summary>Statistics for the CURRENT connection (set by BeginSession).</summary>
@@ -360,6 +402,9 @@ namespace TrFileTransfer
             // Pairing-failure counters are process-wide (per peer IP, across connections)
             clone.AuthFailures = ctx.AuthFailures;
             clone.MaxAuthFailures = ctx.MaxAuthFailures;
+            // File digests are process-wide too: the point is that the NEXT connection
+            // (a repeat sync) finds what this one already hashed or received.
+            clone.FileHashes = ctx.FileHashes;
             // Transport-selected: TCP needs the sender to read the verdict byte.
             clone.CompletionAck = ctx.CompletionAck;
             clone.Cb = scb;
@@ -495,6 +540,32 @@ namespace TrFileTransfer
                         }
                         active = await HandleCompressionOfferAsync(active, ctx, ct).ConfigureAwait(false);
                     }
+                    else if (transferType == 0x0A)
+                    {
+                        if (++preludeFrames > MaxPreludeFrames)
+                        {
+                            ctx.Cb.RaiseLog(L.S_InvalidHeader(transferType, preludeFrames));
+                            return outcome;
+                        }
+                        // Same pre-auth guard as 0x08: capabilities are only offered to
+                        // authenticated peers on a pairing-required server.
+                        if (!authSeen && !string.IsNullOrEmpty(ctx.PairingCode))
+                        {
+                            ctx.Cb.RaiseLog(L.S_InvalidHeader(transferType, preludeFrames));
+                            outcome.Rejected = true;
+                            return outcome;
+                        }
+                        var capBuf = new byte[1];
+                        await active.ReadExactAsync(capBuf, 0, 1, ct).ConfigureAwait(false);
+                        // We always have the digest cache, so bit 0 (per-file skip for
+                        // 0x04) is the only capability and it is always on. Flags let a
+                        // future build decline individual features without new frames.
+                        var respA = new byte[2];
+                        respA[0] = 0x1A;
+                        respA[1] = 0x01;
+                        await active.WriteExactAsync(respA, 0, respA.Length, ct).ConfigureAwait(false);
+                        ctx.PerFileSkip = true;
+                    }
                     else
                     {
                         break;
@@ -555,7 +626,14 @@ namespace TrFileTransfer
                     return o3;
                 }
                 if (transferType == 0x04)
-                    return UpdateOutcome(outcome, await HandleFolderResumableAsync(active, ctx, ct).ConfigureAwait(false));
+                {
+                    bool okSync = await HandleFolderResumableAsync(active, ctx, ct).ConfigureAwait(false);
+                    // Same reason as 0x01/0x06 below: on TCP a 0x04 that fails after the body
+                    // (a rejected gate, a full-file mismatch, a disk-full mid-folder) would
+                    // otherwise look like success to the sender. UDT answers out of band.
+                    if (ctx.CompletionAck) await WriteCompletionAck(active, okSync, ct).ConfigureAwait(false);
+                    return UpdateOutcome(outcome, okSync);
+                }
                 if (transferType == 0x06)
                 {
                     bool okText = await HandleTextMessage(active, ctx, ct).ConfigureAwait(false);
@@ -1023,19 +1101,24 @@ namespace TrFileTransfer
                 if (len == sizes[i])
                 {
                     // Complete size — verify content against the manifest hash
-                    if (await VerifyFullHashFile(path, fullHashes[i], ct).ConfigureAwait(false))
+                    if (await VerifyFullHashFile(ctx, path, fullHashes[i], ct).ConfigureAwait(false))
                         continue;
                     resumeIndex = i;
                     resumeOffset = 0;
                     break;
                 }
-                if (len > 0 && len < sizes[i])
+                if (len > 0 && len < sizes[i] && !KnownComplete(ctx, path, len))
                 {
+                    // Shorter than the sender's version: a partially received file, so the
+                    // bytes on disk are a true prefix and the rest can be appended.
                     resumeIndex = i;
                     resumeOffset = len;
                     break;
                 }
-                // Missing, empty-but-nonzero, or oversized — rewrite from scratch
+                // Missing, empty-but-nonzero, oversized, or a complete older version of a
+                // file the sender has since changed — the bytes on disk belong to different
+                // content, so appending the new tail would just splice two files together
+                // (the full-file check then discards it, wasting the whole pass).
                 resumeIndex = i;
                 resumeOffset = 0;
                 break;
@@ -1061,14 +1144,33 @@ namespace TrFileTransfer
                 return true;
             }
 
-            // Receive body: for each file from resumeIndex, [increment bytes][32-byte SHA256 of increment]
+            // Receive body: for each file from resumeIndex, [increment bytes][32-byte SHA256 of increment].
+            // With the 0x0A capability the client first declares each remaining file (size, path,
+            // full hash) and the server answers 1 byte per file — skip (already holds identical
+            // content) or send — so a shifted manifest order no longer re-sends identical files.
+            bool[] need = null;
+            if (ctx.PerFileSkip && resumeIndex < fileCount)
+                need = await NegotiatePerFileSkipAsync(s, ctx, dir, relativePaths, sizes, fullHashes,
+                    resumeIndex, fileCount, ct).ConfigureAwait(false);
+
             var sw = System.Diagnostics.Stopwatch.StartNew();
             long completedBytes = resumeOffset;
             for (int i = 0; i < resumeIndex; i++) completedBytes += sizes[i];
 
             for (int i = resumeIndex; i < fileCount && !ct.IsCancellationRequested; i++)
             {
+                if (need != null && !need[i - resumeIndex])
+                {
+                    // Declared and confirmed present — no bytes travel for it
+                    completedBytes += sizes[i] - (i == resumeIndex ? resumeOffset : 0);
+                    continue;
+                }
                 long start = (i == resumeIndex) ? resumeOffset : 0;
+                // With start == 0 the payload IS the whole file, so the increment hash the
+                // loop below computes is the file's full digest — kept here and remembered
+                // once the write stream is closed (the mtime is only final by then), so the
+                // next sync recognises the file without reading it back.
+                byte[] receivedFullHash = null;
                 string savePath = Path.Combine(dir, relativePaths[i]);
                 string subDir = Path.GetDirectoryName(savePath);
                 if (!string.IsNullOrEmpty(subDir) && !Directory.Exists(subDir))
@@ -1121,18 +1223,30 @@ namespace TrFileTransfer
                             ctx.Cb.RaiseError(L.S_HashFailed(relativePaths[i]));
                             return false;
                         }
+                        if (start == 0)
+                            receivedFullHash = sha256.Hash;
                     }
                 }
 
                 // A resumed file is old-prefix + new-suffix. The increment hash covers
                 // only the suffix, so re-verify the assembled file against the manifest
                 // hash — otherwise a stale/corrupt prefix yields a silently wrong file.
-                if (start > 0 && !await VerifyFullHashFile(savePath, fullHashes[i], ct).ConfigureAwait(false))
+                if (start > 0 && !await VerifyFullHashFile(ctx, savePath, fullHashes[i], ct).ConfigureAwait(false))
                 {
+                    // The file on disk is a splice of two versions: discard it rather than
+                    // leave something that looks complete at the final path (the message
+                    // says "discarded", and a retry then re-receives it from the start).
+                    ctx.FileHashes.Remove(savePath);
+                    Utils.DeleteWithRetry(savePath);
                     ctx.Cb.RaiseLog(L.S_FullHashFailed(relativePaths[i]));
                     ctx.Cb.RaiseError(L.S_FullHashFailed(relativePaths[i]));
                     return false;
                 }
+
+                // File just written start-to-finish: its digest is known for free (the
+                // stream was closed by the using above, so the mtime key is settled).
+                if (receivedFullHash != null)
+                    ctx.FileHashes.Store(savePath, receivedFullHash);
 
                 ctx.Cb.RaiseFileReceived(savePath, sizes[i]);
                 completedBytes += sizes[i] - start;
@@ -1486,7 +1600,7 @@ namespace TrFileTransfer
                 string basePath = Path.Combine(ctx.SaveDirectory, fileName);
                 var existing = new FileInfo(basePath);
                 if (existing.Exists && existing.Length == totalSize
-                    && await VerifyFullHashFile(basePath, expectedFullHash, ct).ConfigureAwait(false))
+                    && await VerifyFullHashFile(ctx, basePath, expectedFullHash, ct).ConfigureAwait(false))
                 {
                     await SendResumeResponse(s, totalSize, 2, ct).ConfigureAwait(false);
                     ctx.Cb.RaiseLog(L.S_DuplicateSkipped(fileName));
@@ -1589,7 +1703,7 @@ namespace TrFileTransfer
                 else
                 {
                     newState.WriteStream.Dispose();
-                    try { File.Delete(newState.SavePath); } catch { }
+                    Utils.DeleteWithRetry(newState.SavePath);
                     ctx.ResumeStates.TryGetValue(sessionId, out state);
                     isNew = false;
                 }
@@ -1730,7 +1844,7 @@ namespace TrFileTransfer
                     state.WriteStream.Dispose();
                     state.WriteStream = null;
 
-                    if (expectedFullHash == null || await VerifyFullHashFile(state.SavePath, expectedFullHash, ct).ConfigureAwait(false))
+                    if (expectedFullHash == null || await VerifyFullHashFile(ctx, state.SavePath, expectedFullHash, ct).ConfigureAwait(false))
                     {
                         ResumeState removed;
                         ctx.ResumeStates.TryRemove(sessionId, out removed);
@@ -1747,7 +1861,8 @@ namespace TrFileTransfer
                     ResumeState removedFh;
                     ctx.ResumeStates.TryRemove(sessionId, out removedFh);
                     ServerResumeStore.Delete(sessionId);
-                    try { File.Delete(state.SavePath); } catch { }
+                    ctx.FileHashes.Remove(state.SavePath);
+                    Utils.DeleteWithRetry(state.SavePath);
                     ctx.Cb.RaiseLog(L.S_FullHashFailed(fileName));
                     ctx.Cb.RaiseError(L.S_FullHashFailed(fileName));
                     await SendResumeResponse(s, totalSize, 3, ct).ConfigureAwait(false);
@@ -1776,8 +1891,105 @@ namespace TrFileTransfer
             await s.WriteExactAsync(resp, 0, 10, ct).ConfigureAwait(false);
         }
 
-        private static async Task<bool> VerifyFullHashFile(string savePath, byte[] expected, CancellationToken ct)
+        /// <summary>Compares a file on disk against an expected SHA256, answering from the
+        /// server's FileHashCache when this file was hashed before and is unchanged since.
+        /// The cache is what keeps a repeat 0x04 sync from re-reading its whole corpus.</summary>
+        /// <summary>
+        /// The 0x0A per-file skip pass: the client declares every remaining file
+        /// ([size(8)][pathLen(2)][path][fullHash(32)], the manifest entry format) and we
+        /// answer 1 byte per file — 0x00 "skip, I hold identical content", 0x01 "send".
+        /// An answer comes from the digest cache when the file's (size, mtime) is known
+        /// (free); otherwise the file is hashed now and the digest remembered (self-warming:
+        /// cold cache costs one read per unknown file, once). A file whose size differs, or
+        /// whose digest differs, is always "send" — a mismatch can only cost bytes, never
+        /// silence a changed file.
+        /// </summary>
+        private static async Task<bool[]> NegotiatePerFileSkipAsync(IWireStream s, ServerWireContext ctx, string dir,
+            string[] relativePaths, long[] sizes, byte[][] fullHashes, int resumeIndex, int fileCount, CancellationToken ct)
         {
+            int count = fileCount - resumeIndex;
+            var answers = new byte[count];
+
+            var entryHeader = new byte[10];
+            for (int i = resumeIndex; i < fileCount; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                await s.ReadExactAsync(entryHeader, 0, entryHeader.Length, ct).ConfigureAwait(false);
+                long size = BitConverter.ToInt64(entryHeader, 0);
+                int pathLen = BitConverter.ToInt16(entryHeader, 8);
+                if (size < 0 || size > Utils.MaxTransferSize || pathLen <= 0 || pathLen > 4096)
+                    throw new IOException("corrupt skip-manifest entry");
+                var pathBuf = new byte[pathLen];
+                await s.ReadExactAsync(pathBuf, 0, pathLen, ct).ConfigureAwait(false);
+                var declaredHash = new byte[32];
+                await s.ReadExactAsync(declaredHash, 0, 32, ct).ConfigureAwait(false);
+
+                string path = Path.Combine(dir, Utils.SanitizeRelativePath(
+                    System.Text.Encoding.UTF8.GetString(pathBuf)));
+                answers[i - resumeIndex] = await HaveIdenticalAsync(ctx, path, size, declaredHash, ct)
+                    .ConfigureAwait(false) ? (byte)0 : (byte)1;
+            }
+            await s.WriteExactAsync(answers, 0, answers.Length, ct).ConfigureAwait(false);
+
+            var need = new bool[count];
+            for (int i = 0; i < count; i++) need[i] = answers[i] == 1;
+            return need;
+        }
+
+        /// <summary>True when the file at path currently hashes to expected, answered from the
+        /// cache when possible and from a fresh (remembered) read otherwise. False when the
+        /// file is missing, unreadable, or of a different size.</summary>
+        private static async Task<bool> HaveIdenticalAsync(ServerWireContext ctx, string path, long size,
+            byte[] expected, CancellationToken ct)
+        {
+            long statSize, mtime;
+            if (!FileHashCache.Stat(path, out statSize, out mtime) || statSize != size)
+                return false;
+
+            bool matches;
+            if (ctx.FileHashes.TryMatch(path, size, mtime, expected, out matches))
+                return matches;
+
+            try
+            {
+                byte[] actual = await Task.Run(() => ClientWire.ComputeFileHash(path, ct), ct).ConfigureAwait(false);
+                ctx.FileHashes.StoreIfUnchanged(path, actual, size, mtime);
+                return Utils.ConstantTimeEquals(actual, expected);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (IOException) { return false; }
+            catch (UnauthorizedAccessException) { return false; }
+        }
+
+        /// <summary>True when the server has already hashed the file in its current (size,
+        /// mtime) state, i.e. what is on disk is a complete version of something. A short
+        /// file that is NOT known-complete is a partial transfer whose bytes can be appended
+        /// to; one that IS known-complete is the previous version of a changed file, and its
+        /// bytes must not be reused as a prefix.</summary>
+        private static bool KnownComplete(ServerWireContext ctx, string path, long size)
+        {
+            long mtime;
+            try
+            {
+                var fi = new FileInfo(path);
+                if (!fi.Exists) return false;
+                mtime = fi.LastWriteTimeUtc.Ticks;
+            }
+            catch (IOException) { return false; }
+            catch (UnauthorizedAccessException) { return false; }
+            return ctx.FileHashes.Knows(path, size, mtime);
+        }
+
+        private static async Task<bool> VerifyFullHashFile(ServerWireContext ctx, string savePath, byte[] expected, CancellationToken ct)
+        {
+            long size, mtime;
+            if (!FileHashCache.Stat(savePath, out size, out mtime))
+                return false;
+
+            bool matches;
+            if (ctx.FileHashes.TryMatch(savePath, size, mtime, expected, out matches))
+                return matches;
+
             try
             {
                 using (var fs = new FileStream(savePath, FileMode.Open, FileAccess.Read,
@@ -1789,6 +2001,7 @@ namespace TrFileTransfer
                     while ((read = await fs.ReadAsync(buf, 0, buf.Length, ct).ConfigureAwait(false)) > 0)
                         sha.TransformBlock(buf, 0, read, null, 0);
                     sha.TransformFinalBlock(Utils.EmptyBytes, 0, 0);
+                    ctx.FileHashes.StoreIfUnchanged(savePath, sha.Hash, size, mtime);
                     return Utils.ConstantTimeEquals(expected, sha.Hash);
                 }
             }
@@ -1937,7 +2150,7 @@ namespace TrFileTransfer
                     catch (IOException) { }
                     catch (UnauthorizedAccessException) { }
                     if (dup)
-                        dup = await VerifyFullHashFile(basePath, computedHash, ct).ConfigureAwait(false);
+                        dup = await VerifyFullHashFile(ctx, basePath, computedHash, ct).ConfigureAwait(false);
                     if (dup)
                     {
                         ctx.Cb.RaiseLog(L.S_DuplicateSkipped(displayName));
@@ -1949,6 +2162,11 @@ namespace TrFileTransfer
                 fileStream.Dispose();
                 File.Move(tempPath, savePath);
                 committed = true;
+                // The receiver hashed this file's bytes on the way in, so its digest is known
+                // for free: record it (the path is only final now, and the move settled the
+                // mtime the entry is keyed on). A later dedup check against this path — or a
+                // sync that finds it already present — then costs no disk read.
+                ctx.FileHashes.Store(savePath, computedHash);
             }
             return true;
             }
@@ -1984,6 +2202,13 @@ namespace TrFileTransfer
         /// <summary>True when the peer dropped the 0x08 compression offer (an older
         /// version) — the caller must reconnect without the offer.</summary>
         public bool NeedNoCompressionFallback;
+        /// <summary>True when the peer answered the 0x0A capability frame (0x1A, bit 0) —
+        /// a 0x04 body may use the per-file skip pass instead of re-sending every file
+        /// after the resume index.</summary>
+        public bool PerFileSkip;
+        /// <summary>True when the peer dropped the 0x0A capability frame (an older
+        /// version) — the caller must reconnect without the offer.</summary>
+        public bool NeedNoPerFileSkipFallback;
     }
 
     public static class ClientWire
@@ -2134,6 +2359,92 @@ namespace TrFileTransfer
         }
 
         /// <summary>
+        /// Enumerates a folder and hashes every file, producing the manifest 0x04 sends.
+        /// Blocking — call it on a worker thread, and call it BEFORE opening the connection:
+        /// the hash pass is the longest step before the first byte, and a peer left silent
+        /// through it hits its receive timeout (UDT: 30s) and drops the connection.
+        /// Logs before the pass, not after, so the pause is explained while it happens.
+        /// Honours ct per file (cancel/pause work during the pass) and raises progress
+        /// events, so the UI shows the hash moving instead of a frozen card.
+        /// Returns null for an empty folder (the error is already reported through the callbacks).
+        /// </summary>
+        public static FolderSendManifest BuildFolderManifest(string folderPath, WireCallbacks cb, CancellationToken ct)
+        {
+            string folderName = Path.GetFileName(folderPath.TrimEnd('\\', '/'));
+            if (string.IsNullOrWhiteSpace(folderName))
+                folderName = "folder";
+
+            ct.ThrowIfCancellationRequested();
+            var files = Directory.GetFiles(folderPath, "*", SearchOption.AllDirectories);
+            if (files.Length == 0)
+            {
+                cb.RaiseLog(L.C_ZeroFiles);
+                cb.RaiseError(L.C_ZeroFiles);
+                return null;
+            }
+
+            var manifest = new FolderSendManifest
+            {
+                FolderName = folderName,
+                FolderPath = folderPath,
+                Files = files,
+                RelativePaths = new string[files.Length],
+                Sizes = new long[files.Length],
+                Hashes = new byte[files.Length][]
+            };
+
+            // Per-file hashes let the server verify complete files on resume. Files whose
+            // (size, mtime) the cache already knows are not read again — a repeat sync of
+            // an unchanged folder costs a stat per file and nothing else.
+            cb.RaiseLog(L.ComputingFolderHashes(files.Length));
+            long totalBytes = 0;
+            for (int i = 0; i < files.Length; i++)
+                totalBytes += new FileInfo(files[i]).Length;
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            long hashedBytes = 0;
+            int reused = 0;
+            var progressTimer = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < files.Length; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                manifest.Sizes[i] = new FileInfo(files[i]).Length;
+                manifest.RelativePaths[i] = files[i].Substring(folderPath.Length).TrimStart('\\', '/');
+                bool computed;
+                manifest.Hashes[i] = FileHashCache.ForClient.GetOrCompute(files[i], cb, false, out computed, ct);
+                if (!computed) reused++;
+                hashedBytes += manifest.Sizes[i];
+
+                if (progressTimer.ElapsedMilliseconds >= 100)
+                {
+                    progressTimer.Restart();
+                    cb.RaiseProgress(new TransferProgress
+                    {
+                        BytesTransferred = hashedBytes,
+                        TotalBytes = totalBytes,
+                        SpeedBytesPerSecond = hashedBytes / Math.Max(sw.Elapsed.TotalSeconds, 0.001),
+                        Elapsed = sw.Elapsed,
+                        FileName = folderName
+                    });
+                }
+            }
+            if (reused > 0)
+                cb.RaiseLog(L.ManifestHashCache(reused, files.Length - reused));
+            // Final 100% event: the throttle can drop the last file's update, and the card
+            // should not sit at e.g. 2/3 until the send phase's own progress replaces it.
+            cb.RaiseProgress(new TransferProgress
+            {
+                BytesTransferred = totalBytes,
+                TotalBytes = totalBytes,
+                SpeedBytesPerSecond = totalBytes / Math.Max(sw.Elapsed.TotalSeconds, 0.001),
+                Elapsed = sw.Elapsed,
+                FileName = folderName
+            });
+            manifest.TotalBytes = totalBytes;
+            return manifest;
+        }
+
+        /// <summary>
         /// Sends a folder with resume support (type 0x04). Sends a manifest with per-file
         /// full-file SHA256, then only the bytes the server reports as missing. The client
         /// persists a FolderResumeState so an interrupted session can be retried later.
@@ -2141,42 +2452,22 @@ namespace TrFileTransfer
         /// maps to a fixed server directory, so repeat runs transfer only differences —
         /// and the state is flagged IsSync to stay out of the resume dialog.
         /// </summary>
-        public static async Task SendFolderResumableAsync(IWireStream s, string folderPath, Guid sessionId,
+        public static async Task SendFolderResumableAsync(IWireStream s, FolderSendManifest manifest, Guid sessionId,
             string serverIp, int port, bool isUdt, int bufferSize, SpeedLimiter limiter, WireCallbacks cb,
-            CancellationToken ct, bool keepState = false)
+            CancellationToken ct, bool keepState = false, bool perFileSkip = false)
         {
-            string folderName = Path.GetFileName(folderPath.TrimEnd('\\', '/'));
-            if (string.IsNullOrWhiteSpace(folderName))
-                folderName = "folder";
-
-            var files = Directory.GetFiles(folderPath, "*", SearchOption.AllDirectories);
-            if (files.Length == 0)
-            {
-                cb.RaiseLog(L.C_ZeroFiles);
-                cb.RaiseError(L.C_ZeroFiles);
-                return;
-            }
-
-            // Pre-compute manifest entries; hashes let the server verify complete files on resume
-            cb.RaiseLog(L.ComputingFolderHashes(files.Length));
-            var relativePaths = new string[files.Length];
-            var sizes = new long[files.Length];
-            var hashes = new byte[files.Length][];
-            long totalBytes = 0;
-            for (int i = 0; i < files.Length; i++)
-            {
-                var fi = new FileInfo(files[i]);
-                sizes[i] = fi.Length;
-                relativePaths[i] = files[i].Substring(folderPath.Length).TrimStart('\\', '/');
-                hashes[i] = ComputeFileHash(files[i]);
-                totalBytes += sizes[i];
-            }
+            string folderName = manifest.FolderName;
+            string[] files = manifest.Files;
+            string[] relativePaths = manifest.RelativePaths;
+            long[] sizes = manifest.Sizes;
+            byte[][] hashes = manifest.Hashes;
+            long totalBytes = manifest.TotalBytes;
 
             // Persist the session before sending so an interruption keeps it resumable
             var state = new FolderResumeState
             {
                 SessionId = sessionId,
-                FolderPath = folderPath,
+                FolderPath = manifest.FolderPath,
                 FolderName = folderName,
                 ServerIp = serverIp,
                 Port = port,
@@ -2215,9 +2506,25 @@ namespace TrFileTransfer
                 await s.WriteExactAsync(entry, 0, entry.Length, ct).ConfigureAwait(false);
             }
 
-            // 0x11 response: resumeFileIndex(8) + resumeOffset(8) + status(1) = 18 bytes
+            // 0x11 response: resumeFileIndex(8) + resumeOffset(8) + status(1) = 18 bytes.
+            // The server scans (and hashes) what it already holds before it can answer, so
+            // this wait gets the generous window as well.
             var resp = new byte[1 + 8 + 8 + 1];
-            await s.ReadExactAsync(resp, 0, resp.Length, ct).ConfigureAwait(false);
+            LongReadWindow(s, true);
+            try
+            {
+                await s.ReadExactAsync(resp, 0, resp.Length, ct).ConfigureAwait(false);
+            }
+            finally { LongReadWindow(s, false); }
+            if (resp[0] == 0x00)
+            {
+                // Not a folder-resume response: the receiver refused the transfer outright
+                // (its confirmation gate said no). It still writes its verdict byte, so this
+                // is reported as a rejection instead of being parsed as a bogus response.
+                cb.RaiseLog(L.C_RejectedByPeer);
+                cb.RaiseError(L.C_RejectedByPeer);
+                throw new IOException(L.C_RejectedByPeer);
+            }
             if (resp[0] != 0x11)
                 throw new InvalidDataException(string.Format("Unexpected folder resume response type: {0}", resp[0]));
             int resumeIndex = (int)BitConverter.ToInt64(resp, 1);
@@ -2238,11 +2545,53 @@ namespace TrFileTransfer
             for (int i = 0; i < resumeIndex; i++) state.SentBytes += sizes[i];
             state.Save();
 
+            // Per-file skip pass (0x0A capability agreed): declare every remaining file and
+            // let the receiver answer which ones it already holds identically. Only the
+            // "send" files travel — an inserted file no longer drags its successors along.
+            bool[] need = null;
+            int skippedByPeer = 0;
+            if (perFileSkip && resumeIndex < files.Length)
+            {
+                for (int i = resumeIndex; i < files.Length; i++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    byte[] relPathBytes = System.Text.Encoding.UTF8.GetBytes(relativePaths[i]);
+                    var entry = new byte[8 + 2 + relPathBytes.Length + 32];
+                    Buffer.BlockCopy(BitConverter.GetBytes(sizes[i]), 0, entry, 0, 8);
+                    Buffer.BlockCopy(BitConverter.GetBytes((short)relPathBytes.Length), 0, entry, 8, 2);
+                    Buffer.BlockCopy(relPathBytes, 0, entry, 10, relPathBytes.Length);
+                    Buffer.BlockCopy(hashes[i], 0, entry, 10 + relPathBytes.Length, 32);
+                    await s.WriteExactAsync(entry, 0, entry.Length, ct).ConfigureAwait(false);
+                }
+
+                var answers = new byte[files.Length - resumeIndex];
+                LongReadWindow(s, true); // the receiver may hash cold files to answer
+                try
+                {
+                    await s.ReadExactAsync(answers, 0, answers.Length, ct).ConfigureAwait(false);
+                }
+                finally { LongReadWindow(s, false); }
+
+                need = new bool[answers.Length];
+                for (int i = 0; i < answers.Length; i++)
+                {
+                    need[i] = answers[i] == 1;
+                    if (!need[i]) skippedByPeer++;
+                }
+                if (skippedByPeer > 0)
+                    cb.RaiseLog(L.C_PerFileSkip(skippedByPeer, answers.Length - skippedByPeer));
+            }
+
             // Send body: per file [increment][32-byte SHA256 of the increment]
             var sw = System.Diagnostics.Stopwatch.StartNew();
             long totalSent = state.SentBytes;
             for (int i = resumeIndex; i < files.Length && !ct.IsCancellationRequested; i++)
             {
+                if (need != null && !need[i - resumeIndex])
+                {
+                    totalSent += sizes[i] - (i == resumeIndex ? resumeOffset : 0);
+                    continue;
+                }
                 long start = (i == resumeIndex) ? resumeOffset : 0;
                 await SendFilePayload(s, files[i], sizes[i] - start, relativePaths[i],
                     bufferSize, limiter, cb, ct, start).ConfigureAwait(false);
@@ -2269,16 +2618,37 @@ namespace TrFileTransfer
             // Sync mode keeps the state: the next run of the same (folder, target) pair
             // reuses the session and the server scan skips everything already received
             if (!keepState) FolderResumeState.Delete(sessionId);
+            // The receiver's verdict: a folder that failed after the body (a file discarded
+            // by its full-file check, a disk-full mid-folder) must not be reported as done.
+            // Only read when the peer proved to be a version that sends it.
+            await ConfirmCompletionAsync(s, cb, ct).ConfigureAwait(false);
             cb.RaiseComplete();
         }
 
         /// <summary>Computes the SHA256 of a file's full content.</summary>
-        private static byte[] ComputeFileHash(string path)
+        public static byte[] ComputeFileHash(string path)
+        {
+            return ComputeFileHash(path, CancellationToken.None);
+        }
+
+        /// <summary>Same, but checks the token between blocks — a cancel during a long hash
+        /// pass surfaces as OperationCanceledException instead of after minutes of silence.</summary>
+        public static byte[] ComputeFileHash(string path, CancellationToken ct)
         {
             using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
                 FileShare.Read, 4194304, FileOptions.SequentialScan))
             using (var sha = System.Security.Cryptography.SHA256.Create())
-                return sha.ComputeHash(fs);
+            {
+                var buf = new byte[4194304];
+                int read;
+                while ((read = fs.Read(buf, 0, buf.Length)) > 0)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    sha.TransformBlock(buf, 0, read, null, 0);
+                }
+                sha.TransformFinalBlock(Utils.EmptyBytes, 0, 0);
+                return sha.Hash;
+            }
         }
 
         /// <summary>
@@ -2294,7 +2664,7 @@ namespace TrFileTransfer
         public static async Task<AuthResult> AuthenticateAsync(IWireStream s, string pairingCode, bool tryEncryption,
             bool tryCompression, WireCallbacks cb, CancellationToken ct)
         {
-            return await AuthenticateAsync(s, pairingCode, tryEncryption, tryCompression, cb, ct, true).ConfigureAwait(false);
+            return await AuthenticateAsync(s, pairingCode, tryEncryption, tryCompression, cb, ct, true, false).ConfigureAwait(false);
         }
 
         /// <param name="allowDowngrade">False forbids negotiating a weaker handshake:
@@ -2303,6 +2673,14 @@ namespace TrFileTransfer
         /// 0x07 encryption whose key is derivable from the wire).</param>
         public static async Task<AuthResult> AuthenticateAsync(IWireStream s, string pairingCode, bool tryEncryption,
             bool tryCompression, WireCallbacks cb, CancellationToken ct, bool allowDowngrade)
+        {
+            return await AuthenticateAsync(s, pairingCode, tryEncryption, tryCompression, cb, ct, allowDowngrade, false).ConfigureAwait(false);
+        }
+
+        /// <param name="tryPerFileSkip">Offer the 0x0A capability frame (0x1A ack) so a 0x04
+        /// body can skip files the receiver already holds. Only folder-resumable senders ask.</param>
+        public static async Task<AuthResult> AuthenticateAsync(IWireStream s, string pairingCode, bool tryEncryption,
+            bool tryCompression, WireCallbacks cb, CancellationToken ct, bool allowDowngrade, bool tryPerFileSkip)
         {
             IWireStream current = s;
             bool encrypted = false;
@@ -2374,7 +2752,31 @@ namespace TrFileTransfer
                 // Any other status: the peer declined — continue uncompressed
             }
 
-            return new AuthResult { Stream = current, Encrypted = encrypted, Compressed = compressed };
+            bool perFileSkip = false;
+            if (tryPerFileSkip)
+            {
+                // Same drop-is-the-signal pattern: an older server sees 0x0A as an unknown
+                // transfer type, rejects and closes — the EOF here means "retry without it".
+                var frameA = new byte[2];
+                frameA[0] = 0x0A;
+                frameA[1] = 0x01;
+                await current.WriteExactAsync(frameA, 0, frameA.Length, ct).ConfigureAwait(false);
+
+                var respA = new byte[2];
+                try
+                {
+                    await current.ReadExactAsync(respA, 0, 2, ct).ConfigureAwait(false);
+                }
+                catch (IOException)
+                {
+                    return new AuthResult { Stream = current, Encrypted = encrypted, Compressed = compressed, NeedNoPerFileSkipFallback = true };
+                }
+                if (respA[0] != 0x1A || (respA[1] & 0x01) == 0)
+                    return new AuthResult { Stream = current, Encrypted = encrypted, Compressed = compressed, NeedNoPerFileSkipFallback = true };
+                perFileSkip = true;
+            }
+
+            return new AuthResult { Stream = current, Encrypted = encrypted, Compressed = compressed, PerFileSkip = perFileSkip };
         }
 
         /// <summary>
@@ -2541,10 +2943,16 @@ namespace TrFileTransfer
             cb.RaiseComplete();
         }
 
-        /// <summary>Sends a file with resume support (type 0x03), negotiating the offset with the server.</summary>
-        public static async Task SendResumableAsync(IWireStream s, string filePath, Guid sessionId, bool verifyHash,
+        /// <summary>Sends a file with resume support (type 0x03), negotiating the offset with the server.
+        /// fullHash is the optional full-file SHA256 the server checks the assembled file against
+        /// (null sends without it); the caller computes it BEFORE opening the connection (through
+        /// FileHashCache) — hashing after the connect leaves the peer waiting silently long enough
+        /// to hit its receive timeout, which drops the connection before the transfer starts.
+        /// Over UDT with a large enough file, that made the send impossible.</summary>
+        public static async Task SendResumableAsync(IWireStream s, string filePath, Guid sessionId, byte[] fullHash,
             string serverIp, int port, bool isUdt, int bufferSize, SpeedLimiter limiter, WireCallbacks cb, CancellationToken ct)
         {
+            bool verifyHash = fullHash != null;
             ResumeState.EnsureDir();
             var fileInfo = new FileInfo(filePath);
             long fileSize = fileInfo.Length;
@@ -2553,17 +2961,6 @@ namespace TrFileTransfer
             long sourceMTime;
             try { sourceMTime = File.GetLastWriteTimeUtc(filePath).Ticks; }
             catch { sourceMTime = 0; }
-
-            // Full-file hash for verification (computed up front; only when requested)
-            byte[] fullHash = null;
-            if (verifyHash)
-            {
-                using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read,
-                    FileShare.Read, 4194304, FileOptions.SequentialScan))
-                using (var sha = System.Security.Cryptography.SHA256.Create())
-                    fullHash = sha.ComputeHash(fs);
-                cb.RaiseLog(L.C_ComputingFullHash(fileName));
-            }
 
             // Load existing state if resuming
             var existingState = ResumeState.Load(sessionId);
@@ -2615,9 +3012,16 @@ namespace TrFileTransfer
                 Buffer.BlockCopy(fullHash, 0, header, p, 32);
             await s.WriteExactAsync(header, 0, header.Length, ct).ConfigureAwait(false);
 
-            // Read 0x10 server response (10 bytes: 0x10 + offset8 + status1)
+            // Read 0x10 server response (10 bytes: 0x10 + offset8 + status1). The peer may
+            // legitimately sit silent for a while here (it hashes what it already holds
+            // before it can answer), so this one wait gets a generous budget.
             var respBuf = new byte[10];
-            await s.ReadExactAsync(respBuf, 0, 10, ct).ConfigureAwait(false);
+            LongReadWindow(s, true);
+            try
+            {
+                await s.ReadExactAsync(respBuf, 0, 10, ct).ConfigureAwait(false);
+            }
+            finally { LongReadWindow(s, false); }
 
             if (respBuf[0] != 0x10)
                 throw new InvalidDataException(string.Format("Unexpected resume response type: {0}", respBuf[0]));
@@ -2627,8 +3031,11 @@ namespace TrFileTransfer
 
             if (respStatus == 3)
             {
-                // Full-file verification failed on the server — file was discarded.
-                // Keep the local resume state so the transfer can be retried.
+                // Full-file verification failed on the server — file was discarded. Drop our
+                // own digest for it: if the digest we declared was the stale one, the retry
+                // must not declare it again (that would fail the same way until the entry
+                // expired by age). Keep the local resume state so the transfer can retry.
+                FileHashCache.ForClient.Remove(filePath);
                 cb.RaiseLog(L.C_VerifyFailed(fileName));
                 cb.RaiseError(L.C_VerifyFailed(fileName));
                 return;
@@ -2654,12 +3061,21 @@ namespace TrFileTransfer
 
             // Read the final 0x10 response: status 2 = success, 3 = full-file
             // verification failed (server discarded the file, keep local state).
+            // Same generous window: the server verifies the assembled file before answering.
             var finalResp = new byte[10];
-            await s.ReadExactAsync(finalResp, 0, 10, ct).ConfigureAwait(false);
+            LongReadWindow(s, true);
+            try
+            {
+                await s.ReadExactAsync(finalResp, 0, 10, ct).ConfigureAwait(false);
+            }
+            finally { LongReadWindow(s, false); }
             if (finalResp[0] != 0x10)
                 throw new InvalidDataException(string.Format("Unexpected resume response type: {0}", finalResp[0]));
             if (finalResp[9] == 3)
             {
+                // Same self-healing as the first response: the digest we declared is the
+                // suspect, so forget it and let the retry re-read the file.
+                FileHashCache.ForClient.Remove(filePath);
                 cb.RaiseLog(L.C_VerifyFailed(fileName));
                 cb.RaiseError(L.C_VerifyFailed(fileName));
                 return;
@@ -2668,6 +3084,18 @@ namespace TrFileTransfer
             // Success — delete resume state
             ResumeState.Delete(sessionId);
             cb.RaiseComplete();
+        }
+
+        /// <summary>Milliseconds a peer may stay silent while it is doing work we asked for
+        /// (hashing what it already holds, verifying an assembled file) before we give up.
+        /// Its own payload stalls are still caught by the normal 30s socket timeout.</summary>
+        public const int LongReadWindowMs = 300000;
+
+        /// <summary>Widens (on) or restores (off) the socket read timeout around a wait for the
+        /// peer's verdict. Streams without a read timeout — TCP, and the test doubles — ignore it.</summary>
+        private static void LongReadWindow(IWireStream s, bool on)
+        {
+            s.SetReadTimeoutMs(on ? LongReadWindowMs : 30000);
         }
 
         /// <summary>Streams file bytes from fileOffset (sendSize bytes) followed by the SHA256 of what was sent.</summary>
@@ -2741,4 +3169,426 @@ namespace TrFileTransfer
     }
 
     #endregion
+
+    /// <summary>Pre-computed 0x04 manifest: the file list, their sizes and per-file SHA256.
+    /// Built by <see cref="ClientWire.BuildFolderManifest"/> before the connection opens.</summary>
+    public sealed class FolderSendManifest
+    {
+        public string FolderName;
+        public string FolderPath;
+        public string[] Files;
+        public string[] RelativePaths;
+        public long[] Sizes;
+        public byte[][] Hashes;
+        public long TotalBytes;
+    }
+
+    /// <summary>
+    /// Digest cache for files on disk, keyed by full path and validated by (size, mtime).
+    /// Both sides need it: the server re-verifies files it already holds (0x04 checks its whole
+    /// corpus on every sync, 0x00/0x03 dedup compares against files on disk), and the client
+    /// re-hashes its own files (0x04 manifest, 0x03 full hash). Without it every run re-reads
+    /// everything — slow, and on UDT long enough to outlast the peer's 30s receive timeout.
+    /// A digest is recorded whenever the file is hashed and whenever the app itself produced
+    /// the file and knows the digest, so a repeat run hits the cache right away.
+    /// Trust is bounded on purpose:
+    ///  · an entry older than MaxAgeDays is ignored, forcing a real re-hash (periodic refresh);
+    ///  · Strict ignores the cache entirely, for anyone who does not want to rely on filesystem
+    ///    metadata at all — the only way to *prove* the content is to read it.
+    /// The key assumes a rewrite moves the timestamp, which is true for anything written through
+    /// the filesystem; the measured window for an in-place rewrite landing in the same tick is
+    /// sub-millisecond, and a tool that restores timestamps restores the *source* file's time,
+    /// which does not match the time recorded here. A false "same" is the only harmful direction
+    /// (a skipped re-verify), and it is what MaxAgeDays/Strict are for.
+    /// Persistence is an append-only journal: entries are appended as they are learned, the
+    /// newest line per path wins on load, and the journal is rewritten when it outgrows
+    /// MaxJournalBytes or when a load finds it bloated. Two instances may append at once — a
+    /// torn line is ignored on load, and the cost of losing one entry is a single re-hash.
+    /// </summary>
+    public sealed class FileHashCache
+    {
+        /// <summary>Entries kept per generation (two generations are held, see Insert).</summary>
+        public int MaxEntriesPerGeneration = 25000;
+
+        /// <summary>Days an entry is trusted before the file is re-read and re-hashed.
+        /// 0 = trust forever.</summary>
+        public int MaxAgeDays = 7;
+
+        /// <summary>True = never answer from the cache; every file is read and hashed.
+        /// Set from Config "SyncVerifyContent".</summary>
+        public bool Strict;
+
+        /// <summary>Journal size that triggers a rewrite (entries are ~150 bytes each).
+        /// An instance field so tests can force the rewrite with a tiny journal.</summary>
+        public long MaxJournalBytes = 8 * 1024 * 1024;
+
+        private sealed class Entry
+        {
+            public long Size;
+            public long MTimeTicks;
+            public long StoredTicks;
+            public byte[] Hash;
+        }
+
+        private readonly object _rotateLock = new object();
+        private readonly string _journalPath;
+        private long _journalBytes;
+        private ConcurrentDictionary<string, Entry> _current = NewMap();
+        private ConcurrentDictionary<string, Entry> _previous = NewMap();
+
+        /// <summary>The running instance's caches: the client hashes local files, the server
+        /// hashes the files it holds. Journal path null keeps a cache in memory only.</summary>
+        public static readonly FileHashCache ForClient = new FileHashCache(JournalPath("hash-cache-client.txt"));
+        public static readonly FileHashCache ForServer = new FileHashCache(JournalPath("hash-cache-server.txt"));
+
+        private static string JournalPath(string fileName)
+        {
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "TrFileTransfer", fileName);
+        }
+
+        /// <summary>Creates a cache, loading what a previous run left in the journal.</summary>
+        public FileHashCache(string journalPath)
+        {
+            _journalPath = journalPath;
+            if (journalPath != null)
+            {
+                try { Directory.CreateDirectory(Path.GetDirectoryName(journalPath)); } catch { }
+            }
+            Load();
+        }
+
+        /// <summary>Adopts the Config policy (Config "SyncVerifyContent" = byte-for-byte mode,
+        /// "HashCacheDays" = entry lifetime). Called where the option is promised to take
+        /// effect: server start, and every client send.</summary>
+        public void ApplyConfig()
+        {
+            Strict = Config.GetBool("SyncVerifyContent", false);
+            MaxAgeDays = Math.Max(0, Config.GetInt("HashCacheDays", 7));
+        }
+
+        private static ConcurrentDictionary<string, Entry> NewMap()
+        {
+            // Windows paths are case-insensitive — two spellings of one file must not
+            // end up as two entries with different digests.
+            return new ConcurrentDictionary<string, Entry>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        /// <summary>Number of remembered digests (both generations).</summary>
+        public int Count { get { return _current.Count + _previous.Count; } }
+
+        /// <summary>Reads a file's (size, mtime) cache key; false when it cannot be stat'ed
+        /// (missing, unreadable) — the caller then treats the file as unverifiable.</summary>
+        public static bool Stat(string path, out long size, out long mtimeTicks)
+        {
+            size = 0;
+            mtimeTicks = 0;
+            try
+            {
+                var fi = new FileInfo(path);
+                if (!fi.Exists) return false;
+                size = fi.Length;
+                mtimeTicks = fi.LastWriteTimeUtc.Ticks;
+                return true;
+            }
+            catch (IOException) { return false; }
+            catch (UnauthorizedAccessException) { return false; }
+        }
+
+        /// <summary>Answers "does the file at path hash to expected?" from an earlier pass when
+        /// the file still carries the recorded (size, mtime) and the entry is still fresh.
+        /// Returns false when no usable entry exists — the caller must hash the file itself;
+        /// on true, matches carries the verdict (a remembered digest that differs from
+        /// expected IS the answer, not a miss).</summary>
+        public bool TryMatch(string path, long size, long mtimeTicks, byte[] expected, out bool matches)
+        {
+            matches = false;
+            byte[] hash;
+            if (!TryGet(path, size, mtimeTicks, out hash))
+                return false;
+            matches = Utils.ConstantTimeEquals(hash, expected);
+            return true;
+        }
+
+        /// <summary>Returns the file's SHA256, reading it only when the cache holds no fresh
+        /// entry for the file's current (size, mtime). loggingFirst logs while the pass is
+        /// running (a single file) rather than after it; computed reports whether the file
+        /// actually had to be read. Blocking — call it on a worker thread. Honours ct between
+        /// read blocks.</summary>
+        public byte[] GetOrCompute(string filePath, WireCallbacks cb, bool loggingFirst, out bool computed, CancellationToken ct = default(CancellationToken))
+        {
+            long size, mtime;
+            bool statted = Stat(filePath, out size, out mtime);
+            computed = false;
+            byte[] hash;
+            if (statted && TryGet(filePath, size, mtime, out hash))
+                return hash;
+
+            if (loggingFirst && cb != null)
+                cb.RaiseLog(L.C_ComputingFullHash(Path.GetFileName(filePath)));
+            computed = true;
+            hash = ClientWire.ComputeFileHash(filePath, ct);
+            if (statted)
+            {
+                // StoreIfUnchanged also re-stats, so a file edited while it was being read
+                // is not remembered as if the digest described what is on disk now.
+                StoreIfUnchanged(filePath, hash, size, mtime);
+            }
+            return hash;
+        }
+
+        /// <summary>Returns the remembered digest for the file's current (size, mtime), or
+        /// false when nothing trustworthy is recorded (never hashed, aged out of the TTL, or
+        /// byte-for-byte mode). This is what an integrity scan compares a fresh hash against.</summary>
+        public bool TryGetDigest(string path, long size, long mtimeTicks, out byte[] hash)
+        {
+            return TryGet(path, size, mtimeTicks, out hash);
+        }
+
+        /// <summary>True when the file's current (size, mtime) is already known to this cache —
+        /// i.e. what is on disk is a complete version of something (see the 0x04 resume scan,
+        /// which uses this to tell a partial transfer from a replaced file).</summary>
+        public bool Knows(string path, long size, long mtimeTicks)
+        {
+            byte[] hash;
+            return TryGet(path, size, mtimeTicks, out hash);
+        }
+
+        private bool TryGet(string path, long size, long mtimeTicks, out byte[] hash)
+        {
+            hash = null;
+            if (Strict) return false; // byte-for-byte mode: nothing short of reading proves it
+            Entry e;
+            if (_current.TryGetValue(path, out e) || _previous.TryGetValue(path, out e))
+            {
+                if (e.Size == size && e.MTimeTicks == mtimeTicks)
+                {
+                    if (MaxAgeDays > 0 && DateTime.UtcNow.Ticks - e.StoredTicks > TimeSpan.TicksPerDay * MaxAgeDays)
+                        return false; // stale: re-read it and the entry refreshes itself
+                    // Promote: a file that keeps being asked about stays in the live
+                    // generation, so the periodic rotation drops the coldest entries.
+                    _current[path] = e;
+                    hash = e.Hash;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>Records the digest of a file that was just written or read to completion;
+        /// keys it on the file's current (size, mtime), so call it after the stream is closed.</summary>
+        public void Store(string path, byte[] hash)
+        {
+            long size, mtime;
+            if (!Stat(path, out size, out mtime)) return;
+            Insert(path, size, mtime, hash);
+        }
+
+        /// <summary>Records a digest computed from a read that began when the file carried
+        /// (sizeBefore, mtimeBefore); dropped when the file changed since — a digest must
+        /// never be remembered for content the pass did not actually see in full.</summary>
+        public void StoreIfUnchanged(string path, byte[] hash, long sizeBefore, long mtimeBefore)
+        {
+            long size, mtime;
+            if (!Stat(path, out size, out mtime)) return;
+            if (size != sizeBefore || mtime != mtimeBefore) return;
+            Insert(path, size, mtime, hash);
+        }
+
+        /// <summary>Forgets a file's digest. Used when the peer just contradicted it (a
+        /// full-hash check failed), so the next attempt reads the file instead of trusting
+        /// an entry that may be describing content from before an unseen change.</summary>
+        public void Remove(string path)
+        {
+            Entry removed;
+            _current.TryRemove(path, out removed);
+            _previous.TryRemove(path, out removed);
+        }
+
+        private void Insert(string path, long size, long mtime, byte[] hash)
+        {
+            if (_current.Count >= Math.Max(1, MaxEntriesPerGeneration))
+            {
+                lock (_rotateLock)
+                {
+                    if (_current.Count >= Math.Max(1, MaxEntriesPerGeneration))
+                    {
+                        // Retire a whole generation instead of evicting entry by entry:
+                        // entries still in use are promoted back by TryGet, so what
+                        // disappears is whatever went two generations untouched.
+                        _previous = _current;
+                        _current = NewMap();
+                    }
+                }
+            }
+            var entry = new Entry { Size = size, MTimeTicks = mtime, StoredTicks = DateTime.UtcNow.Ticks, Hash = hash };
+            _current[path] = entry;
+            Persist(path, entry);
+        }
+
+        // ==================== journal ====================
+
+        /// <summary>Appends one entry to the journal. A cache that cannot persist still
+        /// works in memory, so every failure here is swallowed.</summary>
+        private void Persist(string path, Entry entry)
+        {
+            if (_journalPath == null) return;
+            try
+            {
+                // FormatJournalLine adds the checksum — "|" cannot appear in a Windows path,
+                // so the separators are unambiguous, and the checksum makes a torn or
+                // overwritten line (a crash mid-append, two instances writing at once) fail
+                // to parse instead of being read back as a digest for the wrong file.
+                string line = FormatJournalLine(path, entry.Size, entry.MTimeTicks, entry.StoredTicks, entry.Hash);
+                byte[] bytes = System.Text.Encoding.UTF8.GetBytes(line);
+                // FileShare.ReadWrite so two instances can append to the same journal
+                using (var fs = new FileStream(_journalPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+                    fs.Write(bytes, 0, bytes.Length);
+                _journalBytes += bytes.Length;
+            }
+            catch { }
+            CompactIfBloated();
+        }
+
+        private void Load()
+        {
+            if (_journalPath == null) return;
+            try
+            {
+                if (!File.Exists(_journalPath)) return;
+                foreach (var line in File.ReadAllLines(_journalPath, System.Text.Encoding.UTF8))
+                {
+                    _journalBytes += line.Length + 2;
+                    var parts = line.Split('|');
+                    if (parts.Length != 6) continue; // torn line or a pre-checksum journal
+                    string body = parts[0] + "|" + parts[1] + "|" + parts[2] + "|" + parts[3] + "|" + parts[4];
+                    if (!string.Equals(LineChecksum(body), parts[5], StringComparison.Ordinal)) continue;
+                    long size, mtime, stored;
+                    byte[] hash = FromHex(parts[4]);
+                    if (hash == null) continue;
+                    if (!long.TryParse(parts[1], out size)) continue;
+                    if (!long.TryParse(parts[2], out mtime)) continue;
+                    if (!long.TryParse(parts[3], out stored)) continue;
+                    // Newest line wins: a later append for the same path supersedes
+                    _current[parts[0]] = new Entry { Size = size, MTimeTicks = mtime, StoredTicks = stored, Hash = hash };
+                }
+                TrimToCapacity();
+            }
+            catch { }
+            CompactIfBloated();
+        }
+
+        /// <summary>Caps what a long-lived journal can pull into memory: keeps the newest
+        /// entries (each carries the time it was learned). Internal so tests can exercise
+        /// the bound without writing a 50k-entry journal.</summary>
+        internal void TrimToCapacity()
+        {
+            int cap = Math.Max(1, MaxEntriesPerGeneration) * 2;
+            if (_current.Count <= cap) return;
+            var all = new System.Collections.Generic.List<System.Collections.Generic.KeyValuePair<string, Entry>>(_current);
+            all.Sort(delegate(System.Collections.Generic.KeyValuePair<string, Entry> a, System.Collections.Generic.KeyValuePair<string, Entry> b)
+            {
+                return b.Value.StoredTicks.CompareTo(a.Value.StoredTicks);
+            });
+            var keep = NewMap();
+            for (int i = 0; i < cap && i < all.Count; i++)
+                keep[all[i].Key] = all[i].Value;
+            _current = keep;
+            _previous = NewMap();
+        }
+
+        /// <summary>Rewrites the journal with one line per known file when it has grown past
+        /// what the live entries justify (a compact journal needs no rewrite).</summary>
+        private void CompactIfBloated()
+        {
+            if (_journalPath == null) return;
+            long liveBytes = (long)Count * 160;
+            if (_journalBytes <= MaxJournalBytes && _journalBytes <= liveBytes * 2 + 4096)
+                return;
+
+            long written = 0;
+            try
+            {
+                var sb = new System.Text.StringBuilder();
+                foreach (var kv in _current)
+                    AppendLine(sb, kv.Key, kv.Value);
+                foreach (var kv in _previous)
+                {
+                    if (!_current.ContainsKey(kv.Key))
+                        AppendLine(sb, kv.Key, kv.Value);
+                }
+                byte[] bytes = System.Text.Encoding.UTF8.GetBytes(sb.ToString());
+                written = bytes.Length;
+                string tmp = _journalPath + ".tmp";
+                File.WriteAllBytes(tmp, bytes);
+                // Another instance appending between our read and this swap loses those
+                // lines; the cache is advisory, so the cost is one re-hash.
+                if (File.Exists(_journalPath)) File.Replace(tmp, _journalPath, null);
+                else File.Move(tmp, _journalPath);
+            }
+            catch
+            {
+                // Leave the journal as it is; the next append keeps appending to it.
+                written = 0;
+            }
+            _journalBytes = written;
+        }
+
+        private static void AppendLine(System.Text.StringBuilder sb, string path, Entry entry)
+        {
+            sb.Append(FormatJournalLine(path, entry.Size, entry.MTimeTicks, entry.StoredTicks, entry.Hash));
+        }
+
+        /// <summary>One journal line: body|checksum. Internal so tests can craft valid,
+        /// torn and tampered lines without re-implementing the format.</summary>
+        internal static string FormatJournalLine(string path, long size, long mtimeTicks, long storedTicks, byte[] hash)
+        {
+            string body = path + "|" + size + "|" + mtimeTicks + "|" + storedTicks + "|" + ToHex(hash);
+            return body + "|" + LineChecksum(body) + "\r\n";
+        }
+
+        /// <summary>FNV-1a over the line's body. This is corruption detection, not
+        /// authentication: the journal is a local file, and the only adversaries are a
+        /// half-written line, a stray byte and two instances appending at once.</summary>
+        private static string LineChecksum(string body)
+        {
+            uint hash = 2166136261u;
+            for (int i = 0; i < body.Length; i++)
+            {
+                hash ^= body[i];
+                hash *= 16777619u;
+            }
+            return hash.ToString("x8");
+        }
+
+        private static string ToHex(byte[] bytes)
+        {
+            var sb = new System.Text.StringBuilder(bytes.Length * 2);
+            for (int i = 0; i < bytes.Length; i++)
+                sb.Append(bytes[i].ToString("x2"));
+            return sb.ToString();
+        }
+
+        private static byte[] FromHex(string text)
+        {
+            if (text == null || text.Length != 64) return null;
+            var bytes = new byte[32];
+            for (int i = 0; i < 32; i++)
+            {
+                int hi = HexVal(text[i * 2]);
+                int lo = HexVal(text[i * 2 + 1]);
+                if (hi < 0 || lo < 0) return null;
+                bytes[i] = (byte)((hi << 4) | lo);
+            }
+            return bytes;
+        }
+
+        private static int HexVal(char c)
+        {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        }
+    }
 }

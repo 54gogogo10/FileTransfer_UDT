@@ -325,7 +325,7 @@ namespace TrFileTransfer
                     string fArg;
                     if (args.TryGetValue("f", out fArg))
                     {
-                        await ServeFileAsync(ns, fArg, peer, ct).ConfigureAwait(false);
+                        await ServeFileAsync(ns, fArg, peer, headers, ct).ConfigureAwait(false);
                     }
                     else
                     {
@@ -882,7 +882,8 @@ namespace TrFileTransfer
             return kept.ToString();
         }
 
-        private async Task ServeFileAsync(NetworkStream ns, string rawRel, string peer, CancellationToken ct)
+        private async Task ServeFileAsync(NetworkStream ns, string rawRel, string peer,
+            Dictionary<string, string> headers, CancellationToken ct)
         {
             string full = ResolveSafe(rawRel);
             if (full == null || !File.Exists(full))
@@ -901,22 +902,90 @@ namespace TrFileTransfer
             if (handler != null)
                 handler("[HTTP] " + peer + " " + (inline ? "preview" : "download") + ": " + name);
 
-            byte[] head = Encoding.ASCII.GetBytes(
-                "HTTP/1.1 200 OK\r\n" +
-                "Content-Type: " + mime + "\r\n" +
-                "Content-Length: " + new FileInfo(full).Length + "\r\n" +
-                "Content-Disposition: " + (inline ? "inline" : "attachment") +
-                "; filename=\"" + SanitizeAsciiFallback(name) + "\"; filename*=UTF-8''" + Uri.EscapeDataString(name) + "\r\n" +
-                "Connection: close\r\n\r\n");
+            long total = new FileInfo(full).Length;
+            long rangeStart = 0, rangeEnd = total - 1;
+            bool isRange = false, rangeInvalid = false;
+            string rangeHeader;
+            if (headers.TryGetValue("Range", out rangeHeader) && total > 0)
+            {
+                // Single range only (browsers resume with one); "bytes=start-end",
+                // "bytes=start-" (to EOF) or "bytes=-suffix" (last N bytes)
+                string spec = rangeHeader.Trim();
+                if (spec.StartsWith("bytes=", StringComparison.OrdinalIgnoreCase)) spec = spec.Substring(6);
+                int dash = spec.IndexOf('-');
+                string first = dash >= 0 ? spec.Substring(0, dash).Trim() : spec.Trim();
+                string second = dash >= 0 ? spec.Substring(dash + 1).Trim() : "";
+                long start, end;
+                if (first.Length == 0 && long.TryParse(second, out end) && end > 0)
+                {
+                    // suffix form: last end bytes
+                    rangeStart = total > end ? total - end : 0;
+                    rangeEnd = total - 1;
+                    isRange = rangeStart <= rangeEnd;
+                }
+                else if (long.TryParse(first, out start) && start >= 0 && start < total)
+                {
+                    rangeStart = start;
+                    if (second.Length == 0 || !long.TryParse(second, out end) || end >= total)
+                        rangeEnd = total - 1;
+                    else
+                        rangeEnd = end;
+                    isRange = rangeStart <= rangeEnd;
+                }
+                else
+                {
+                    rangeInvalid = true;
+                }
+            }
+
+            if (rangeInvalid)
+            {
+                byte[] bad = Encoding.ASCII.GetBytes(
+                    "HTTP/1.1 416 Range Not Satisfiable\r\n" +
+                    "Content-Range: bytes */" + total + "\r\n" +
+                    "Content-Length: 0\r\nConnection: close\r\n\r\n");
+                await ns.WriteAsync(bad, 0, bad.Length, ct).ConfigureAwait(false);
+                return;
+            }
+
+            byte[] head;
+            if (isRange)
+            {
+                head = Encoding.ASCII.GetBytes(
+                    "HTTP/1.1 206 Partial Content\r\n" +
+                    "Content-Type: " + mime + "\r\n" +
+                    "Content-Length: " + (rangeEnd - rangeStart + 1) + "\r\n" +
+                    "Content-Range: bytes " + rangeStart + "-" + rangeEnd + "/" + total + "\r\n" +
+                    "Accept-Ranges: bytes\r\n" +
+                    "Content-Disposition: " + (inline ? "inline" : "attachment") +
+                    "; filename=\"" + SanitizeAsciiFallback(name) + "\"; filename*=UTF-8''" + Uri.EscapeDataString(name) + "\r\n" +
+                    "Connection: close\r\n\r\n");
+            }
+            else
+            {
+                head = Encoding.ASCII.GetBytes(
+                    "HTTP/1.1 200 OK\r\n" +
+                    "Content-Type: " + mime + "\r\n" +
+                    "Content-Length: " + total + "\r\n" +
+                    "Accept-Ranges: bytes\r\n" +
+                    "Content-Disposition: " + (inline ? "inline" : "attachment") +
+                    "; filename=\"" + SanitizeAsciiFallback(name) + "\"; filename*=UTF-8''" + Uri.EscapeDataString(name) + "\r\n" +
+                    "Connection: close\r\n\r\n");
+            }
             await ns.WriteAsync(head, 0, head.Length, ct).ConfigureAwait(false);
 
             using (var fs = new FileStream(full, FileMode.Open, FileAccess.Read, FileShare.Read,
                 65536, FileOptions.SequentialScan))
             {
+                if (isRange) fs.Seek(rangeStart, SeekOrigin.Begin);
+                long left = isRange ? rangeEnd - rangeStart + 1 : total;
                 var buf = new byte[65536];
                 int n;
-                while ((n = await fs.ReadAsync(buf, 0, buf.Length, ct).ConfigureAwait(false)) > 0)
+                while (left > 0 && (n = await fs.ReadAsync(buf, 0, (int)Math.Min(buf.Length, left), ct).ConfigureAwait(false)) > 0)
+                {
                     await ns.WriteAsync(buf, 0, n, ct).ConfigureAwait(false);
+                    left -= n;
+                }
             }
         }
 

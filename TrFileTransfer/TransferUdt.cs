@@ -352,6 +352,9 @@ namespace TrFileTransfer
         {
             _cts = new CancellationTokenSource();
             ServerResumeStore.CleanupStale(7); // drop orphaned resume sessions from clients that never returned
+            // Receive-option policy (byte-for-byte verification, digest lifetime) applies from
+            // here on — the options dialog promises these take effect on the next server start.
+            FileHashCache.ForServer.ApplyConfig();
             UdtDll.EnsureExtracted();
 
             // The save directory may legitimately not exist yet (date-archive mode
@@ -842,6 +845,9 @@ namespace TrFileTransfer
 
         private async Task UdtConnect(CancellationToken ct)
         {
+            // Mirror of the TCP-side guard: a cancel that landed while the hash/manifest
+            // pass was still finishing must not walk into connect with a dead token.
+            ct.ThrowIfCancellationRequested();
             _socket = UdtNative.udt_socket(UdtNative.AF_INET, UdtNative.SOCK_STREAM, 0);
             if (_socket < 0)
                 throw new Exception("Failed to create UDT socket");
@@ -877,8 +883,18 @@ namespace TrFileTransfer
         /// </summary>
         private async Task<IWireStream> OpenAndAuthenticateAsync(CancellationToken ct)
         {
+            return (await OpenAndAuthenticateResultAsync(ct, false).ConfigureAwait(false)).Stream;
+        }
+
+        /// <summary>Same, returning the full negotiation result. wantPerFileSkip offers the
+        /// 0x0A capability frame so a 0x04 body can skip files the receiver already holds;
+        /// a peer that drops it costs one reconnect without the offer (budget 3 attempts —
+        /// encryption, compression and skip can each be discovered independently).</summary>
+        private async Task<AuthResult> OpenAndAuthenticateResultAsync(CancellationToken ct, bool wantPerFileSkip)
+        {
             bool allowEncrypt = EncryptionEnabled;
             bool allowCompress = CompressionEnabled;
+            int maxAttempts = wantPerFileSkip ? 3 : 2;
             for (int attempt = 0; ; attempt++)
             {
                 await UdtConnect(ct).ConfigureAwait(false);
@@ -886,11 +902,11 @@ namespace TrFileTransfer
                 AuthResult auth;
                 try
                 {
-                    // Short receive window: an older peer that does not know 0x07/0x08
+                    // Short receive window: an older peer that does not know 0x07/0x08/0x0A
                     // never answers, and waiting out the full 30s timeout would feel broken
                     UdtNative.SetTimeout(_socket, 8000, 30000);
                     auth = await ClientWire.AuthenticateAsync(raw, PairingCode, allowEncrypt, allowCompress, _cb, ct,
-                        EncryptionDowngradeAllowed).ConfigureAwait(false);
+                        EncryptionDowngradeAllowed, wantPerFileSkip).ConfigureAwait(false);
                     UdtNative.SetTimeout(_socket, 30000, 30000);
                 }
                 catch
@@ -898,7 +914,7 @@ namespace TrFileTransfer
                     raw.Dispose();
                     throw;
                 }
-                if (auth.NeedNoCompressionFallback && allowCompress && attempt < 2)
+                if (auth.NeedNoCompressionFallback && allowCompress && attempt < maxAttempts)
                 {
                     raw.Dispose();
                     try { UdtNative.udt_close(_socket); } catch { }
@@ -907,7 +923,7 @@ namespace TrFileTransfer
                     _cb.RaiseLog(L.C_CompressFallback);
                     continue;
                 }
-                if (auth.NeedPlainFallback && allowEncrypt && attempt < 2)
+                if (auth.NeedPlainFallback && allowEncrypt && attempt < maxAttempts)
                 {
                     raw.Dispose();
                     try { UdtNative.udt_close(_socket); } catch { }
@@ -918,7 +934,15 @@ namespace TrFileTransfer
                     _cb.RaiseLog(L.C_EncryptFallback);
                     continue;
                 }
-                return auth.Stream;
+                if (auth.NeedNoPerFileSkipFallback && wantPerFileSkip && attempt < maxAttempts)
+                {
+                    raw.Dispose();
+                    try { UdtNative.udt_close(_socket); } catch { }
+                    _socket = -1;
+                    wantPerFileSkip = false;
+                    continue;
+                }
+                return auth;
             }
         }
 
@@ -949,18 +973,36 @@ namespace TrFileTransfer
 
         private async Task SendFolderResumableInternal(Guid sessionId, CancellationToken ct, bool keepState)
         {
-            using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
+            // Hash the whole folder before connecting, not after: the connect-then-hash order
+            // left the server idle through the hash pass, and a large enough folder tripped its
+            // 30s receive timeout, which dropped the connection before the transfer could start.
+            var manifest = await Task.Run(
+                delegate { return ClientWire.BuildFolderManifest(_filePath, _cb, ct); }, ct).ConfigureAwait(false);
+            if (manifest == null) return;
+            var auth = await OpenAndAuthenticateResultAsync(ct, wantPerFileSkip: true).ConfigureAwait(false);
+            using (var ws = auth.Stream)
             {
-                await ClientWire.SendFolderResumableAsync(ws, _filePath, sessionId,
-                    _serverIp, _port, true, _bufferSize, _limiter, _cb, ct, keepState).ConfigureAwait(false);
+                await ClientWire.SendFolderResumableAsync(ws, manifest, sessionId,
+                    _serverIp, _port, true, _bufferSize, _limiter, _cb, ct, keepState, auth.PerFileSkip).ConfigureAwait(false);
             }
         }
 
         private async Task SendResumableUdtInternal(Guid sessionId, CancellationToken ct, bool verifyHash)
         {
+            // Same reason as SendFolderResumableInternal for hashing before the connect;
+            // the cache keeps a retry from re-reading the file a second and third time.
+            byte[] fullHash = null;
+            if (verifyHash)
+            {
+                fullHash = await Task.Run(delegate
+                {
+                    bool computed;
+                    return FileHashCache.ForClient.GetOrCompute(_filePath, _cb, true, out computed, ct);
+                }, ct).ConfigureAwait(false);
+            }
             using (var ws = await OpenAndAuthenticateAsync(ct).ConfigureAwait(false))
             {
-                await ClientWire.SendResumableAsync(ws, _filePath, sessionId, verifyHash,
+                await ClientWire.SendResumableAsync(ws, _filePath, sessionId, fullHash,
                     _serverIp, _port, true, _bufferSize, _limiter, _cb, ct).ConfigureAwait(false);
             }
         }

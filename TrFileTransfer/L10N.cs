@@ -337,6 +337,18 @@ namespace TrFileTransfer
                 ? string.Format("正在计算 {0} 个文件的校验值...", count)
                 : string.Format("Computing hashes for {0} files...", count);
         }
+        public static string ManifestHashCache(object reused, object computed)
+        {
+            return IsChinese
+                ? string.Format("校验值缓存：{0} 个文件沿用上次结果，{1} 个重新计算。", reused, computed)
+                : string.Format("Hash cache: {0} files reused, {1} recomputed.", reused, computed);
+        }
+        public static string C_PerFileSkip(object skipped, object sent)
+        {
+            return IsChinese
+                ? string.Format("对端已持有 {0} 个文件（跳过），需发送 {1} 个。", skipped, sent)
+                : string.Format("Peer already holds {0} file(s) (skipped); sending {1}.", skipped, sent);
+        }
         public static string FolderResumeStart(object index, object count, object offset)
         {
             return IsChinese
@@ -688,17 +700,28 @@ namespace TrFileTransfer
                       "  TrFileTransfer send --ip <IP> --port <端口> [--tcp|--udt] --file <路径|--folder <路径>\r\n" +
                       "        [--code <配对码>] [--limit <KB/s>] [--srcport <端口>] [--nocompress] [--noencrypt]\r\n" +
                       "  TrFileTransfer recv --port <端口> [--out <目录>] [--tcp|--udt] [--code <配对码>] [--count <N>]\r\n" +
+                      "  TrFileTransfer sync --folder <目录> --ip <IP> --port <端口> [--tcp|--udt]\r\n" +
+                      "        [--code <配对码>] [--limit <KB/s>] [--srcport <端口>] [--nocompress] [--noencrypt]\r\n" +
+                      "  TrFileTransfer verify --dir <目录>\r\n" +
                       "\r\n" +
                       "send: 发送一个文件或文件夹后退出（退出码 0=成功）。\r\n" +
                       "recv: 接收直到 Ctrl+C，或收到 --count 个文件后退出。\r\n" +
+                      "sync: 增量同步一个文件夹（只传差异），适合任务计划程序定时备份。\r\n" +
+                      "verify: 用本地校验缓存核对目录中文件是否与接收时一致（发现改动退出码为 1）。\r\n" +
                       "默认协议 TCP；--nocompress/--noencrypt 关闭压缩/加密协商。"
                     : "Usage:\r\n" +
                       "  TrFileTransfer send --ip <IP> --port <port> [--tcp|--udt] --file <path|--folder <path>\r\n" +
                       "        [--code <pairing code>] [--limit <KB/s>] [--srcport <port>] [--nocompress] [--noencrypt]\r\n" +
                       "  TrFileTransfer recv --port <port> [--out <dir>] [--tcp|--udt] [--code <pairing code>] [--count <N>]\r\n" +
+                      "  TrFileTransfer sync --folder <dir> --ip <IP> --port <port> [--tcp|--udt]\r\n" +
+                      "        [--code <pairing code>] [--limit <KB/s>] [--srcport <port>] [--nocompress] [--noencrypt]\r\n" +
+                      "  TrFileTransfer verify --dir <dir>\r\n" +
                       "\r\n" +
                       "send: sends one file or folder, then exits (exit code 0 = success).\r\n" +
                       "recv: receives until Ctrl+C, or until --count files have arrived.\r\n" +
+                      "sync: incremental folder sync (differences only) — for scheduled backups.\r\n" +
+                      "verify: checks the directory's files against the local digest cache\r\n" +
+                      "  (exit code 1 when any file no longer matches its received digest).\r\n" +
                       "TCP is the default protocol; --nocompress/--noencrypt disable those negotiations.";
             }
         }
@@ -738,6 +761,58 @@ namespace TrFileTransfer
                 ? string.Format("已收到 {0} 个文件，退出。", n)
                 : string.Format("Received {0} file(s); exiting.", n);
         }
+        public static string CliSyncStart(object path, object ip, object port, object proto)
+        {
+            return IsChinese
+                ? string.Format("增量同步：{0} → {1}:{2}（{3}）", path, ip, port, proto)
+                : string.Format("Sync: {0} → {1}:{2} ({3})", path, ip, port, proto);
+        }
+        public static string CliSyncDone(object size, object secs)
+        {
+            return IsChinese
+                ? string.Format("同步完成（{0}，{1:F1}s）", size, secs)
+                : string.Format("Sync complete ({0}, {1:F1}s)", size, secs);
+        }
+        public static string CliVerifyStart(object dir)
+        {
+            return IsChinese
+                ? string.Format("正在校验目录：{0}", dir)
+                : string.Format("Verifying directory: {0}", dir);
+        }
+        public static string CliVerifyChanged(object path)
+        {
+            return IsChinese
+                ? string.Format("与接收时不一致（被改动或损坏）：{0}", path)
+                : string.Format("No longer matches its received digest (edited or corrupt): {0}", path);
+        }
+        public static string CliVerifySummary(object ok, object changed, object unknown, object skipped)
+        {
+            return IsChinese
+                ? string.Format("校验完成：{0} 个一致，{1} 个不一致，{2} 个无记录，{3} 个无法读取。", ok, changed, unknown, skipped)
+                : string.Format("Verify done: {0} ok, {1} changed, {2} unverified, {3} unreadable.", ok, changed, unknown, skipped);
+        }
+
+        // ---- library verify (GUI) ----
+        public static string VerifyBtn { get { return IsChinese ? "校验" : "Verify"; } }
+        public static string LibVerifyTitle { get { return IsChinese ? "文件库校验" : "Library Verify"; } }
+        public static string LibVerifyStart { get { return IsChinese ? "开始校验" : "Start"; } }
+        public static string LibVerifyStop { get { return IsChinese ? "停止" : "Stop"; } }
+        public static string LibVerifyClose { get { return IsChinese ? "关闭" : "Close"; } }
+        public static string LibVerifyIdle
+        {
+            get
+            {
+                return IsChinese
+                    ? "用接收时记下的校验值逐个核对文件，检出事后被改动或损坏的文件。"
+                    : "Re-hashes files and compares against the digests recorded when they were received,\ndetecting files that were edited or corrupted afterwards.";
+            }
+        }
+        public static string LibVerifyCancelled { get { return IsChinese ? "已停止（部分结果未列出）。" : "Stopped (partial results)."; } }
+        public static string LibVerifyAllOk { get { return IsChinese ? "全部与接收时一致。" : "Every file matches its received digest."; } }
+        public static string LibVerifyTagChanged { get { return IsChinese ? "[不一致] " : "[CHANGED] "; } }
+        public static string LibVerifyTagUnverified { get { return IsChinese ? "[无记录] " : "[NO RECORD] "; } }
+        public static string LibVerifyTagSkipped { get { return IsChinese ? "[跳过] " : "[SKIPPED] "; } }
+        public static string LibVerifyDirLabel { get { return IsChinese ? "目录:" : "Directory:"; } }
         public static string C_NoCompletionAck
         {
             get
@@ -921,11 +996,14 @@ namespace TrFileTransfer
             get
             {
                 return IsChinese
-                    ? "设置已保存；分目录/去重/接收限速在下次启动服务器时生效。"
-                    : "Saved; per-device/dedup/receive-limit options apply on the next server start.";
+                    ? "设置已保存；分目录/去重/接收限速/校验缓存在下次启动服务器时生效（逐字节核对同时作用于发送端）。"
+                    : "Saved; per-device/dedup/receive-limit/cache options apply on the next server start (byte-for-byte mode also affects sending).";
             }
         }
         public static string RORecvSpeedLabel { get { return IsChinese ? "接收限速 KB/s (0=不限):" : "Receive limit KB/s (0 = off):"; } }
+        public static string ROVerifyContent { get { return IsChinese ? "同步时逐字节核对（忽略校验缓存，慢）" : "Verify byte-for-byte on sync (ignore the digest cache)"; } }
+        public static string ROHashCacheDaysLabel { get { return IsChinese ? "校验缓存有效期 天 (0=永不过期):" : "Digest cache TTL days (0 = never expire):"; } }
+        public static string ROPairingLengthLabel { get { return IsChinese ? "配对码位数 (4-12):" : "Pairing code digits (4-12):"; } }
 
         // ---- Transfer statistics ----
         public static string StatsBtn { get { return IsChinese ? "统计" : "Stats"; } }

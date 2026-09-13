@@ -22,6 +22,1113 @@ namespace TrFileTransfer.Tests
             RunQr(runner);
             RunStatsStore(runner);
             RunSpeedLimiter(runner);
+            RunClientHashCache(runner);
+            RunFileHashCache(runner);
+            RunHashCancellation(runner);
+            RunLibraryVerifier(runner);
+            RunCli(runner);
+        }
+
+        // ==================== Unit: hash pass cancellation and progress ====================
+
+        private static void RunHashCancellation(TestRunner runner)
+        {
+            runner.Run("ClientWire_ComputeFileHash_CancellationHonoured", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_hcanc_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    string path = Path.Combine(dir, "a.bin");
+                    var content = new byte[8 * 1024 * 1024]; // two buffer fills
+                    new Random(101).NextBytes(content);
+                    File.WriteAllBytes(path, content);
+
+                    var cts = new CancellationTokenSource();
+                    cts.Cancel();
+                    try
+                    {
+                        ClientWire.ComputeFileHash(path, cts.Token);
+                        Assert.True(false, "expected a cancelled hash to throw");
+                    }
+                    catch (OperationCanceledException) { }
+
+                    // Same file, live token: the digest is still the real one
+                    byte[] digest = ClientWire.ComputeFileHash(path, CancellationToken.None);
+                    Assert.True(Utils.ConstantTimeEquals(digest, ClientWire.ComputeFileHash(path)),
+                        "the overload computes the same digest as the plain one");
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+
+            runner.Run("ClientWire_BuildFolderManifest_CancellableMidPass", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_hmanc_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    // First file big enough that hashing it trips the 100ms progress throttle,
+                    // so the cancel lands mid-pass and not before the loop starts
+                    string big = Path.Combine(dir, "big.bin");
+                    var content = new byte[192 * 1024 * 1024];
+                    new Random(102).NextBytes(content);
+                    File.WriteAllBytes(big, content);
+                    File.WriteAllBytes(Path.Combine(dir, "small.bin"), new byte[128]);
+
+                    var cts = new CancellationTokenSource();
+                    var cb = new WireCallbacks();
+                    cb.Progress = delegate { cts.Cancel(); };
+                    try
+                    {
+                        ClientWire.BuildFolderManifest(dir, cb, cts.Token);
+                        Assert.True(false, "expected the hash pass to be cancellable mid-way");
+                    }
+                    catch (OperationCanceledException) { }
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+
+            runner.Run("ClientWire_BuildFolderManifest_HashProgress", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_hmprog_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    long total = 0;
+                    var rnd = new Random(103);
+                    for (int i = 0; i < 3; i++)
+                    {
+                        var content = new byte[96 * 1024 * 1024]; // slow enough to trip the throttle
+                        rnd.NextBytes(content);
+                        File.WriteAllBytes(Path.Combine(dir, "f" + i + ".bin"), content);
+                        total += content.Length;
+                    }
+
+                    var events = new System.Collections.Generic.List<TransferProgress>();
+                    var cb = new WireCallbacks();
+                    cb.Progress = delegate(TransferProgress p)
+                    {
+                        lock (events) events.Add(p);
+                    };
+                    var manifest = ClientWire.BuildFolderManifest(dir, cb, CancellationToken.None);
+                    Assert.True(manifest != null, "manifest built");
+                    Assert.Equal(total, manifest.TotalBytes, "manifest total bytes");
+                    lock (events)
+                    {
+                        Assert.True(events.Count > 0, "at least one hash progress event fired");
+                        Assert.Equal(total, events[events.Count - 1].BytesTransferred, "last event reports the full pass");
+                        Assert.Equal(total, events[events.Count - 1].TotalBytes, "event total matches the folder size");
+                    }
+                    bool computed;
+                    byte[] h = manifest.Hashes[0];
+                    Assert.True(Utils.ConstantTimeEquals(h, ClientWire.ComputeFileHash(manifest.Files[0])),
+                        "manifest digest is the file's real SHA256");
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+        }
+
+        // ==================== Unit: library verifier ====================
+
+        private static void RunLibraryVerifier(TestRunner runner)
+        {
+            runner.Run("LibraryVerifier_Classification", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_lv_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    string ok = Path.Combine(dir, "ok.bin");
+                    string changed = Path.Combine(dir, "changed.bin");
+                    string unknown = Path.Combine(dir, "unknown.bin");
+                    string locked = Path.Combine(dir, "locked.bin");
+                    File.WriteAllBytes(ok, new byte[4096]);
+                    var original = new byte[8192];
+                    new Random(111).NextBytes(original);
+                    File.WriteAllBytes(changed, original);
+                    File.WriteAllBytes(unknown, new byte[2048]);
+                    File.WriteAllBytes(locked, new byte[4096]);
+
+                    var cache = new FileHashCache(null);
+                    cache.Store(ok, ClientWire.ComputeFileHash(ok));
+                    cache.Store(changed, ClientWire.ComputeFileHash(changed));
+                    cache.Store(locked, ClientWire.ComputeFileHash(locked));
+
+                    // In-place corruption: same size, timestamp forced back to what the
+                    // cache recorded — exactly the case a scrub exists to catch
+                    var damaged = new byte[8192];
+                    new Random(112).NextBytes(damaged);
+                    long sz, mt;
+                    FileHashCache.Stat(changed, out sz, out mt);
+                    File.WriteAllBytes(changed, damaged);
+                    File.SetLastWriteTimeUtc(changed, new DateTime(mt));
+
+                    // Hold the lock while the scan runs: a FileShare.None read inside
+                    // Verify fails, which must classify as Skipped, not Changed
+                    VerifyReport report;
+                    using (File.Open(locked, FileMode.Open, FileAccess.Read, FileShare.None))
+                    {
+                        report = LibraryVerifier.Verify(dir, cache, null, CancellationToken.None);
+                    }
+
+                    Assert.Equal(1, report.Verified.Count, "exactly the untouched file verifies");
+                    Assert.True(report.Verified.Contains(ok), "verified file is the right one");
+                    Assert.Equal(1, report.Changed.Count, "the in-place corruption is caught");
+                    Assert.True(report.Changed.Contains(changed), "changed file is the right one");
+                    Assert.Equal(1, report.Unverified.Count, "the never-received file has no record");
+                    Assert.True(report.Unverified.Contains(unknown), "unverified file is the right one");
+                    Assert.Equal(1, report.Skipped.Count, "the locked file is skipped, not judged");
+                    Assert.True(report.Skipped.Contains(locked), "skipped file is the right one");
+                    Assert.Equal(4, report.Total, "every file lands in exactly one bucket");
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+
+            runner.Run("LibraryVerifier_EmptyAndMissingDir", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_lv2_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    var empty = LibraryVerifier.Verify(dir, new FileHashCache(null), null, CancellationToken.None);
+                    Assert.Equal(0, empty.Total, "empty directory scans to nothing");
+                    var missing = LibraryVerifier.Verify(Path.Combine(dir, "nope"), new FileHashCache(null), null, CancellationToken.None);
+                    Assert.Equal(0, missing.Total, "missing directory scans to nothing");
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+        }
+
+        // ==================== Unit: CLI verbs ====================
+
+        // ==================== Unit: pairing code length ====================
+
+        private static void RunCli(TestRunner runner)
+        {
+            runner.Run("Cli_InvocationAndHelp", () =>
+            {
+                Assert.True(Cli.IsCliInvocation(new[] { "send" }), "send is a CLI verb");
+                Assert.True(Cli.IsCliInvocation(new[] { "SYNC" }), "verbs are case-insensitive");
+                Assert.True(Cli.IsCliInvocation(new[] { "verify" }), "verify is a CLI verb");
+                Assert.False(Cli.IsCliInvocation(null), "no args is the GUI");
+                Assert.False(Cli.IsCliInvocation(new[] { "whatever" }), "unknown verb is the GUI");
+                Assert.Equal(0, Cli.Run(new[] { "--help" }), "help exits 0");
+                Assert.Equal(2, Cli.Run(new[] { "sync" }), "sync without required args exits 2 (usage)");
+            });
+
+            runner.Run("WireAuth_GeneratePairingCode_Length", () =>
+            {
+                for (int len = 4; len <= 12; len += 2)
+                {
+                    for (int i = 0; i < 20; i++)
+                    {
+                        string code = WireAuth.GeneratePairingCode(len);
+                        Assert.Equal(len, code.Length, "code honours the requested length");
+                        bool allDigits = true;
+                        foreach (char ch in code)
+                            if (ch < '0' || ch > '9') allDigits = false;
+                        Assert.True(allDigits, "code is digits only");
+                    }
+                }
+                // Out-of-range requests clamp instead of producing garbage
+                Assert.Equal(4, WireAuth.GeneratePairingCode(1).Length, "clamped low");
+                Assert.Equal(12, WireAuth.GeneratePairingCode(50).Length, "clamped high");
+                // Default overload keeps the historic 6-digit shape
+                Assert.Equal(6, WireAuth.GeneratePairingCode().Length, "default stays 6");
+            });
+        }
+
+
+        // ==================== Unit: server-side file digest cache ====================
+
+        private static void RunFileHashCache(TestRunner runner)
+        {
+            runner.Run("FileHashCache_HitsMissesAndInvalidation", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_srvhash_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    string path = Path.Combine(dir, "a.bin");
+                    var content = new byte[32 * 1024];
+                    new Random(21).NextBytes(content);
+                    File.WriteAllBytes(path, content);
+                    byte[] digest = ClientWire.ComputeFileHash(path);
+
+                    var cache = new FileHashCache(null);
+                    long size, mtime;
+                    bool matches;
+                    Assert.True(FileHashCache.Stat(path, out size, out mtime), "stat the file");
+                    Assert.False(cache.TryMatch(path, size, mtime, digest, out matches), "cold cache misses");
+
+                    cache.Store(path, digest);
+                    Assert.True(cache.TryMatch(path, size, mtime, digest, out matches) && matches,
+                        "remembered digest answers a match");
+                    Assert.True(cache.TryMatch(path, size, mtime, new byte[32], out matches) && !matches,
+                        "a remembered digest that differs is a verdict, not a miss");
+
+                    // Rewritten content moves the key → the file must be hashed again
+                    var other = new byte[48 * 1024];
+                    new Random(22).NextBytes(other);
+                    File.WriteAllBytes(path, other);
+                    FileHashCache.Stat(path, out size, out mtime);
+                    Assert.False(cache.TryMatch(path, size, mtime, digest, out matches), "changed file misses");
+
+                    // Same size but a new timestamp is still a miss: content may differ
+                    File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddMinutes(5));
+                    FileHashCache.Stat(path, out size, out mtime);
+                    Assert.False(cache.TryMatch(path, size, mtime, digest, out matches), "touched file misses");
+
+                    // A digest computed from a read the file has since outgrown is not
+                    // remembered — a cache must never answer for bytes it did not see.
+                    cache.StoreIfUnchanged(path, digest, size + 1, mtime);
+                    Assert.False(cache.TryMatch(path, size, mtime, digest, out matches), "stale read is not remembered");
+                    cache.StoreIfUnchanged(path, digest, size, mtime);
+                    Assert.True(cache.TryMatch(path, size, mtime, digest, out matches) && matches, "unchanged read is remembered");
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+
+            runner.Run("FileHashCache_BoundedAcrossGenerations", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_srvbound_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    var cache = new FileHashCache(null);
+                    cache.MaxEntriesPerGeneration = 2;
+
+                    var paths = new string[5];
+                    for (int i = 0; i < paths.Length; i++)
+                    {
+                        paths[i] = Path.Combine(dir, "f" + i + ".bin");
+                        File.WriteAllBytes(paths[i], new byte[512 + i]);
+                        cache.Store(paths[i], ClientWire.ComputeFileHash(paths[i]));
+                    }
+
+                    // Five stores with a generation of two: the oldest two were retired and
+                    // are gone, the two before the newest are still reachable in the
+                    // previous generation, and the total never exceeds two generations.
+                    long size, mtime;
+                    bool matches;
+                    FileHashCache.Stat(paths[0], out size, out mtime);
+                    Assert.False(cache.TryMatch(paths[0], size, mtime, new byte[32], out matches), "oldest entry retired");
+                    FileHashCache.Stat(paths[2], out size, out mtime);
+                    Assert.True(cache.TryMatch(paths[2], size, mtime, new byte[32], out matches), "entry from the previous generation still serves");
+                    Assert.True(cache.Count <= 4, "entries stay within two generations, got " + cache.Count);
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+        }
+
+        // ==================== Unit: client-side digest reuse ====================
+
+        private static void RunClientHashCache(TestRunner runner)
+        {
+            runner.Run("FileHashCache_GetOrComputeReusesUntilFileChanges", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_fhc_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                string path = Path.Combine(dir, "payload.bin");
+                try
+                {
+                    var contentA = new byte[64 * 1024];
+                    new Random(11).NextBytes(contentA);
+                    File.WriteAllBytes(path, contentA);
+
+                    int logCount = 0;
+                    var cb = new WireCallbacks();
+                    cb.Log = delegate(string m) { logCount++; };
+
+                    bool computed;
+                    var cache = new FileHashCache(null);
+                    byte[] first = cache.GetOrCompute(path, cb, true, out computed);
+                    Assert.True(computed, "first pass reads the file");
+                    byte[] second = cache.GetOrCompute(path, cb, true, out computed);
+                    Assert.True(!computed && ReferenceEquals(first, second),
+                        "unchanged file: cached digest reused (a retry must not re-read the file)");
+                    Assert.True(logCount == 1, "unchanged file: hash pass logged once, got " + logCount);
+                    Assert.True(Utils.ConstantTimeEquals(first, ClientWire.ComputeFileHash(path)),
+                        "cached digest is the file's real SHA256");
+
+                    // A digest that no longer describes the file must never be reused
+                    var contentB = new byte[96 * 1024];
+                    new Random(12).NextBytes(contentB);
+                    File.WriteAllBytes(path, contentB);
+                    byte[] third = cache.GetOrCompute(path, cb, true, out computed);
+                    Assert.True(computed, "changed file: digest recomputed");
+                    Assert.True(logCount == 2, "changed file: hash pass logged again, got " + logCount);
+                    Assert.True(Utils.ConstantTimeEquals(third, ClientWire.ComputeFileHash(path)),
+                        "recomputed digest matches the new content");
+                    Assert.True(!Utils.ConstantTimeEquals(first, third), "digests differ after the file changed");
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+
+            runner.Run("FileHashCache_SurvivesRestartAndExpires", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_fhcp_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                string journal = Path.Combine(dir, "journal.txt");
+                string path = Path.Combine(dir, "payload.bin");
+                try
+                {
+                    var content = new byte[16 * 1024];
+                    new Random(13).NextBytes(content);
+                    File.WriteAllBytes(path, content);
+                    byte[] digest = ClientWire.ComputeFileHash(path);
+                    string hex = BitConverter.ToString(digest).Replace("-", "").ToLowerInvariant();
+
+                    long size, mtime;
+                    bool matches;
+                    FileHashCache.Stat(path, out size, out mtime);
+                    new FileHashCache(journal).Store(path, digest);
+                    Assert.True(File.Exists(journal), "journal written");
+
+                    // A fresh instance (a restarted server/client) still knows the digest
+                    var reopened = new FileHashCache(journal);
+                    Assert.True(reopened.TryMatch(path, size, mtime, digest, out matches) && matches,
+                        "digest survives a restart");
+                    Assert.True(reopened.Count >= 1, "entry loaded from the journal, got " + reopened.Count);
+
+                    // Byte-for-byte mode ignores the cache entirely
+                    reopened.Strict = true;
+                    Assert.False(reopened.TryMatch(path, size, mtime, digest, out matches), "strict mode ignores the cache");
+                    reopened.Strict = false;
+
+                    // Entry age drives the TTL: the same line is used when it is fresh and
+                    // ignored once it is older than the limit (the periodic refresh).
+                    string freshJournal = Path.Combine(dir, "fresh.txt");
+                    string staleJournal = Path.Combine(dir, "stale.txt");
+                    File.WriteAllText(freshJournal,
+                        FileHashCache.FormatJournalLine(path, size, mtime, DateTime.UtcNow.Ticks, digest));
+                    File.WriteAllText(staleJournal,
+                        FileHashCache.FormatJournalLine(path, size, mtime, DateTime.UtcNow.AddDays(-30).Ticks, digest));
+                    Assert.True(new FileHashCache(freshJournal).TryMatch(path, size, mtime, digest, out matches),
+                        "entry within the TTL is used");
+                    var expiring = new FileHashCache(staleJournal);
+                    expiring.MaxAgeDays = 7;
+                    Assert.False(expiring.TryMatch(path, size, mtime, digest, out matches),
+                        "entry older than the TTL is ignored, so the file gets re-read");
+
+                    // A journal bloated with superseded lines is rewritten on load, and the
+                    // newest line per path is the one that survives
+                    var bogus = new byte[32];
+                    for (int i = 0; i < bogus.Length; i++) bogus[i] = 0xAB;
+                    var sb = new System.Text.StringBuilder();
+                    for (int i = 0; i < 5000; i++)
+                        sb.Append(FileHashCache.FormatJournalLine(path, size, mtime, DateTime.UtcNow.Ticks, bogus));
+                    sb.Append(FileHashCache.FormatJournalLine(path, size, mtime, DateTime.UtcNow.Ticks, digest));
+                    string bloated = Path.Combine(dir, "bloated.txt");
+                    File.WriteAllText(bloated, sb.ToString());
+                    long before = new FileInfo(bloated).Length;
+                    var compacted = new FileHashCache(bloated);
+                    Assert.True(new FileInfo(bloated).Length * 10 < before,
+                        "bloated journal rewritten on load (was " + before + " bytes)");
+                    Assert.True(compacted.TryMatch(path, size, mtime, digest, out matches) && matches,
+                        "the newest line per path survives compaction");
+                    Assert.True(compacted.TryMatch(path, size, mtime, bogus, out matches) && !matches,
+                        "superseded lines are gone: the remembered digest is the newest one");
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+
+            // Everything the journal can throw at the loader: a torn line, a tampered
+            // digest, junk — must cost a re-hash at worst, and must never produce a digest
+            // that answers for content the pass never saw.
+            runner.Run("FileHashCache_RejectsCorruptJournalLines", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_fhcc_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    string path = Path.Combine(dir, "a.bin");
+                    var content = new byte[8 * 1024];
+                    new Random(14).NextBytes(content);
+                    File.WriteAllBytes(path, content);
+                    byte[] digest = ClientWire.ComputeFileHash(path);
+                    long size, mtime;
+                    FileHashCache.Stat(path, out size, out mtime);
+
+                    string good = FileHashCache.FormatJournalLine(path, size, mtime, DateTime.UtcNow.Ticks, digest);
+                    var bogus = new byte[32];
+                    for (int i = 0; i < bogus.Length; i++) bogus[i] = 0x5A;
+                    string tampered = FileHashCache.FormatJournalLine(path, size, mtime, DateTime.UtcNow.Ticks, bogus);
+
+                    // Journal with nothing but damaged lines: a torn tail, junk, the
+                    // pre-checksum format, and a line whose checksum no longer matches its
+                    // body (what a stray byte or a partial overwrite by a second instance
+                    // looks like). None may load — the caller must re-hash instead.
+                    string damaged = Path.Combine(dir, "damaged.txt");
+                    var bad = new System.Text.StringBuilder();
+                    bad.Append(tampered.TrimEnd('\r', '\n').Substring(0, tampered.TrimEnd('\r', '\n').Length - 8)).Append("\r\n");
+                    bad.Append(good.Substring(0, good.Length / 2));                        // torn (crash mid-append)
+                    bad.Append("not even a line\r\n");                                     // junk
+                    bad.Append(path).Append("|1|2|3|").Append(new string('0', 64)).Append("\r\n"); // no checksum field
+                    File.WriteAllText(damaged, bad.ToString());
+
+                    long fileSize, fileMtime;
+                    bool matches;
+                    Assert.True(FileHashCache.Stat(path, out fileSize, out fileMtime), "stat the file");
+                    var rejected = new FileHashCache(damaged);
+                    Assert.True(rejected.Count == 0, "no damaged line loads, got " + rejected.Count);
+                    Assert.False(rejected.TryMatch(path, fileSize, fileMtime, bogus, out matches),
+                        "and none of them can answer a lookup");
+
+                    // The same journal plus one intact line: that line loads, and asking about
+                    // other content gets a definitive mismatch rather than a miss.
+                    string mixed = Path.Combine(dir, "mixed.txt");
+                    File.WriteAllText(mixed, bad.ToString() + good);
+                    var cache = new FileHashCache(mixed);
+                    Assert.True(cache.TryMatch(path, fileSize, fileMtime, digest, out matches) && matches,
+                        "the intact line in the same journal still loads");
+                    Assert.True(cache.TryMatch(path, fileSize, fileMtime, bogus, out matches) && !matches,
+                        "the loaded digest is the intact one, so other content is a mismatch");
+
+                    // Garbage, an empty file and a directory-as-journal must not throw
+                    string emptyFile = Path.Combine(dir, "empty.txt");
+                    File.WriteAllText(emptyFile, "");
+                    Assert.True(new FileHashCache(emptyFile).Count == 0, "empty journal loads as empty");
+                    string garbage = Path.Combine(dir, "garbage.txt");
+                    File.WriteAllBytes(garbage, new byte[] { 0x00, 0xFF, 0x10, 0x0A, 0x0D });
+                    Assert.True(new FileHashCache(garbage).Count == 0, "binary junk loads as empty");
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+
+            runner.Run("FileHashCache_TwoInstancesAppendToOneJournal", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_fhcm_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    string journal = Path.Combine(dir, "shared.txt");
+                    var a = new FileHashCache(journal);
+                    var b = new FileHashCache(journal);   // second app instance, same machine
+
+                    string pathA = Path.Combine(dir, "a.bin");
+                    string pathB = Path.Combine(dir, "b.bin");
+                    File.WriteAllBytes(pathA, new byte[1024]);
+                    File.WriteAllBytes(pathB, new byte[2048]);
+                    byte[] digestA = ClientWire.ComputeFileHash(pathA);
+                    byte[] digestB = ClientWire.ComputeFileHash(pathB);
+
+                    // Interleaved writes: neither instance saw the other's entry at load time
+                    a.Store(pathA, digestA);
+                    b.Store(pathB, digestB);
+                    a.Store(pathA, digestA);
+
+                    long size, mtime;
+                    bool matches;
+                    var reopened = new FileHashCache(journal);
+                    FileHashCache.Stat(pathA, out size, out mtime);
+                    Assert.True(reopened.TryMatch(pathA, size, mtime, digestA, out matches) && matches,
+                        "first instance's entry survived");
+                    FileHashCache.Stat(pathB, out size, out mtime);
+                    Assert.True(reopened.TryMatch(pathB, size, mtime, digestB, out matches) && matches,
+                        "second instance's entry survived");
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+
+            runner.Run("FileHashCache_UnwritableJournalStillServes", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_fhcu_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    string path = Path.Combine(dir, "a.bin");
+                    var content = new byte[4096];
+                    new Random(15).NextBytes(content);
+                    File.WriteAllBytes(path, content);
+                    byte[] digest = ClientWire.ComputeFileHash(path);
+
+                    // A directory where the journal should be: every append fails, and the
+                    // cache must still answer from memory for this run.
+                    string blocked = Path.Combine(dir, "blocked.txt");
+                    Directory.CreateDirectory(blocked);
+                    var cache = new FileHashCache(blocked);
+                    cache.Store(path, digest);
+
+                    long size, mtime;
+                    bool matches;
+                    FileHashCache.Stat(path, out size, out mtime);
+                    Assert.True(cache.TryMatch(path, size, mtime, digest, out matches) && matches,
+                        "an unwritable journal degrades to an in-memory cache");
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+
+            runner.Run("FileHashCache_TrimsAndForgets", () =>            {
+                string dir = Path.Combine(TempBase(), "tr_fhct_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    // A journal with more entries than the cache is willing to hold: the trim
+                    // keeps the newest ones and brings the total back within its bound.
+                    string journal = Path.Combine(dir, "big.txt");
+                    var sb = new System.Text.StringBuilder();
+                    var digest = new byte[32];
+                    for (int i = 0; i < 12; i++)
+                    {
+                        // Fresh timestamps (the TTL would otherwise reject them all) but
+                        // ordered, so "newest" is unambiguous
+                        sb.Append(FileHashCache.FormatJournalLine(
+                            Path.Combine(dir, "f" + i), 10 + i, 100 + i, DateTime.UtcNow.Ticks + i, digest));
+                    }
+                    File.WriteAllText(journal, sb.ToString());
+                    var cache = new FileHashCache(journal);
+                    Assert.True(cache.Count == 12, "all twelve entries loaded, got " + cache.Count);
+                    cache.MaxEntriesPerGeneration = 2;
+                    cache.TrimToCapacity();
+                    bool matches;
+                    Assert.True(cache.Count <= 4, "trim stays within two generations, got " + cache.Count);
+                    Assert.True(cache.TryMatch(Path.Combine(dir, "f11"), 21, 111, digest, out matches) && matches,
+                        "the newest entry is kept");
+                    Assert.False(cache.TryMatch(Path.Combine(dir, "f0"), 10, 100, digest, out matches),
+                        "the oldest entry is dropped");
+
+                    // Remove drops an entry so the next lookup re-reads (self-healing hook)
+                    string path = Path.Combine(dir, "a.bin");
+                    File.WriteAllBytes(path, new byte[512]);
+                    byte[] real = ClientWire.ComputeFileHash(path);
+                    var single = new FileHashCache(null);
+                    single.Store(path, real);
+                    long size, mtime;
+                    FileHashCache.Stat(path, out size, out mtime);
+                    Assert.True(single.TryMatch(path, size, mtime, real, out matches), "stored entry is usable");
+                    single.Remove(path);
+                    Assert.False(single.TryMatch(path, size, mtime, real, out matches), "removed entry must be re-read");
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+
+            // A peer that is hashing what it already holds is busy, not stalled: the wait
+            // for its status response must not be held to the transfer's own socket timeout.
+            runner.Run("ClientWire_NegotiationWaitGetsGenerousTimeout", () =>
+            {
+                var manifest = new FolderSendManifest
+                {
+                    FolderName = "f",
+                    FolderPath = "x",
+                    Files = new string[] { "x\\a.bin" },
+                    RelativePaths = new string[] { "a.bin" },
+                    Sizes = new long[] { 1 },
+                    Hashes = new byte[][] { new byte[32] },
+                    TotalBytes = 1
+                };
+                var resp = new byte[18];
+                resp[0] = 0x11;                 // folder resume response, status 2 = complete
+                resp[17] = 2;
+                Guid sessionId = Guid.NewGuid();
+                var wire = new ScriptedWire(resp);
+                try
+                {
+                    ClientWire.SendFolderResumableAsync(wire, manifest, sessionId, "127.0.0.1", 1, false,
+                        4096, null, new WireCallbacks(), CancellationToken.None).Wait(10000);
+                }
+                finally
+                {
+                    FolderResumeState.Delete(sessionId);
+                }
+                Assert.True(wire.ReadTimeouts.Count == 2,
+                    "the wait is widened and then restored, got " + wire.ReadTimeouts.Count);
+                Assert.True(wire.ReadTimeouts[0] == ClientWire.LongReadWindowMs,
+                    "widened while waiting for the peer's verdict, got " + wire.ReadTimeouts[0]);
+                Assert.True(wire.ReadTimeouts[1] == 30000,
+                    "restored before the payload, got " + wire.ReadTimeouts[1]);
+            });
+
+            // The widen must not survive a failed read: whatever the wait throws, the next
+            // read on this stream sees the normal window again.
+            runner.Run("ClientWire_NegotiationTimeoutRestoredOnFailure", () =>
+            {
+                var manifest = new FolderSendManifest
+                {
+                    FolderName = "f",
+                    FolderPath = "x",
+                    Files = new string[] { "x\\a.bin" },
+                    RelativePaths = new string[] { "a.bin" },
+                    Sizes = new long[] { 1 },
+                    Hashes = new byte[][] { new byte[32] },
+                    TotalBytes = 1
+                };
+                Guid sessionId = Guid.NewGuid();
+                var wire = new ScriptedWire(new byte[0]); // response read hits EOF and throws
+                bool threw = false;
+                try
+                {
+                    ClientWire.SendFolderResumableAsync(wire, manifest, sessionId, "127.0.0.1", 1, false,
+                        4096, null, new WireCallbacks(), CancellationToken.None).Wait(10000);
+                }
+                catch
+                {
+                    threw = true;
+                }
+                finally
+                {
+                    FolderResumeState.Delete(sessionId);
+                }
+                Assert.True(threw, "a dead peer surfaces as an error");
+                Assert.True(wire.ReadTimeouts.Count == 2,
+                    "the window was restored despite the failed read, got " + wire.ReadTimeouts.Count);
+                Assert.True(wire.ReadTimeouts[0] == ClientWire.LongReadWindowMs && wire.ReadTimeouts[1] == 30000,
+                    "widen then restore, got " + wire.ReadTimeouts[0] + "/" + wire.ReadTimeouts[1]);
+            });
+
+            // The raw socket is the thing that owns a timeout, so both decorators must pass
+            // the request through instead of swallowing it.
+            runner.Run("WireStream_TimeoutForwardedThroughDecorators", () =>
+            {
+                var inner = new ScriptedWire(new byte[0]);
+                byte[] k1 = MakeSecret(91, 32), k2 = MakeSecret(92, 32);
+                byte[] k3 = MakeSecret(93, 32), k4 = MakeSecret(94, 32);
+                var compressed = new CompressedWireStream(inner, false);
+                var encrypted = new EncryptedWireStream(compressed, k1, k2, k3, k4, false);
+                try
+                {
+                    encrypted.SetReadTimeoutMs(123456);
+                }
+                finally
+                {
+                    encrypted.Dispose();   // ownsInner=false: the fake stays open
+                    compressed.Dispose();
+                }
+                Assert.True(inner.ReadTimeouts.Count == 1 && inner.ReadTimeouts[0] == 123456,
+                    "the request reached the innermost stream, got " + inner.ReadTimeouts.Count + " entries");
+            });
+
+            // What the key is made of, and which mismatches must be refused even when only
+            // one component moved.
+            runner.Run("FileHashCache_KeyComposition", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_fhck_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    string path = Path.Combine(dir, "a.bin");
+                    var content = new byte[16 * 1024];
+                    new Random(16).NextBytes(content);
+                    File.WriteAllBytes(path, content);
+                    byte[] digest = ClientWire.ComputeFileHash(path);
+                    long size, mtime;
+                    FileHashCache.Stat(path, out size, out mtime);
+                    bool matches;
+                    long stored = DateTime.UtcNow.Ticks;
+
+                    // Size is part of the key on its own: a line that claims a different size
+                    // for the same path and timestamp must not answer.
+                    string wrongSize = Path.Combine(dir, "size.txt");
+                    File.WriteAllText(wrongSize, FileHashCache.FormatJournalLine(path, size + 1, mtime, stored, digest));
+                    Assert.False(new FileHashCache(wrongSize).TryMatch(path, size, mtime, digest, out matches),
+                        "a line with the wrong size is not usable");
+
+                    // Timestamp likewise
+                    string wrongTime = Path.Combine(dir, "time.txt");
+                    File.WriteAllText(wrongTime, FileHashCache.FormatJournalLine(path, size, mtime + 1, stored, digest));
+                    Assert.False(new FileHashCache(wrongTime).TryMatch(path, size, mtime, digest, out matches),
+                        "a line with the wrong timestamp is not usable");
+
+                    // Path spelling: Windows is case-insensitive, so a differently-cased
+                    // spelling of the same file finds the entry ...
+                    var cache = new FileHashCache(null);
+                    cache.Store(path, digest);
+                    Assert.True(cache.TryMatch(path.ToUpperInvariant(), size, mtime, digest, out matches) && matches,
+                        "path keys are case-insensitive");
+                    // ... but a path the caller never recorded (a different spelling that is
+                    // not just case) is a miss, never a wrong answer.
+                    Assert.False(cache.TryMatch(Path.Combine(dir, "sub", "a.bin"), size, mtime, digest, out matches),
+                        "an unrecorded path is a miss");
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+
+            runner.Run("FileHashCache_TtlZeroNeverExpiresAndRefreshesOnUse", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_fhcl_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    string path = Path.Combine(dir, "a.bin");
+                    var content = new byte[8192];
+                    new Random(17).NextBytes(content);
+                    File.WriteAllBytes(path, content);
+                    byte[] digest = ClientWire.ComputeFileHash(path);
+                    long size, mtime;
+                    FileHashCache.Stat(path, out size, out mtime);
+                    bool matches;
+
+                    // MaxAgeDays = 0 means "trust forever": even an ancient entry is used.
+                    string journal = Path.Combine(dir, "ancient.txt");
+                    File.WriteAllText(journal, FileHashCache.FormatJournalLine(
+                        path, size, mtime, DateTime.UtcNow.AddYears(-3).Ticks, digest));
+                    var forever = new FileHashCache(journal);
+                    forever.MaxAgeDays = 0;
+                    Assert.True(forever.TryMatch(path, size, mtime, digest, out matches) && matches,
+                        "TTL 0 keeps serving an old entry");
+
+                    // With a TTL the same entry is ignored, and a fresh verification (what the
+                    // caller does on a miss) makes it usable again — the refresh cycle.
+                    var expiring = new FileHashCache(journal);
+                    expiring.MaxAgeDays = 7;
+                    Assert.False(expiring.TryMatch(path, size, mtime, digest, out matches),
+                        "the same entry is ignored once a TTL applies");
+                    expiring.StoreIfUnchanged(path, digest, size, mtime);
+                    Assert.True(expiring.TryMatch(path, size, mtime, digest, out matches) && matches,
+                        "re-verifying the file refreshes the entry");
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+
+            // Strict mode reads the file, but it still records what it learned so the cache
+            // is warm the moment the switch goes back off.
+            runner.Run("FileHashCache_StrictStillComputesAndStores", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_fhcs_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    string path = Path.Combine(dir, "a.bin");
+                    var content = new byte[4096];
+                    new Random(18).NextBytes(content);
+                    File.WriteAllBytes(path, content);
+
+                    var cache = new FileHashCache(null);
+                    cache.Strict = true;
+                    bool computed;
+                    byte[] first = cache.GetOrCompute(path, new WireCallbacks(), false, out computed);
+                    Assert.True(computed, "strict mode always reads the file");
+                    Assert.True(Utils.ConstantTimeEquals(first, ClientWire.ComputeFileHash(path)), "and returns the real digest");
+
+                    long size, mtime;
+                    bool matches;
+                    FileHashCache.Stat(path, out size, out mtime);
+                    Assert.False(cache.TryMatch(path, size, mtime, first, out matches), "still refuses to answer");
+
+                    cache.Strict = false;
+                    Assert.True(cache.TryMatch(path, size, mtime, first, out matches) && matches,
+                        "what strict mode computed was recorded");
+                    byte[] second = cache.GetOrCompute(path, new WireCallbacks(), false, out computed);
+                    Assert.True(!computed, "and is reused once the switch is off");
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+
+            // Frequent lookups keep an entry alive through generation rotation; a rewrite
+            // keeps what both generations hold.
+            runner.Run("FileHashCache_PromotesHotEntriesAndKeepsBothGenerationsOnRewrite", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_fhcr_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    var cache = new FileHashCache(null);
+                    cache.MaxEntriesPerGeneration = 1;
+                    var digest = new byte[32];
+                    string hot = Path.Combine(dir, "hot.bin");
+                    string cold = Path.Combine(dir, "cold.bin");
+                    string fresh = Path.Combine(dir, "fresh.bin");
+                    File.WriteAllBytes(hot, new byte[1024]);
+                    File.WriteAllBytes(cold, new byte[1024]);
+                    File.WriteAllBytes(fresh, new byte[1024]);
+                    long size, mtime;
+                    bool matches;
+
+                    cache.Store(hot, digest);
+                    cache.Store(cold, digest);          // rotates: hot is only in the old generation
+                    FileHashCache.Stat(hot, out size, out mtime);
+                    Assert.True(cache.TryMatch(hot, size, mtime, digest, out matches), "hit in the retired generation");
+                    cache.Store(fresh, digest);         // another rotation
+                    Assert.True(cache.TryMatch(hot, size, mtime, digest, out matches),
+                        "the entry that was just used survived the rotation");
+
+                    // A rewrite keeps both generations, not just the live one
+                    string journal = Path.Combine(dir, "small.txt");
+                    var persisted = new FileHashCache(journal);
+                    persisted.MaxEntriesPerGeneration = 1;
+                    persisted.MaxJournalBytes = 1;      // force the journal to be rewritten
+                    persisted.Store(hot, digest);
+                    persisted.Store(cold, digest);
+                    var reopened = new FileHashCache(journal);
+                    // Each file's own (size, mtime): two files written back to back may or
+                    // may not share a timestamp, and the key is per file.
+                    long hotSize, hotMtime, coldSize, coldMtime;
+                    FileHashCache.Stat(hot, out hotSize, out hotMtime);
+                    FileHashCache.Stat(cold, out coldSize, out coldMtime);
+                    Assert.True(reopened.TryMatch(hot, hotSize, hotMtime, digest, out matches),
+                        "the rewrite kept the retired generation too");
+                    Assert.True(reopened.TryMatch(cold, coldSize, coldMtime, digest, out matches),
+                        "and the live one");
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+
+            // Non-ASCII names must survive the UTF-8 journal round-trip byte for byte.
+            runner.Run("FileHashCache_UnicodePathRoundTrip", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_fhcn_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    string path = Path.Combine(dir, "中文文件名 空格.bin");
+                    var content = new byte[2048];
+                    new Random(19).NextBytes(content);
+                    File.WriteAllBytes(path, content);
+                    byte[] digest = ClientWire.ComputeFileHash(path);
+
+                    string journal = Path.Combine(dir, "unicode.txt");
+                    new FileHashCache(journal).Store(path, digest);
+
+                    long size, mtime;
+                    bool matches;
+                    FileHashCache.Stat(path, out size, out mtime);
+                    Assert.True(new FileHashCache(journal).TryMatch(path, size, mtime, digest, out matches) && matches,
+                        "a non-ASCII path round-trips through the journal");
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+
+            // The documented trust boundary: metadata that lies. Same size and a restored
+            // mtime hide a content change from the cache — that is its designed trust level —
+            // while byte-for-byte mode still catches it.
+            runner.Run("FileHashCache_AdversarialMetadataAnsweredByStrict", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_fhca_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    string path = Path.Combine(dir, "a.bin");
+                    var first = new byte[16 * 1024];
+                    new Random(21).NextBytes(first);
+                    File.WriteAllBytes(path, first);
+                    long size, mtime;
+                    FileHashCache.Stat(path, out size, out mtime);
+                    byte[] digest = ClientWire.ComputeFileHash(path);
+
+                    var cache = new FileHashCache(null);
+                    cache.Store(path, digest);
+
+                    // Same size, different content, mtime forced back to the recorded value
+                    var second = new byte[16 * 1024];
+                    new Random(22).NextBytes(second);
+                    File.WriteAllBytes(path, second);
+                    File.SetLastWriteTimeUtc(path, new DateTime(mtime));
+
+                    bool matches;
+                    Assert.True(cache.TryMatch(path, size, mtime, digest, out matches) && matches,
+                        "the cache answers from metadata — this is its documented trust level");
+                    cache.Strict = true;
+                    Assert.False(cache.TryMatch(path, size, mtime, digest, out matches),
+                        "byte-for-byte mode ignores the lie and re-reads");
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+
+            // Parallel sends and lookups (multiple app instances, overlapping syncs): the
+            // dictionary, the generation rotation and the journal append all under contention.
+            runner.Run("FileHashCache_ConcurrentStress", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_fhcx_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    var paths = new string[32];
+                    var digests = new byte[32][];
+                    for (int i = 0; i < paths.Length; i++)
+                    {
+                        paths[i] = Path.Combine(dir, "f" + i + ".bin");
+                        File.WriteAllBytes(paths[i], new byte[256 + i]);
+                        digests[i] = ClientWire.ComputeFileHash(paths[i]);
+                    }
+
+                    var cache = new FileHashCache(Path.Combine(dir, "stress.txt"));
+                    cache.MaxEntriesPerGeneration = 8; // force rotations during the storm
+
+                    var errors = new System.Collections.Generic.List<string>();
+                    var threads = new Thread[8];
+                    for (int t = 0; t < threads.Length; t++)
+                    {
+                        int seed = t;
+                        threads[t] = new Thread(delegate()
+                        {
+                            try
+                            {
+                                var rnd = new Random(seed);
+                                for (int i = 0; i < 300; i++)
+                                {
+                                    int k = rnd.Next(paths.Length);
+                                    long size, mtime;
+                                    FileHashCache.Stat(paths[k], out size, out mtime);
+                                    switch (rnd.Next(3))
+                                    {
+                                        case 0:
+                                            cache.Store(paths[k], digests[k]);
+                                            break;
+                                        case 1:
+                                            bool hit;
+                                            cache.TryMatch(paths[k], size, mtime, digests[k], out hit);
+                                            break;
+                                        default:
+                                            if (rnd.Next(20) == 0) cache.Remove(paths[k]);
+                                            break;
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                lock (errors) errors.Add(ex.Message);
+                            }
+                        });
+                        threads[t].Start();
+                    }
+                    for (int t = 0; t < threads.Length; t++) threads[t].Join();
+                    Assert.True(errors.Count == 0, "no thread saw an exception: " + string.Join(" | ", errors.ToArray()));
+                    Assert.True(cache.Count <= 16, "entries stayed within two generations, got " + cache.Count);
+
+                    // Whatever survived must reload and must never answer with a wrong digest.
+                    // Reload materializes the previous generation into memory too (its entries
+                    // are still valid), so the bound here is the path universe, not two
+                    // generations — the runtime bound was already asserted above.
+                    var reopened = new FileHashCache(Path.Combine(dir, "stress.txt"));
+                    Assert.True(reopened.Count <= paths.Length,
+                        "the journal holds at most one entry per path, got " + reopened.Count);
+                    long s2, m2;
+                    var zero = new byte[32];
+                    bool matches;
+                    for (int i = 0; i < paths.Length; i++)
+                    {
+                        FileHashCache.Stat(paths[i], out s2, out m2);
+                        Assert.True(!reopened.TryMatch(paths[i], s2, m2, zero, out matches) || !matches,
+                            "a stored digest never equals the all-zero digest");
+                    }
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+
+            // Compaction rewrites the journal with every live entry, not a sample of it.
+            runner.Run("FileHashCache_CompactionKeepsAllLiveEntries", () =>
+            {
+                string dir = Path.Combine(TempBase(), "tr_fhccomp_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(dir);
+                try
+                {
+                    string journal = Path.Combine(dir, "many.txt");
+                    var sb = new System.Text.StringBuilder();
+                    var digest = new byte[32];
+                    int total = 300;
+                    for (int i = 0; i < total; i++)
+                        sb.Append(FileHashCache.FormatJournalLine(
+                            Path.Combine(dir, "f" + i), i, 1000 + i, DateTime.UtcNow.Ticks + i, digest));
+                    File.WriteAllText(journal, sb.ToString());
+
+                    var cache = new FileHashCache(journal);
+                    Assert.True(cache.Count == total, "all entries loaded, got " + cache.Count);
+                    cache.MaxJournalBytes = 1024;   // force the rewrite on the next append
+                    File.WriteAllBytes(Path.Combine(dir, "extra"), new byte[16]);
+                    cache.Store(Path.Combine(dir, "extra"), digest);
+
+                    var reopened = new FileHashCache(journal);
+                    Assert.True(reopened.Count >= total,
+                        "compaction lost no live entries (had " + total + ", reloaded " + reopened.Count + ")");
+                    bool matches;
+                    Assert.True(reopened.TryMatch(Path.Combine(dir, "f0"), 0, 1000, digest, out matches),
+                        "oldest live entry survived the rewrite");
+                    Assert.True(reopened.TryMatch(Path.Combine(dir, "f" + (total - 1)), total - 1, 999 + total, digest, out matches),
+                        "newest live entry survived the rewrite");
+                }
+                finally
+                {
+                    try { Directory.Delete(dir, true); } catch { }
+                }
+            });
+
+            // The receive-options plumbing end to end: Config keys flip the cache policy.
+            runner.Run("HashCacheConfig_AppliedThroughApplyConfig", () =>
+            {
+                string prevVerify = Config.Get("SyncVerifyContent", "");
+                string prevDays = Config.Get("HashCacheDays", "");
+                try
+                {
+                    Config.SetBool("SyncVerifyContent", true);
+                    Config.SetInt("HashCacheDays", 3);
+                    var cache = new FileHashCache(null);
+                    cache.ApplyConfig();
+                    Assert.True(cache.Strict, "byte-for-byte mode reaches the cache");
+                    Assert.True(cache.MaxAgeDays == 3, "the TTL reaches the cache, got " + cache.MaxAgeDays);
+
+                    Config.SetBool("SyncVerifyContent", false);
+                    Config.SetInt("HashCacheDays", 0);
+                    cache.ApplyConfig();
+                    Assert.False(cache.Strict, "turning the switch off clears strict");
+                    Assert.True(cache.MaxAgeDays == 0, "TTL 0 = never expire");
+                }
+                finally
+                {
+                    Config.Set("SyncVerifyContent", prevVerify);
+                    Config.Set("HashCacheDays", prevDays);
+                    Config.Save();
+                }
+            });
         }
 
         // ==================== Unit: chunk reassembly coverage ====================
@@ -230,6 +1337,8 @@ namespace TrFileTransfer.Tests
             {
                 return Task.FromResult(Buffer.Read(buffer, offset, count));
             }
+
+            public void SetReadTimeoutMs(int milliseconds) { }
 
             public void Dispose() { }
         }
@@ -690,10 +1799,12 @@ namespace TrFileTransfer.Tests
             });
         }
 
-        /// <summary>Read-only in-memory stream seeded from a byte array.</summary>
+        /// <summary>Read-only in-memory stream seeded from a byte array. Records the read
+        /// timeouts the protocol asks for, so a test can see the widen/restore around a wait.</summary>
         private class MemoryStreamWire : IWireStream
         {
             private readonly MemoryStream _ms;
+            public readonly List<int> ReadTimeouts = new List<int>();
             public MemoryStreamWire(byte[] data) { _ms = new MemoryStream(data, false); }
             public Task WriteExactAsync(byte[] b, int o, int c, CancellationToken ct) { throw new IOException("read-only"); }
             public Task ReadExactAsync(byte[] b, int o, int c, CancellationToken ct)
@@ -707,7 +1818,31 @@ namespace TrFileTransfer.Tests
             {
                 return Task.FromResult(_ms.Read(b, o, c));
             }
+            public void SetReadTimeoutMs(int milliseconds) { ReadTimeouts.Add(milliseconds); }
             public void Dispose() { _ms.Dispose(); }
+        }
+
+        /// <summary>Accepts and discards writes, serves a canned response, and records the
+        /// read timeouts the protocol asks for.</summary>
+        private class ScriptedWire : IWireStream
+        {
+            private readonly MemoryStream _in;
+            public readonly List<int> ReadTimeouts = new List<int>();
+            public ScriptedWire(byte[] response) { _in = new MemoryStream(response, false); }
+            public Task WriteExactAsync(byte[] b, int o, int c, CancellationToken ct) { return Task.FromResult(0); }
+            public Task ReadExactAsync(byte[] b, int o, int c, CancellationToken ct)
+            {
+                if (c == 0) return Task.FromResult(0);
+                int read = _in.Read(b, o, c);
+                if (read < c) throw new IOException("exhausted");
+                return Task.FromResult(0);
+            }
+            public Task<int> ReadSomeAsync(byte[] b, int o, int c, CancellationToken ct)
+            {
+                return Task.FromResult(_in.Read(b, o, c));
+            }
+            public void SetReadTimeoutMs(int milliseconds) { ReadTimeouts.Add(milliseconds); }
+            public void Dispose() { _in.Dispose(); }
         }
 
         // ==================== Unit: IP filter / disk / stats ====================

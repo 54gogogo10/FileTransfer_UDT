@@ -24,7 +24,8 @@ namespace TrFileTransfer
         {
             if (args == null || args.Length == 0) return false;
             string a = args[0].ToLowerInvariant();
-            return a == "send" || a == "recv" || a == "help" || a == "--help" || a == "-h" || a == "/?";
+            return a == "send" || a == "recv" || a == "sync" || a == "verify"
+                || a == "help" || a == "--help" || a == "-h" || a == "/?";
         }
 
         public static int Run(string[] args)
@@ -39,7 +40,14 @@ namespace TrFileTransfer
                     return 0;
                 }
                 var opt = ParseOptions(args, 1);
-                return cmd == "send" ? RunSend(opt) : RunRecv(opt);
+                switch (cmd)
+                {
+                    case "send": return RunSend(opt);
+                    case "recv": return RunRecv(opt);
+                    case "sync": return RunSync(opt);
+                    case "verify": return RunVerify(opt);
+                    default: throw new CliUsageException(L.CliUnknownCmd(args[0]));
+                }
             }
             catch (CliUsageException ex)
             {
@@ -215,6 +223,85 @@ namespace TrFileTransfer
             if (countTarget > 0)
                 Console.Out.WriteLine(L.CliRecvCountDone(Interlocked.Read(ref received)));
             return 0;
+        }
+
+        // ---- sync: one-shot incremental folder sync (0x04, keepState) ----
+
+        private static int RunSync(Dictionary<string, string> opt)
+        {
+            string ip = Require(opt, "ip");
+            int port = ParsePort(Require(opt, "port"));
+            string path = Require(opt, "folder");
+            if (!Directory.Exists(path))
+                throw new CliUsageException(L.DirNotExist + " " + path);
+            bool isUdt = opt.ContainsKey("udt");
+            long limitKb = ParseLong(opt, "limit", 0, 1024L * 1024 * 1024, 0);
+            long limitBps = limitKb * 1024L;
+            if (limitBps > int.MaxValue) limitBps = int.MaxValue;
+            int limit = (int)limitBps;
+            int srcPort = (int)ParseLong(opt, "srcport", 0, 65535, 0);
+            string code = GetValue(opt, "code");
+
+            // Same stable session the GUI sync mode derives — a CLI sync and a GUI sync of
+            // the same (folder, target) pair continue each other's work.
+            Guid sessionId = FolderResumeState.DeriveSyncSession(path, ip, port, isUdt);
+
+            Console.Out.WriteLine(L.CliSyncStart(path, ip, port, isUdt ? "UDT" : "TCP"));
+            var watch = Stopwatch.StartNew();
+            long bytes = Measure(path);
+            try
+            {
+                if (isUdt)
+                {
+                    var client = ClientFactory.CreateUdt(ip, port, path, srcPort, limit, code);
+                    if (opt.ContainsKey("noencrypt")) client.EncryptionEnabled = false;
+                    if (opt.ContainsKey("nocompress")) client.CompressionEnabled = false;
+                    client.OnLog += msg => Console.Out.WriteLine(msg);
+                    client.OnError += msg => Console.Error.WriteLine(msg);
+                    RunToCompletion(client.SendFolderResumableAsync(sessionId, keepState: true));
+                }
+                else
+                {
+                    var client = ClientFactory.CreateTcp(ip, port, path, srcPort, limit, code);
+                    if (opt.ContainsKey("noencrypt")) client.EncryptionEnabled = false;
+                    if (opt.ContainsKey("nocompress")) client.CompressionEnabled = false;
+                    client.OnLog += msg => Console.Out.WriteLine(msg);
+                    client.OnError += msg => Console.Error.WriteLine(msg);
+                    RunToCompletion(client.SendFolderResumableAsync(sessionId, keepState: true));
+                }
+            }
+            catch (Exception)
+            {
+                // OnError already printed the reason on the console
+                return 1;
+            }
+            watch.Stop();
+            Console.Out.WriteLine(L.CliSyncDone(Utils.FormatSize(bytes), watch.Elapsed.TotalSeconds));
+            return 0;
+        }
+
+        // ---- verify: integrity self-check of a directory against the digest cache ----
+
+        private static int RunVerify(Dictionary<string, string> opt)
+        {
+            string dir = Require(opt, "dir");
+            if (!Directory.Exists(dir))
+                throw new CliUsageException(L.DirNotExist + " " + dir);
+
+            // Ctrl+C cancels the scan orderly instead of killing the process mid-file
+            var cts = new CancellationTokenSource();
+            Console.CancelKeyPress += (s, e) => { e.Cancel = true; cts.Cancel(); };
+
+            Console.Out.WriteLine(L.CliVerifyStart(dir));
+            var cb = new WireCallbacks();
+            cb.Log = msg => Console.Out.WriteLine(msg);
+            VerifyReport report = LibraryVerifier.Verify(dir, FileHashCache.ForServer, cb, cts.Token);
+
+            foreach (var p in report.Changed)
+                Console.Error.WriteLine(L.CliVerifyChanged(p));
+            Console.Out.WriteLine(L.CliVerifySummary(
+                report.Verified.Count, report.Changed.Count, report.Unverified.Count, report.Skipped.Count));
+            return report.Changed.Count > 0 ? 1 : 0;
         }
 
         // ---- option parsing ----

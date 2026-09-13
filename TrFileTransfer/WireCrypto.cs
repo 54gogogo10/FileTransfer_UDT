@@ -321,6 +321,13 @@ namespace TrFileTransfer
             return n;
         }
 
+        /// <summary>Forwarded: the raw socket underneath is the one that has a timeout, and
+        /// the caller must still be able to widen it (see IWireStream.SetReadTimeoutMs).</summary>
+        public void SetReadTimeoutMs(int milliseconds)
+        {
+            _inner.SetReadTimeoutMs(milliseconds);
+        }
+
         /// <summary>Reads, authenticates and decrypts the next segment into _plain.
         /// Throws IOException on MAC mismatch (tampering or key mismatch).</summary>
         private async Task ReadSegmentAsync(CancellationToken ct)
