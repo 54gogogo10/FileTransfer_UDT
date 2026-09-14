@@ -103,6 +103,12 @@ namespace TrFileTransfer
             /// <summary>Chunk-group pause (concurrent single-file): resume sends only the
             /// server's missing ranges via the 0x0B coverage query.</summary>
             public bool Chunked;
+            // Source file identity at pause time: if the file changes while paused, the
+            // server's coverage describes OLD bytes — resuming into its gaps would splice
+            // old and new content (0x02 has no whole-file hash), so the guard restarts
+            // with a fresh group instead.
+            public long SourceLength;
+            public long SourceMTime;
         }
         private PauseState _pauseState;
         private bool _paused;                     // paused right now (resume button armed)
@@ -1256,12 +1262,14 @@ namespace TrFileTransfer
                 return;
             }
 
-            // The combo stores display strings ("0.0.0.0 (所有接口)") — strip to the bare
-            // address: TCP's TryParse would silently fall back to Any, but UDT's
-            // IPAddress.Parse throws on the decoration
-            string bindAddr = (_cmbBind.SelectedItem as string ?? "0.0.0.0").Split(' ')[0].Trim();
-            if (string.IsNullOrWhiteSpace(bindAddr))
-                bindAddr = "0.0.0.0";
+            // The combo stores display strings — the first item is a localized label
+            // ("所有接口 (IPv4 + IPv6)"), not an address. Anything that is not a bare
+            // IP literal means "all interfaces": TCP treats it as the dual-stack
+            // unspecified bind, UDT as its historic v4-any bind.
+            string bindAddr = (_cmbBind.SelectedItem as string ?? "").Split(' ')[0].Trim();
+            IPAddress bindLiteral;
+            if (!IPAddress.TryParse(bindAddr, out bindLiteral))
+                bindAddr = "";
 
             if (_chkServerTcp.IsChecked != true && _chkServerUdt.IsChecked != true)
             {
@@ -1761,6 +1769,17 @@ namespace TrFileTransfer
                 bool pausable = concurrency == 1 || chunkedPause;
                 if (pausable)
                 {
+                    long srcLen = 0, srcMTime = 0;
+                    if (chunkedPause)
+                    {
+                        try
+                        {
+                            var fi = new FileInfo(path);
+                            srcLen = fi.Length;
+                            srcMTime = fi.LastWriteTimeUtc.Ticks;
+                        }
+                        catch { }
+                    }
                     _pauseState = new PauseState
                     {
                         Path = path,
@@ -1774,7 +1793,9 @@ namespace TrFileTransfer
                         SpeedLimit = speedLimit,
                         Sync = syncMode,
                         Session = pauseSession,
-                        Chunked = chunkedPause
+                        Chunked = chunkedPause,
+                        SourceLength = srcLen,
+                        SourceMTime = srcMTime
                     };
                     _btnPause.IsEnabled = true;
                 }
@@ -1791,7 +1812,13 @@ namespace TrFileTransfer
                     bool groupCancelled = false;
                     try
                     {
-                        await concurrent.SendAsync(chunkedPause ? (Guid?)pauseSession : null);
+                        // A resume continues the paused group: the 0x0B coverage query
+                        // sends only the server's missing ranges. A fresh send carries a
+                        // new group id so a later pause has something to resume into.
+                        if (chunkSession.HasValue)
+                            await concurrent.ResumeAsync(chunkSession.Value);
+                        else
+                            await concurrent.SendAsync(pauseSession);
                         groupCancelled = concurrent.WasCancelled;
                     }
                     finally { _concurrent = null; }
@@ -1945,10 +1972,26 @@ namespace TrFileTransfer
 
                 if (st.Chunked)
                 {
-                    // Chunk-group resume: the 0x0B coverage query sends only the gaps
+                    // Chunk-group resume: the 0x0B coverage query sends only the gaps.
+                    // Source-change guard first: the coverage describes the OLD file, so
+                    // resuming into its gaps would splice old and new content (or, after
+                    // a size change, never complete while reporting success). A changed
+                    // file restarts under a fresh group id — the server evicts the stale
+                    // tracker on size mismatch and reassembles cleanly.
+                    Guid chunkSessionId = st.Session;
+                    try
+                    {
+                        var fi = new FileInfo(st.Path);
+                        if (fi.Length != st.SourceLength || fi.LastWriteTimeUtc.Ticks != st.SourceMTime)
+                        {
+                            AddLog(L.C_ResumeSourceChanged(Path.GetFileName(st.Path)));
+                            chunkSessionId = Guid.NewGuid();
+                        }
+                    }
+                    catch { chunkSessionId = Guid.NewGuid(); }
                     AddLog(L.C_TransferResumed);
                     var _ = StartTransfer(st.Path, st.IsFolder, st.Ip, st.Port, st.IsTcp, st.SrcPort,
-                        st.Concurrency, st.VerifyHash, st.SpeedLimit, null, st.Session);
+                        st.Concurrency, st.VerifyHash, st.SpeedLimit, null, chunkSessionId);
                     return;
                 }
 

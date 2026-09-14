@@ -158,6 +158,12 @@ namespace TrFileTransfer
         {
             long totalSize = new FileInfo(_filePath).Length;
             _totalBytes = totalSize;
+            if (totalSize == 0)
+            {
+                var errHandler = OnError;
+                if (errHandler != null) errHandler("File is empty");
+                return;
+            }
 
             long[][] covered = null;
             try
@@ -247,11 +253,15 @@ namespace TrFileTransfer
             {
                 var client = new TransferUdtClient(_serverIp, _port, _filePath, 0, 4194304, 0);
                 client.PairingCode = PairingCode;
-                return await client.QueryChunkCoverageAsync(chunkSession).ConfigureAwait(false);
+                RegisterCancel(client.Cancel);
+                try { return await client.QueryChunkCoverageAsync(chunkSession).ConfigureAwait(false); }
+                finally { UnregisterCancel(client.Cancel); }
             }
             var tcp = new TransferClient(_serverIp, _port, _filePath, 0, 4194304, 0);
             tcp.PairingCode = PairingCode;
-            return await tcp.QueryChunkCoverageAsync(chunkSession).ConfigureAwait(false);
+            RegisterCancel(tcp.Cancel);
+            try { return await tcp.QueryChunkCoverageAsync(chunkSession).ConfigureAwait(false); }
+            finally { UnregisterCancel(tcp.Cancel); }
         }
 
         public async Task SendFolderAsync()

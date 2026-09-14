@@ -473,7 +473,13 @@ namespace TrFileTransfer
             }
             else
             {
-                var addr = UdtNative.BuildSockaddr(_bindAddress, _port);
+                // UDT4 has no dual-mode socket, so an "all interfaces" selection ("" or
+                // the localized combo label) keeps the historic v4-any bind; only a
+                // parseable specific v4 address binds narrowly.
+                string v4Bind = bindIp != null
+                    && bindIp.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
+                    ? _bindAddress : "0.0.0.0";
+                var addr = UdtNative.BuildSockaddr(v4Bind, _port);
                 if (UdtNative.udt_bind(_socket, ref addr, UdtNative.SockAddrSize) == UdtNative.ERROR)
                 {
                     string err = UdtNative.GetErrorDesc();
@@ -1133,6 +1139,15 @@ namespace TrFileTransfer
             finally
             {
                 _isRunning = false;
+                // Mirror RunUdtTransfer's teardown: the wire stream does NOT own the
+                // socket (ownsInner=false), so without this close every coverage query
+                // would leak one native UDT socket while other transfers keep the
+                // library's ref count above zero.
+                if (_socket >= 0)
+                {
+                    try { UdtNative.udt_close(_socket); } catch { }
+                    _socket = -1;
+                }
                 UdtNative.UdtCleanup();
                 var stoppedHandler = OnStopped;
                 if (stoppedHandler != null) stoppedHandler();

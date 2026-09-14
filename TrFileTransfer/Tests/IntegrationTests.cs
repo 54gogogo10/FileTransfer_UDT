@@ -135,6 +135,7 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_UDT_ChunkCoverageResume", () => ChunkCoverageResume(true), 1);
             runner.Run("Integration_TCP_IPv6", TcpIPv6, 1);
             runner.Run("Integration_UDT_IPv6", UdtIPv6, 1);
+            runner.Run("Integration_TCP_DualStack_PeerNormalization", DualStackPeerNormalization, 1);
         }
 
         /// <summary>
@@ -308,6 +309,79 @@ namespace TrFileTransfer.Tests
                 Thread.Sleep(300);
                 Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(Path.Combine(recvDir, "v6u.bin"))),
                     "UDT over IPv6 delivered the file");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// The dual-mode ("") listener must hand v4 peers to the policy layer as plain
+        /// v4 addresses (not ::ffff:…) — per-device folders, IP filter and stats all
+        /// compare plain v4 strings. Also pins the chunk-group ownership: the group
+        /// owner's 0x0B query answers, a foreign peer's query is refused.
+        /// </summary>
+        private static void DualStackPeerNormalization()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_ds_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_ds_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferServer server = null;
+            try
+            {
+                var content = new byte[256 * 1024];
+                new Random(211).NextBytes(content);
+                string file = Path.Combine(sendDir, "ds.bin");
+                File.WriteAllBytes(file, content);
+
+                var started = new ManualResetEvent(false);
+                server = new TransferServer("", port, recvDir); // "" = dual-mode listener
+                server.PerDeviceFolder = true;
+                server.ResolveDeviceName = delegate(string ip) { return null; }; // fall back to the raw IP
+                server.OnStarted += delegate { started.Set(); };
+                server.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("Server did not start within 5s");
+
+                // A v4 peer arrives as ::ffff:127.0.0.1 on the dual socket — the device
+                // folder must still be the plain "127.0.0.1"
+                new TransferClient("127.0.0.1", port, file).SendAsync().Wait(30000);
+                Thread.Sleep(300);
+                string[] dirs = Directory.GetDirectories(recvDir);
+                Assert.True(dirs.Length == 1 && Path.GetFileName(dirs[0]) == "127.0.0.1",
+                    "v4 peer's device folder is the plain address (got: " +
+                    (dirs.Length > 0 ? Path.GetFileName(dirs[0]) : "<none>") + ")");
+                Assert.True(File.Exists(Path.Combine(dirs[0], "ds.bin")),
+                    "file landed in the v4 device folder");
+
+                // A v6 peer owns its chunk group: its query answers, a v4 peer's is refused
+                Guid chunkSession = Guid.NewGuid();
+                var v6 = new TransferClient("::1", port, file) { ChunkSessionId = chunkSession };
+                v6.SendChunkedAsync(0, content.Length / 2, content.Length).Wait(30000);
+                Thread.Sleep(300);
+
+                var q6 = new TransferClient("::1", port, file);
+                var t6 = q6.QueryChunkCoverageAsync(chunkSession);
+                Assert.True(t6.Wait(30000), "owner's coverage query completed");
+                long[][] covered = t6.Result;
+                Assert.True(covered != null && covered.Length == 1 && covered[0][0] == 0
+                    && covered[0][1] == content.Length / 2,
+                    "owner sees exactly [0, half)");
+
+                bool refused = false;
+                try
+                {
+                    var q4 = new TransferClient("127.0.0.1", port, file);
+                    var t4 = q4.QueryChunkCoverageAsync(chunkSession);
+                    t4.Wait(30000);
+                }
+                catch (AggregateException) { refused = true; }
+                Assert.True(refused, "foreign peer's coverage query was refused");
             }
             finally
             {

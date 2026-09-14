@@ -876,6 +876,18 @@ namespace TrFileTransfer
                 ? string.Format("检测到同名文件的上次分块传输未完成且大小不同，已重置重组状态：{0}", name)
                 : string.Format("Stale chunk reassembly for '{0}' (different size) — reset", name);
         }
+        public static string S_ChunkGroupForeignPeer(object group)
+        {
+            return IsChinese
+                ? string.Format("分块组 {0} 属于其他设备，已拒绝。", group)
+                : string.Format("Chunk group {0} belongs to another peer — refusing.", group);
+        }
+        public static string S_ChunkRangeOverflow(object name, object count)
+        {
+            return IsChinese
+                ? string.Format("分块组 {0} 的区间数异常（{1}），疑似恶意布点，已拒绝后续分块。", name, count)
+                : string.Format("Chunk group '{0}' holds an absurd range count ({1}) — refusing further chunks.", name);
+        }
         public static string S_AuthLockedOut(object ip)
         {
             return IsChinese
