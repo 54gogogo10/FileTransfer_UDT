@@ -92,7 +92,7 @@ namespace TrFileTransfer
                 Margin = new Thickness(0, 12, 0, 0),
                 TextWrapping = TextWrapping.Wrap
             };
-            Grid.SetRow(note, 9);
+            Grid.SetRow(note, 10);
             grid.Children.Add(note);
 
             var btnOk = DlgUi.PrimaryMin(L.QueueStart, 96);
