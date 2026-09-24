@@ -46,7 +46,10 @@ namespace TrFileTransfer
             Grid.SetRow(hint, 0);
             grid.Children.Add(hint);
 
-            Grid.SetRow(_list, 1);
+            // Row 2 is the Star row: the list must live there so it fills the dialog
+            // and scrolls instead of growing unbounded (Auto) and pushing the
+            // buttons below the window edge
+            Grid.SetRow(_list, 2);
             _list.Margin = new Thickness(0, 0, 0, 8);
             grid.Children.Add(_list);
 

@@ -31,13 +31,9 @@ namespace TrFileTransfer
             // Totals table (period | count | volume)
             var totals = new Grid { Margin = new Thickness(0, 0, 0, 10) };
             for (int i = 0; i < 3; i++)
-            {
                 totals.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-                totals.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-                totals.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            for (int i = 0; i < 4; i++)
                 totals.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-                totals.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            }
             AddCell(totals, 0, 0, "", true);
             AddCell(totals, 0, 1, L.StatsCountCol, true);
             AddCell(totals, 0, 2, L.StatsDataCol, true);

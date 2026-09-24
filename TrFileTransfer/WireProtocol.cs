@@ -358,6 +358,12 @@ namespace TrFileTransfer
         /// <summary>Upper bound on the file count in a folder manifest (0x01/0x04).</summary>
         public const int MaxFolderFileCount = 1000000;
 
+        /// <summary>Upper bound on a chunk tracker's merged range count. Legit groups
+        /// hold a handful (per-connection splits plus resume pieces); beyond this the
+        /// group is a peer planting strided micro-chunks and further chunks are refused
+        /// (each range costs 16 bytes in every 0x0B coverage answer).</summary>
+        public const int MaxChunkRanges = 8192;
+
         /// <summary>Single-line preview of a text message for logs and balloon tips.</summary>
         public static string Preview(string text)
         {
@@ -654,7 +660,7 @@ namespace TrFileTransfer
                         && !string.Equals(owner, ctx.Session != null ? ctx.Session.Peer : "",
                             StringComparison.OrdinalIgnoreCase))
                     {
-                        ctx.Cb.RaiseLog("Chunk group " + groupKey + " belongs to another peer — query refused");
+                        ctx.Cb.RaiseLog(L.S_ChunkGroupForeignPeer(groupKey));
                         outcome.Rejected = true;
                         return outcome;
                     }
@@ -1509,24 +1515,16 @@ namespace TrFileTransfer
 
             // Session-keyed groups bind to their first peer: a foreign peer that guesses
             // (or replays) a group id must not write into someone else's reassembly.
+            // GetOrAdd is the atomic register-and-check: the first connection wins, every
+            // later one — including a racing first pair — compares against the winner.
             if (groupKey != null)
             {
-                string owner;
                 var peer = ctx.Session != null ? ctx.Session.Peer : "";
-                if (ctx.ChunkSessionPeers.TryGetValue(groupKey, out owner))
+                string owner = ctx.ChunkSessionPeers.GetOrAdd(groupKey, peer);
+                if (!string.Equals(owner, peer, StringComparison.OrdinalIgnoreCase))
                 {
-                    if (!string.Equals(owner, peer, StringComparison.OrdinalIgnoreCase))
-                    {
-                        ctx.Cb.RaiseLog("Chunk group " + groupKey + " belongs to another peer — refusing");
-                        return false;
-                    }
-                }
-                else
-                {
-                    // A group already left a complete file behind must not be resurrected:
-                    // treat re-creation after completion as a fresh group (GetOrCreate below
-                    // rebuilds because the completed tracker was evicted).
-                    ctx.ChunkSessionPeers[groupKey] = peer;
+                    ctx.Cb.RaiseLog(L.S_ChunkGroupForeignPeer(groupKey));
+                    return false;
                 }
             }
 
@@ -1547,6 +1545,17 @@ namespace TrFileTransfer
                 }
                 tracker = ChunkTracker.GetOrCreate(
                     ctx.ChunkTrackers, trackerKey, fileName, totalSize, ctx.SaveDirectory);
+            }
+
+            // Range-count guard: a peer planting strided micro-chunks over many
+            // connections grows the merged range list (and every 0x0B answer built
+            // from it) without bound. A real group holds a handful of ranges; past
+            // this bound the group is garbage and must not keep growing.
+            if (tracker.RangeCount > MaxChunkRanges)
+            {
+                ctx.Cb.RaiseLog(L.S_ChunkRangeOverflow(fileName, tracker.RangeCount));
+                ctx.Cb.RaiseError(L.S_ChunkRangeOverflow(fileName, tracker.RangeCount));
+                return false;
             }
 
             // Stream chunk data through a fixed-size buffer — no giant array allocation

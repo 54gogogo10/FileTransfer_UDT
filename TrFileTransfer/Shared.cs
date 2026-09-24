@@ -131,9 +131,14 @@ namespace TrFileTransfer
             }
         }
 
-        /// <summary>Peer that owns this session (session-keyed trackers refuse chunks from
-        /// anyone else — same protection the 0x03 resume sessions have).</summary>
-        public string Peer;
+        /// <summary>Number of merged, sorted ranges currently held. Real chunk groups
+        /// carry a handful (one per concurrent connection plus resume pieces); a large
+        /// count means a peer is planting strided micro-chunks, so the caller can refuse
+        /// further growth (each range also costs 16 bytes in every 0x0B answer).</summary>
+        public int RangeCount
+        {
+            get { lock (Lock) { return _ranges.Count; } }
+        }
 
         /// <summary>Merges [start,end) into the sorted, non-overlapping range list —
         /// keeps the list tiny (a handful of entries for an out-of-order transfer).</summary>

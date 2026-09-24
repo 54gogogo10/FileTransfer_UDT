@@ -237,6 +237,25 @@ namespace TrFileTransfer
                     client.SendBufferSize = _bufferSize;
                     client.ReceiveBufferSize = _bufferSize;
                     var clientEp = client.Client.RemoteEndPoint as IPEndPoint;
+                    // The dual-mode listener hands v4 peers in as IPv4-mapped v6
+                    // (::ffff:a.b.c.d). Everything downstream — IP filter, per-device
+                    // folders, device memory, stats — compares plain v4 strings, so
+                    // normalize back or an allow-list like "192.168.1.*" would reject
+                    // every v4 LAN client. (Byte check: IPAddress.IsIPv4Mapped is not
+                    // available on every target we compile against.)
+                    if (clientEp != null && clientEp.AddressFamily == AddressFamily.InterNetworkV6)
+                    {
+                        byte[] b = clientEp.Address.GetAddressBytes();
+                        if (b.Length == 16 && b[10] == 0xFF && b[11] == 0xFF
+                            && b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 0
+                            && b[4] == 0 && b[5] == 0 && b[6] == 0 && b[7] == 0
+                            && b[8] == 0 && b[9] == 0)
+                        {
+                            clientEp = new IPEndPoint(
+                                new IPAddress(new byte[] { b[12], b[13], b[14], b[15] }),
+                                clientEp.Port);
+                        }
+                    }
                     Log(L.S_ClientConnected(clientEp));
                     var _ = HandleClient(client, ct, clientEp);
                 }
