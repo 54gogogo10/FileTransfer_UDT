@@ -803,9 +803,28 @@ namespace TrFileTransfer.Tests
 
             runner.Run("PortProbe_ProtocolIndependent", () =>
             {
-                var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+                // Pick a port usable by BOTH stacks first: a raw TCP-ephemeral pick can
+                // land inside a Windows UDP exclusion range (Hyper-V/WSL), which fails
+                // the UDP probe for reasons unrelated to TCP/UDP independence.
+                int basePort = Utils.FindFreePort(20000, false);
+                int port = 0;
+                for (int q = basePort; q < basePort + 256; q++)
+                {
+                    if (!Utils.IsPortFree(q, false, true)) continue;
+                    var probe = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, q);
+                    try
+                    {
+                        probe.Start();
+                        probe.Stop();
+                        port = q;
+                        break;
+                    }
+                    catch { }
+                }
+                Assert.True(port > 0, "found a port usable by both stacks");
+
+                var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, port);
                 listener.Start();
-                int port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
                 try
                 {
                     // TCP occupied but UDP probe asked only — TCP result must not leak into UDP check
@@ -856,6 +875,12 @@ namespace TrFileTransfer.Tests
         static int Main(string[] args)
         {
             Console.OutputEncoding = System.Text.Encoding.UTF8;
+            // Isolate the whole suite from the developer's real config.ini — Config is a
+            // process-global store, and tests exercising it used to stomp the live file
+            // (observed as a GUI instance losing its settings mid-run).
+            string testConfig = Path.Combine(Path.GetTempPath(), "TrFileTransfer-tests-config.ini");
+            try { File.Delete(testConfig); } catch { }
+            Config.UseFile(testConfig);
             Console.WriteLine("=== TrFileTransfer Test Suite ===");
             Console.WriteLine();
 

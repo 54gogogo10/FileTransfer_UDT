@@ -36,9 +36,13 @@ namespace TrFileTransfer
         public static string ServerStopped { get { return IsChinese ? "服务器已停止。" : "Server stopped."; } }
         public static string TransferComplete { get { return IsChinese ? "传输完成!" : "Transfer complete!"; } }
         public static string Cancelling { get { return IsChinese ? "正在取消..." : "Cancelling..."; } }
-        public static string ConcurrencyLabel { get { return IsChinese ? "并发(1-8):" : "Concur(1-8):"; } }
-        public static string SrcPortLabel { get { return IsChinese ? "源端口(0=随机):" : "SrcPort(0=Rnd):"; } }
+        public static string ConcurrencyLabel { get { return IsChinese ? "并发:" : "Concur:"; } }
+        public static string ConcurrencyTip { get { return IsChinese ? "并行连接数（1-8）" : "Parallel connections (1-8)"; } }
+        public static string SrcPortLabel { get { return IsChinese ? "源端口:" : "Src port:"; } }
+        public static string SrcPortTip { get { return IsChinese ? "0 = 系统随机端口" : "0 = random port"; } }
         public static string ExportLog { get { return IsChinese ? "导出日志" : "Export Log"; } }
+        public static string ClearLogBtn { get { return IsChinese ? "清除日志" : "Clear Log"; } }
+        public static string LogCleared { get { return IsChinese ? "日志已清除（磁盘日志文件保留）。" : "Log cleared (on-disk log files are kept)."; } }
         public static string ExportLogTitle { get { return IsChinese ? "导出日志" : "Export Log"; } }
         public static string ExportLogFailed { get { return IsChinese ? "导出失败: " : "Export failed: "; } }
 
@@ -62,7 +66,13 @@ namespace TrFileTransfer
         public static string BrowseDirDesc { get { return IsChinese ? "选择接收文件的保存目录" : "Select directory to save received files"; } }
         public static string BrowseFileTitle { get { return IsChinese ? "选择要发送的文件" : "Select file to send"; } }
         public static string ErrorPrefix { get { return IsChinese ? "错误: " : "Error: "; } }
-        public static string NoProtocolSelected { get { return IsChinese ? "请至少选择一个服务器协议（TCP/UDT）。" : "Select at least one server protocol (TCP/UDT)."; } }
+        public static string NoProtocolSelected { get { return IsChinese ? "请至少选择一个服务器协议（TCP/UDT/UDP）。" : "Select at least one server protocol (TCP/UDT/UDP)."; } }
+
+        /// <summary>Shorthand for the UDP-transport collision message (UDT vs one-way UDP share the transport).</summary>
+        public static string UdpTransportName { get { return IsChinese ? "UDT 与 UDP（同为 UDP 传输）" : "UDT and one-way UDP (both UDP transport)"; } }
+        public static string UdpSingleFileOnly { get { return IsChinese ? "UDP 单向发送仅支持单个文件（不支持文件夹/监控/暂停/续传）。" : "One-way UDP sends a single file only (no folders, monitor, pause or resume)."; } }
+        public static string UdpNotForFanOut { get { return IsChinese ? "群发不支持 UDP 单向发送。" : "Fan-out does not support one-way UDP."; } }
+        public static string UdpNotForText { get { return IsChinese ? "文本发送不支持 UDP。" : "Text messages do not support UDP."; } }
         public static string ServerStartFailed { get { return IsChinese ? "服务器启动失败。请检查端口是否被占用。" : "Server start failed. Check if port is in use."; } }
 
         // ---- Folder mode ----
@@ -74,6 +84,29 @@ namespace TrFileTransfer
         public static string SendFolder { get { return IsChinese ? "发送文件夹" : "Send Folder"; } }
         public static string TransferTypeGroup { get { return IsChinese ? "传输类型" : "Transfer Type"; } }
         public static string BindAll { get { return IsChinese ? "所有接口 (IPv4 + IPv6)" : "All interfaces (IPv4 + IPv6)"; } }
+        public static string BindAllV4 { get { return IsChinese ? "所有 IPv4 接口 (0.0.0.0)" : "All IPv4 (0.0.0.0)"; } }
+        public static string BindAllV6 { get { return IsChinese ? "所有 IPv6 接口 (::)" : "All IPv6 (::)"; } }
+        public static string BindPickNone { get { return IsChinese ? "（请选择绑定地址）" : "(pick bind addresses)"; } }
+        public static string BindPickAtLeastOne { get { return IsChinese ? "请至少勾选一个绑定地址。" : "Check at least one bind address."; } }
+
+        /// <summary>A running listener this bind would collide with (e.g. "IPv6 TCP").</summary>
+        public static string TabPortConflict(string who, string port)
+        {
+            return IsChinese
+                ? string.Format("端口冲突：{0} 已在运行并占用端口 {1}，请更换端口或先停止该服务。", who, port)
+                : string.Format("Port conflict: {0} is already listening on port {1}. Change the port or stop it first.", who, port);
+        }
+
+        /// <summary>Prefix for "another process holds this port" (compared with StartsWith).</summary>
+        public static string TabConflictOsHeld { get { return IsChinese ? "端口被其他程序占用" : "port held by another process"; } }
+
+        /// <summary>Multi-address conflict report: which tab/port, and the offending list.</summary>
+        public static string TabConflictsDetail(string tabName, string port, string details)
+        {
+            return IsChinese
+                ? string.Format("无法启动 {0}（端口 {1}）——以下绑定存在冲突：\n{2}\n请更换端口、调整绑定地址或先停止冲突的服务。", tabName, port, details)
+                : string.Format("Cannot start {0} (port {1}) — conflicting binds:\n{2}\nChange the port, adjust the bind addresses, or stop the conflicting service first.", tabName, port, details);
+        }
 
         // ---- Folder transfer log ----
         public static string S_ReceivingFolder(string name, int count, string sizeStr)
@@ -222,6 +255,108 @@ namespace TrFileTransfer
         }
         public static string UdtS_Stopped { get { return IsChinese ? "UDT服务器已停止。" : "UDT server stopped."; } }
 
+        // ---- One-way UDP server log messages ----
+        public static string UdpS_Started(string port, string dir)
+        {
+            return IsChinese
+                ? string.Format("UDP 单向接收已启动，端口 {0}。保存目录: {1}", port, dir)
+                : string.Format("UDP one-way receiver started on port {0}. Save directory: {1}", port, dir);
+        }
+        public static string UdpS_Stopped { get { return IsChinese ? "UDP 单向接收已停止。" : "UDP one-way receiver stopped."; } }
+        public static string UdpS_SessionStart(string name, string size, string ip)
+        {
+            return IsChinese
+                ? string.Format("来自 {2} 的单向会话: {0}（{1}），缺少的报文将等待重发", name, size, ip)
+                : string.Format("One-way session from {2}: {0} ({1}); missing datagrams wait for a re-send", name, size, ip);
+        }
+        public static string UdpS_Delivered(string name, string size)
+        {
+            return IsChinese
+                ? string.Format("单向接收完成: {0}（{1}），校验一致", name, size)
+                : string.Format("One-way receive complete: {0} ({1}), hash verified", name, size);
+        }
+        public static string UdpS_SessionIdle(string name)
+        {
+            return IsChinese
+                ? string.Format("单向会话空闲超时: {0}（已收分片保留，等待重发）", name)
+                : string.Format("One-way session idle: {0} (received chunks kept for a re-send)", name);
+        }
+        public static string UdpS_SessionEvicted(string name)
+        {
+            return IsChinese
+                ? string.Format("并发单向会话过多，已让出最空闲的: {0}（分片保留，重发即续）", name)
+                : string.Format("Too many concurrent one-way sessions, released the idle-most: {0} (chunks kept; a re-send resumes)", name);
+        }
+        public static string UdpS_FinalizeFailed(string name, string err)
+        {
+            return IsChinese
+                ? string.Format("单向会话收尾失败: {0} — {1}", name, err)
+                : string.Format("One-way finalize failed: {0} — {1}", name, err);
+        }
+        public static string UdpS_HashMismatch(string name, string size)
+        {
+            return IsChinese
+                ? string.Format("单向接收校验不一致，已丢弃 {0}（{1}）——重发一轮即可补齐", name, size)
+                : string.Format("One-way receive hash mismatch, discarded {0} ({1}) — re-send to fill the gaps", name, size);
+        }
+        public static string UdpS_RecvError(string err)
+        {
+            return IsChinese ? "UDP 接收错误: " + err : "UDP receive error: " + err;
+        }
+        public static string UdpS_IpRefused(string ip)
+        {
+            return IsChinese
+                ? string.Format("已拒绝来自 {0} 的 UDP 数据（IP 过滤）", ip)
+                : string.Format("Dropped UDP data from {0} (IP filter)", ip);
+        }
+        public static string UdpS_NoSpace(string name)
+        {
+            return IsChinese
+                ? string.Format("磁盘空间不足，已拒绝 {0}", name)
+                : string.Format("Insufficient disk space, refused {0}", name);
+        }
+
+        // ---- One-way UDP client log messages ----
+        public static string UdpC_Hashing(string name)
+        {
+            return IsChinese
+                ? string.Format("正在计算 {0} 的校验值（单向发送前完成）...", name)
+                : string.Format("Hashing {0} (before the one-way send)...", name);
+        }
+        public static string UdpC_Sending(string name, string size, string ip, string port)
+        {
+            return IsChinese
+                ? string.Format("单向发送 {0}（{1}）到 {2}:{3}（无回传确认，丢失需重发）", name, size, ip, port)
+                : string.Format("One-way send {0} ({1}) to {2}:{3} (no ACK channel; re-send to cover loss)", name, size, ip, port);
+        }
+        public static string UdpC_Done(string name, string size, string secs)
+        {
+            return IsChinese
+                ? string.Format("单向发送完毕: {0}（{1}，{2}秒）。对方是否收齐需在其日志确认", name, size, secs)
+                : string.Format("One-way send finished: {0} ({1}, {2}s). Confirm receipt on the receiver's side", name, size, secs);
+        }
+        public static string UdpC_Cancelled(string name)
+        {
+            return IsChinese
+                ? string.Format("已取消 {0} 的单向发送（接收方只保留已收分片）", name)
+                : string.Format("Cancelled one-way send of {0} (receiver keeps what it got)", name);
+        }
+        public static string UdpC_BadTarget(string ip)
+        {
+            return IsChinese
+                ? string.Format("无效的目标地址: {0}（UDP 单向发送仅支持 IP 字面量）", ip)
+                : string.Format("Invalid target address: {0} (one-way UDP needs an IP literal)", ip);
+        }
+        public static string UdpOneWayHint { get { return IsChinese
+            ? "UDP 为单向发送：本机只发出报文、不等待确认；若链路丢包，请重发以补齐接收方缺口。加密/压缩/配对码不适用于单向链路。"
+            : "UDP is one-way: datagrams are fired without waiting for confirmation; if the link drops some, re-send to fill the receiver's gaps. Encryption/compression/pairing do not apply to a one-way link."; } }
+        public static string ClientPortFollowed(object proto, object port)
+        {
+            return IsChinese
+                ? string.Format("协议已切换为 {0}，端口同步为 {1}（原端口属于其他协议的监听）。", proto, port)
+                : string.Format("Protocol switched to {0}; port updated to {1} (the previous port belongs to another protocol's listener).", proto, port);
+        }
+
         // ---- UDT client log messages ----
         public static string UdtC_Connecting(string ip, int port)
         {
@@ -282,7 +417,8 @@ namespace TrFileTransfer
         public static string ResumeListEmpty { get { return IsChinese ? "没有未完成的传输任务。" : "No incomplete transfer tasks."; } }
         public static string ResumeQueued { get { return IsChinese ? "已选择续传任务，点击“发送”开始续传。" : "Resume task selected. Click Send to resume."; } }
         public static string VerifyHashLabel { get { return IsChinese ? "完整校验（续传）" : "Full hash verify (resume)"; } }
-        public static string SpeedLimitLabel { get { return IsChinese ? "限速(KB/s)" : "Limit(KB/s)"; } }
+        public static string SpeedLimitLabel { get { return IsChinese ? "限速:" : "Limit:"; } }
+        public static string SpeedLimitTip { get { return IsChinese ? "KB/s，0 = 不限速" : "KB/s, 0 = unlimited"; } }
         public static string QueueBtn { get { return IsChinese ? "发送队列" : "Send Queue"; } }
         public static string QueueTitle { get { return IsChinese ? "发送队列" : "Send Queue"; } }
         public static string QueueAdd { get { return IsChinese ? "添加当前文件" : "Add Current"; } }
@@ -1149,9 +1285,13 @@ namespace TrFileTransfer
         {
             return IsChinese
                 ? "【接收（服务器）】\n" +
-                  "1. 选择\"保存到\"目录，勾选 TCP 和/或 UDT，点击\"启动\"。\n" +
+                  "1. 选择\"保存到\"目录；TCP / UDT / UDP 是三张独立标签页，各自选择端口，\n" +
+                  "  并可在\"绑定地址\"里勾选多个地址（IPv4/IPv6 通配或具体网卡），\n" +
+                  "  每个勾选地址都会各起一个监听；点\"启动\"。三种协议可同时运行。\n" +
                   "2. 勾选\"配对码\"后，发送方必须输入相同的 6 位码才能连接。\n" +
-                  "3. \"HTTP 共享\"把保存目录变成网页：手机浏览器可直接浏览、下载与上传。\n\n" +
+                  "3. UDP 为单向接收：无回传确认，报文缺失靠发送方重发补齐\n" +
+                  "  （已收分片会保留，重发只补缺口）；不支持加密/配对。\n" +
+                  "4. \"HTTP 共享\"把保存目录变成网页：手机浏览器可直接浏览、下载与上传。\n\n" +
                   "【发送（客户端）】\n" +
                   "1. 填写对方 IP 与端口；同一台电脑自测填 127.0.0.1。\n" +
                   "2. 选好文件/文件夹点\"发送文件\"，或直接把文件拖进窗口。\n" +
@@ -1179,10 +1319,16 @@ namespace TrFileTransfer
                   "  校验；运行 TrFileTransfer --help 查看用法\n\n" +
                   "提示：所有设置自动保存；关闭窗口仅最小化到托盘，\n托盘右键菜单可开机自启、检查更新或真正退出。"
                 : "[Receive (server)]\n" +
-                  "1. Pick the \"Save to\" folder, check TCP and/or UDT, press \"Start\".\n" +
-                  "2. With \"Pairing\" enabled the sender must enter the same code\n" +
+                  "1. Pick the \"Save to\" folder. TCP / UDT / UDP are separate tabs, each with\n" +
+                  "   its own port and a multi-select \"bind\" picker (family wildcards and/or\n" +
+                  "   specific interfaces — every checked address gets its own listener).\n" +
+                  "   Press \"Start\" per tab; all three can run at once.\n" +
+                  "2. One-way UDP receives without any ACK: lost datagrams are covered by the\n" +
+                  "   sender RE-SENDING (received chunks are kept; a re-send fills only the\n" +
+                  "   gaps). No encryption/pairing on a one-way link.\n" +
+                  "3. With \"Pairing\" enabled the sender must enter the same code\n" +
                   "   (4-12 digits, set in Options).\n" +
-                  "3. \"HTTP Share\" turns the folder into a web page — browse, download and\n" +
+                  "4. \"HTTP Share\" turns the folder into a web page — browse, download and\n" +
                   "   upload from a phone (large downloads can resume).\n\n" +
                   "[Send (client)]\n" +
                   "1. Enter the peer IP and port; use 127.0.0.1 to test on one machine.\n" +

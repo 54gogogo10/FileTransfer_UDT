@@ -17,6 +17,7 @@ namespace TrFileTransfer
         private readonly int _port;
         private readonly string _saveDirectory;
         private readonly int _bufferSize;
+        private readonly TcpBindMode _bindMode;
         private volatile bool _isRunning;
         private readonly ServerWireContext _wire = new ServerWireContext();
 
@@ -55,16 +56,22 @@ namespace TrFileTransfer
         /// <summary>
         /// Creates a TCP server that listens for incoming file transfers.
         /// </summary>
-        /// <param name="bindAddress">IPv4 address to bind to, or "0.0.0.0" for all interfaces.</param>
+        /// <param name="bindAddress">Specific address to bind to, or a wildcard ("0.0.0.0"/"::"/"").</param>
         /// <param name="port">Port to listen on.</param>
         /// <param name="saveDirectory">Directory where received files are saved.</param>
         /// <param name="bufferSize">I/O buffer size in bytes (default 4 MB).</param>
-        public TransferServer(string bindAddress, int port, string saveDirectory, int bufferSize = 4194304)
+        /// <param name="mode">Wildcard semantics: DualStack keeps the historic
+        /// one-listener-both-families behavior; IPv4Only/IPv6Only bind a family-scoped
+        /// wildcard so the two server tabs can share a port number. Ignored for
+        /// specific addresses.</param>
+        public TransferServer(string bindAddress, int port, string saveDirectory,
+            int bufferSize = 4194304, TcpBindMode mode = TcpBindMode.DualStack)
         {
             _bindAddress = bindAddress;
             _port = port;
             _saveDirectory = saveDirectory;
             _bufferSize = bufferSize;
+            _bindMode = mode;
             _wire.SaveDirectory = saveDirectory;
             _wire.BufferSize = bufferSize;
             // TCP has no out-of-band ACK, so the sender must be told the receiver's
@@ -165,19 +172,37 @@ namespace TrFileTransfer
 
             try
             {
-                if (unspecified)
+                if (!unspecified)
+                {
+                    _listener = new TcpListener(bindIp, _port);
+                    _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                    _listener.Start();
+                }
+                else if (_bindMode == TcpBindMode.IPv4Only)
+                {
+                    // Family-scoped wildcard (IPv4 tab): v6 peers cannot reach this
+                    // listener, so the IPv6 tab may listen on the same port number.
+                    _listener = new TcpListener(IPAddress.Any, _port);
+                    _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                    _listener.Start();
+                }
+                else if (_bindMode == TcpBindMode.IPv6Only)
+                {
+                    // DualMode=false is the v6-only wildcard (IPv6 tab). The default for
+                    // a bare v6 socket is v6-only on Windows, but set it explicitly —
+                    // the two-tab port sharing depends on it.
+                    _listener = new TcpListener(IPAddress.IPv6Any, _port);
+                    _listener.Server.DualMode = false;
+                    _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                    _listener.Start();
+                }
+                else
                 {
                     // Dual-mode listener: one socket accepts IPv4 AND IPv6 (v4 arrives as
                     // IPv4-mapped addresses). Falls back to IPv4-any where dual-mode is
                     // unavailable (XP-era) — same reachability as before.
                     _listener = TcpListener.Create(_port);
                     _listener.Server.DualMode = true;
-                    _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-                    _listener.Start();
-                }
-                else
-                {
-                    _listener = new TcpListener(bindIp, _port);
                     _listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
                     _listener.Start();
                 }

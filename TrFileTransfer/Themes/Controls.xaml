@@ -45,6 +45,29 @@
     <Rectangle x:Key="VDivider" Width="1" Height="18"
                Fill="{DynamicResource Brush.CardBorder}" VerticalAlignment="Center" Margin="6,0"/>
 
+    <!-- Horizontal resize handle: invisible hit area with a hairline that lights
+         up on hover so the progress/log rebalance stays discoverable but quiet -->
+    <Style x:Key="SplitterH" TargetType="GridSplitter">
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="GridSplitter">
+                    <Grid Background="{TemplateBinding Background}">
+                        <Rectangle x:Name="line" Height="1" HorizontalAlignment="Stretch"
+                                   VerticalAlignment="Center" RadiusX="0.5" RadiusY="0.5"
+                                   Fill="{DynamicResource Brush.CardBorder}"/>
+                    </Grid>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="line" Property="Fill" Value="{DynamicResource Brush.Accent}"/>
+                            <Setter TargetName="line" Property="Height" Value="2"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
     <!-- ==================== Buttons ==================== -->
 
     <Style x:Key="BtnPrimary" TargetType="Button">
@@ -165,7 +188,10 @@
                     <Border x:Name="bd" Background="{TemplateBinding Background}"
                             BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1"
                             CornerRadius="6">
-                        <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}"
+                        <!-- No Margin here: TextBox applies Padding to its content view
+                             itself, so binding Margin to Padding double-indents and
+                             clips the last digit in narrow port boxes -->
+                        <ScrollViewer x:Name="PART_ContentHost"
                                       VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
                     </Border>
                     <ControlTemplate.Triggers>
@@ -346,6 +372,72 @@
                         </Trigger>
                         <Trigger Property="IsMouseOver" Value="True">
                             <Setter TargetName="ring" Property="BorderBrush" Value="{DynamicResource Brush.TextDisabled}"/>
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter Property="Opacity" Value="0.45"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- ==================== TabControl ==================== -->
+
+    <Style x:Key="TabModern" TargetType="TabControl">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.TextPrimary}"/>
+        <Setter Property="FontSize" Value="12"/>
+        <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="TabControl">
+                    <!-- The ContentPresenter MUST be named PART_SelectedContentHost:
+                         TabControl.OnApplyTemplate looks it up by name, and without it
+                         the selected tab's content drops out of the UI Automation tree
+                         (screen readers / UIA clients see no children). -->
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+                        <Border Grid.Row="0" Background="{DynamicResource Brush.CardInner}"
+                                CornerRadius="6,6,0,0" Padding="4,3,4,0">
+                            <TabPanel IsItemsHost="True"/>
+                        </Border>
+                        <Border Grid.Row="1" BorderBrush="{DynamicResource Brush.CardBorder}"
+                                BorderThickness="1,0,1,1" CornerRadius="0,0,6,6"
+                                Background="Transparent" Padding="0,7,0,0"
+                                KeyboardNavigation.DirectionalNavigation="Contained"
+                                KeyboardNavigation.TabNavigation="Local">
+                            <ContentPresenter x:Name="PART_SelectedContentHost" ContentSource="SelectedContent"
+                                              SnapsToDevicePixels="{TemplateBinding SnapsToDevicePixels}"/>
+                        </Border>
+                    </Grid>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <Style x:Key="TabModernItem" TargetType="TabItem">
+        <Setter Property="Foreground" Value="{DynamicResource Brush.TextSecondary}"/>
+        <Setter Property="FontSize" Value="12"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="TabItem">
+                    <Border x:Name="header" CornerRadius="5,5,0,0" Padding="12,4" Margin="0,0,2,0"
+                            Background="Transparent" BorderThickness="0,0,0,2" BorderBrush="Transparent">
+                        <ContentPresenter ContentSource="Header" VerticalAlignment="Center"/>
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsSelected" Value="True">
+                            <Setter TargetName="header" Property="Background" Value="{DynamicResource Brush.ItemCard}"/>
+                            <Setter TargetName="header" Property="BorderBrush" Value="{DynamicResource Brush.Accent}"/>
+                            <Setter Property="Foreground" Value="{DynamicResource Brush.TextPrimary}"/>
+                        </Trigger>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter Property="Foreground" Value="{DynamicResource Brush.TextPrimary}"/>
                         </Trigger>
                         <Trigger Property="IsEnabled" Value="False">
                             <Setter Property="Opacity" Value="0.45"/>

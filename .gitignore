@@ -12,3 +12,10 @@ release/
 .claude/
 *.xml
 TrFileTransfer.exe.config
+.mimosa/
+.zcode/
+udt-build/
+udt-build2/
+udt-master/doc/hlp/
+udt-sdk/udt4/doc/hlp/
+TrFileTransfer/Tests/*.log

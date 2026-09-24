@@ -1451,7 +1451,11 @@ void CUDTUnited::updateMux(CUDTSocket* s, const CUDTSocket* ls)
    // find the listener's address
    for (map<int, CMultiplexer>::iterator i = m_mMultiplexer.begin(); i != m_mMultiplexer.end(); ++ i)
    {
-      if (i->second.m_iPort == port)
+      // Patch (TrFileTransfer 2026-09): also compare the IP version. Upstream matched
+      // on the port number alone, so a v4 listener and a v6 listener sharing one port
+      // number produced two same-port multiplexers and an accepted socket could attach
+      // to the OTHER family's send/receive queues -> native crash on the first packet.
+      if ((i->second.m_iPort == port) && (i->second.m_iIPversion == ls->m_iIPversion))
       {
          // reuse the existing multiplexer
          ++ i->second.m_iRefCount;

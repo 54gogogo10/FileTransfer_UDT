@@ -30,6 +30,7 @@ echo.
     ..\ConcurrentTransfer.cs ^
     ..\TransferServer.cs ^
     ..\TransferUdt.cs ^
+    ..\TransferUdp.cs ^
     ..\TransferClient.cs ^
     ..\DeviceDiscovery.cs ^
     ..\ResumeState.cs ^
