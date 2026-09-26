@@ -130,7 +130,13 @@ namespace TrFileTransfer
                 long offset = i * chunkSize;
                 long size = Math.Min(chunkSize, totalSize - offset);
                 if (size <= 0) break;
-                int localPort = FindLocalPort(i);
+                // With no user source port, let the OS hand out an ephemeral port —
+                // the same lesson ResumeAsync learned: FindLocalPort probes ports
+                // ADJACENT TO THE SERVER PORT, and a UDT chunk socket (SO_REUSEADDR)
+                // silently shadows whatever already holds that port — e.g. the
+                // one-way UDP server on <udt port>+1 — which then swallows the
+                // handshake response and the chunk connect times out.
+                int localPort = _srcPort > 0 ? FindLocalPort(i) : 0;
                 var task = SendChunkAsync(offset, size, totalSize, localPort, chunkSession);
                 tasks.Add(task);
             }
@@ -147,6 +153,7 @@ namespace TrFileTransfer
                 if (_cancelled) return;
                 var errHandler = OnError;
                 if (errHandler != null) errHandler("Concurrent transfer failed: " + ex.Message);
+                throw; // a failed send must not read as success to the caller
             }
         }
 
@@ -244,6 +251,7 @@ namespace TrFileTransfer
                 if (_cancelled) return;
                 var errHandler = OnError;
                 if (errHandler != null) errHandler("Concurrent resume failed: " + ex.Message);
+                throw; // a failed resume must not read as success to the caller
             }
         }
 

@@ -8,8 +8,8 @@ namespace TrFileTransfer
     #pragma warning disable 1591
     public static class Config
     {
-        private static readonly string _dir;
-        private static readonly string _path;
+        private static string _dir;
+        private static string _path;
         private static readonly Dictionary<string, string> _values = new Dictionary<string, string>();
         // The UI thread writes here (control handlers) while server/client threads read
         // (encryption/compression options, IP filter, device naming). An unsynchronized
@@ -21,6 +21,19 @@ namespace TrFileTransfer
         {
             _dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "TrFileTransfer");
             _path = Path.Combine(_dir, "config.ini");
+        }
+
+        /// <summary>Redirects persistence to a specific file — test isolation, so a
+        /// test run never reads or stomps the developer's real config.ini. Must be
+        /// called before Load/Get; clears anything already loaded.</summary>
+        public static void UseFile(string path)
+        {
+            lock (_lock)
+            {
+                _path = path;
+                _dir = Path.GetDirectoryName(path);
+                _values.Clear();
+            }
         }
 
         public static void Load()

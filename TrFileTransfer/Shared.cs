@@ -1,10 +1,24 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Net;
 using System.Net.Sockets;
 
 namespace TrFileTransfer
 {
+    /// <summary>How a wildcard bind treats the two address families. Specific
+    /// addresses ignore this — the address itself picks the family.</summary>
+    public enum TcpBindMode
+    {
+        /// <summary>Historic default ("": one dual-mode listener accepts IPv4 AND IPv6).</summary>
+        DualStack,
+        /// <summary>"0.0.0.0" as chosen on the IPv4 tab: a v4-only wildcard listener.</summary>
+        IPv4Only,
+        /// <summary>"::" as chosen on the IPv6 tab: a v6-only wildcard listener
+        /// (DualMode=false — v4 peers do NOT reach it).</summary>
+        IPv6Only
+    }
+
     /// <summary>Progress snapshot emitted periodically during a transfer.</summary>
     public struct TransferProgress
     {
@@ -371,9 +385,39 @@ namespace TrFileTransfer
             return false;
         }
 
-        /// <summary>Finds a free port starting from basePort, scanning upward.</summary>
-        public static int FindFreePort(int basePort, bool isUdp = false)
+        /// <summary>Copies a sub-range of a buffer (null-safe).</summary>
+        public static byte[] CopyBytes(byte[] src, int offset, int count)
         {
+            var dst = new byte[count];
+            if (src != null)
+            {
+                int take = Math.Min(count, src.Length - offset);
+                if (take > 0) Buffer.BlockCopy(src, offset, dst, 0, take);
+            }
+            return dst;
+        }
+
+        /// <summary>Stats a file into size + UTC mtime ticks; false when unreachable.</summary>
+        public static bool StatFile(string path, out long size, out long mtimeTicks)
+        {
+            size = 0;
+            mtimeTicks = 0;
+            try
+            {
+                var fi = new FileInfo(path);
+                if (!fi.Exists) return false;
+                size = fi.Length;
+                mtimeTicks = fi.LastWriteTimeUtc.Ticks;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>Finds a free port starting from basePort, scanning upward.</summary>
+        public static int FindFreePort(int basePort, bool isUdp = false)        {
             for (int port = basePort; port < basePort + 128; port++)
             {
                 try
@@ -420,6 +464,75 @@ namespace TrFileTransfer
                 catch { return false; }
             }
             return true;
+        }
+
+        /// <summary>Whether the port can be bound on the EXACT address (not just loopback).
+        /// Probes with the same socket shape the real listener will use: a v6 address is
+        /// probed on a v6-only socket (DualMode=false), so a v4-any listener on the same
+        /// port does not count as occupied — the two families are independent binds.
+        /// An unavailable address (stale NIC entry) is reported as free: the probe cannot
+        /// learn anything there, and the real bind should surface the accurate error.</summary>
+        public static bool IsAddressPortFree(IPAddress addr, int port, bool tcp)
+        {
+            if (addr == null) return IsPortFree(port, tcp, !tcp);
+            if (tcp)
+            {
+                try
+                {
+                    var l = new TcpListener(addr, port);
+                    l.Start();
+                    l.Stop();
+                    return true;
+                }
+                catch (SocketException se)
+                {
+                    if (se.SocketErrorCode == SocketError.AddressNotAvailable) return true;
+                    return false;
+                }
+                catch { return false; }
+            }
+            try
+            {
+                var s = new Socket(addr.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
+                if (addr.AddressFamily == AddressFamily.InterNetworkV6)
+                {
+                    try { s.DualMode = false; } catch { }
+                }
+                try
+                {
+                    s.Bind(new IPEndPoint(addr, port));
+                }
+                finally
+                {
+                    try { s.Close(); } catch { }
+                }
+                return true;
+            }
+            catch (SocketException se)
+            {
+                if (se.SocketErrorCode == SocketError.AddressNotAvailable) return true;
+                return false;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>True for the family wildcard addresses (0.0.0.0 / ::) — anything
+        /// that binds "all interfaces of one family".</summary>
+        public static bool IsWildcardAddress(IPAddress a)
+        {
+            return a != null && (a.Equals(IPAddress.Any) || a.Equals(IPAddress.IPv6Any));
+        }
+
+        /// <summary>Whether two bind endpoints can collide: same port, same family,
+        /// and either identical or one of them is that family's wildcard. v4-any and
+        /// v6-any on the same port coexist on Windows (independent stacks), which is
+        /// what lets the IPv4 and IPv6 tabs share a port number.</summary>
+        public static bool BindConflicts(IPAddress a, IPAddress b, int portA, int portB)
+        {
+            if (portA != portB) return false;
+            if (a == null || b == null) return false;
+            if (a.AddressFamily != b.AddressFamily) return false;
+            return a.Equals(b) || IsWildcardAddress(a) || IsWildcardAddress(b);
         }
 
         /// <summary>First free port scanning upward from start (inclusive); 0 when none in range.</summary>

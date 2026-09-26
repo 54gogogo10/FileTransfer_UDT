@@ -9,7 +9,10 @@ namespace TrFileTransfer
         public bool IsFolder;
         public string ServerIp;
         public int Port;
+        /// <summary>UDT transport (historic name — the queue predates the UDP option).</summary>
         public bool IsUdp;
+        /// <summary>One-way raw UDP transport (no ACK channel).</summary>
+        public bool IsRawUdp;
         public int SrcPort;
         public int Concurrency;
         public bool VerifyHash;

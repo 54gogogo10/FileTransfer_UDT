@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
@@ -133,9 +134,617 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_TCP_ChunkDigestRegistered", ChunkDigestRegistered);
             runner.Run("Integration_TCP_ChunkCoverageResume", () => ChunkCoverageResume(false), 1);
             runner.Run("Integration_UDT_ChunkCoverageResume", () => ChunkCoverageResume(true), 1);
+            runner.Run("Integration_UDT_ChunkSend_AdjacentUdpServer", UdtChunkSendAdjacentUdpServer, 1);
+            runner.Run("Integration_ConcurrentSend_Throws_WhenNoServer", ConcurrentSendThrowsWhenNoServer);
             runner.Run("Integration_TCP_IPv6", TcpIPv6, 1);
             runner.Run("Integration_UDT_IPv6", UdtIPv6, 1);
             runner.Run("Integration_TCP_DualStack_PeerNormalization", DualStackPeerNormalization, 1);
+            runner.Run("Integration_TCP_V4V6_FamilyTabsCoexist", FamilyTabsCoexist, 1);
+            runner.Run("Integration_UDT_V4V6_SamePort", UdtFamilySamePort, 1);
+            runner.Run("Unit_BindConflictRules", BindConflictRules);
+            runner.Run("Unit_AddressPortProbeFamilyScoped", AddressPortProbeFamilyScoped);
+            runner.Run("Unit_AddressPortProbeUnavailableAddr", AddressPortProbeUnavailableAddr);
+            runner.Run("Integration_UDP_OneWay_SingleFile", UdpOneWaySingleFile, 1);
+            runner.Run("Integration_UDP_OneWay_EmptyFile", UdpOneWayEmptyFile, 1);
+            runner.Run("Integration_UDP_OneWay_LossyResume", UdpOneWayLossyResume, 1);
+            runner.Run("Integration_UDP_OneWay_GarbageRejected", UdpOneWayGarbageRejected, 1);
+            runner.Run("Integration_UDP_V4V6_SamePort", UdpV4V6SamePort, 1);
+            runner.Run("Integration_TCP_MultiAddressSamePort", TcpMultiAddressSamePort, 1);
+        }
+
+        /// <summary>
+        /// The protocol tabs start ONE LISTENER PER SELECTED ADDRESS on one port. Two
+        /// specific same-family addresses (loopback + the first real interface) must
+        /// coexist on the same port number and each receive its own traffic. (A wildcard
+        /// plus a specific of the same family is REFUSED by the app's conflict rule even
+        /// though Windows would technically allow the bind — the app-side rule is pinned
+        /// by Unit_BindConflictRules.)
+        /// </summary>
+        private static void TcpMultiAddressSamePort()
+        {
+            IPAddress lan = null;
+            try
+            {
+                foreach (var ni in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up) continue;
+                    foreach (var a in ni.GetIPProperties().UnicastAddresses)
+                    {
+                        if (a.Address.AddressFamily == AddressFamily.InterNetwork
+                            && !a.Address.Equals(IPAddress.Loopback))
+                        {
+                            lan = a.Address;
+                            break;
+                        }
+                    }
+                    if (lan != null) break;
+                }
+            }
+            catch { }
+            Assert.NotNull(lan, "machine has a non-loopback v4 interface");
+
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_ma_s_" + Guid.NewGuid().ToString("N"));
+            string recvLo = Path.Combine(TempBase(), "tr_ma_lo_" + Guid.NewGuid().ToString("N"));
+            string recvLan = Path.Combine(TempBase(), "tr_ma_lan_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvLo);
+            Directory.CreateDirectory(recvLan);
+            TransferServer sLo = null, sLan = null;
+            try
+            {
+                var content = new byte[128 * 1024];
+                new Random(305).NextBytes(content);
+                string file = Path.Combine(sendDir, "multi.bin");
+                File.WriteAllBytes(file, content);
+
+                var loStarted = new ManualResetEvent(false);
+                sLo = new TransferServer(IPAddress.Loopback.ToString(), port, recvLo);
+                sLo.OnStarted += () => loStarted.Set();
+                sLo.Start();
+                if (!loStarted.WaitOne(5000)) throw new Exception("loopback listener did not start");
+
+                var lanStarted = new ManualResetEvent(false);
+                sLan = new TransferServer(lan.ToString(), port, recvLan);
+                sLan.OnStarted += () => lanStarted.Set();
+                sLan.Start();
+                if (!lanStarted.WaitOne(5000)) throw new Exception("interface listener did not start on the same port");
+
+                new TransferClient(IPAddress.Loopback.ToString(), port, file).SendAsync().Wait(30000);
+                new TransferClient(lan.ToString(), port, file).SendAsync().Wait(30000);
+                Thread.Sleep(400);
+                Assert.True(Utils.ConstantTimeEquals(content,
+                    File.ReadAllBytes(Path.Combine(recvLo, "multi.bin"))),
+                    "loopback client landed in the loopback listener's dir");
+                Assert.True(Utils.ConstantTimeEquals(content,
+                    File.ReadAllBytes(Path.Combine(recvLan, "multi.bin"))),
+                    "interface client landed in the interface listener's dir");
+            }
+            finally
+            {
+                if (sLo != null) { try { sLo.Stop(); } catch { } }
+                if (sLan != null) { try { sLan.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvLo, true); } catch { }
+                try { Directory.Delete(recvLan, true); } catch { }
+            }
+        }
+
+        // ==================== One-way raw UDP ====================
+
+        /// <summary>A forwarding proxy with a mutable drop policy — simulates a lossy
+        /// one-way link in front of a real receiver, with real datagrams.</summary>
+        private sealed class LossyUdpProxy : IDisposable
+        {
+            private readonly UdpClient _listen;
+            private readonly IPEndPoint _target;
+            public Func<byte[], bool> Forward;
+            public int Port;
+
+            public LossyUdpProxy(IPEndPoint target, Func<byte[], bool> forward)
+            {
+                _target = target;
+                Forward = forward;
+                _listen = new UdpClient(0);
+                // The proxy adds a forwarding hop per datagram — without a deep buffer
+                // the client's burst overflows it and the "lossy link" loses far more
+                // than the policy says (observed ~25% on loopback)
+                try { _listen.Client.ReceiveBufferSize = 4 * 1024 * 1024; } catch { }
+                // ICMP port-unreachable (while the target restarts) must not poison the
+                // proxy's next send — the lossy-link stand-in has to survive it
+                try { _listen.Client.IOControl(unchecked((int)0x98000004), new byte[] { 0 }, null); }
+                catch { }
+                Port = ((IPEndPoint)_listen.Client.LocalEndPoint).Port;
+                Loop();
+            }
+
+            private async void Loop()
+            {
+                try
+                {
+                    while (true)
+                    {
+                        UdpReceiveResult r = await _listen.ReceiveAsync();
+                        if (Forward != null && !Forward(r.Buffer)) continue;
+                        try
+                        {
+                            await _listen.SendAsync(r.Buffer, r.Buffer.Length, _target);
+                        }
+                        catch (SocketException) { } // transient (target mid-restart) — keep serving
+                    }
+                }
+                catch (ObjectDisposedException) { }
+                catch (SocketException) { }
+            }
+
+            public void Dispose()
+            {
+                try { _listen.Close(); } catch { }
+            }
+        }
+
+        private static TransferUdpServer StartUdpReceiver(string bind, int port, string dir)
+        {
+            var started = new ManualResetEvent(false);
+            var server = new TransferUdpServer(bind, port, dir);
+            server.OnStarted += () => started.Set();
+            server.Start();
+            if (!started.WaitOne(5000))
+                throw new Exception("UDP receiver did not start within 5s");
+            return server;
+        }
+
+        /// <summary>Delivery waiter — subscribe BEFORE the send starts, or a fast
+        /// loopback delivery fires before anyone is listening.</summary>
+        private sealed class UdpDeliveryWaiter
+        {
+            public string Path;
+            public readonly ManualResetEvent Done = new ManualResetEvent(false);
+        }
+
+        private static UdpDeliveryWaiter WatchUdpDelivery(TransferUdpServer server)
+        {
+            var w = new UdpDeliveryWaiter();
+            server.OnFileReceived += (p, sz) => { w.Path = p; w.Done.Set(); };
+            return w;
+        }
+
+        private static string WaitUdp(UdpDeliveryWaiter w, int timeoutMs)
+        {
+            return w.Done.WaitOne(timeoutMs) ? w.Path : null;
+        }
+
+        private static void UdpOneWaySingleFile()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_u1_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_u1_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdpServer server = null;
+            try
+            {
+                var content = new byte[1024 * 1024];
+                new Random(301).NextBytes(content);
+                string file = Path.Combine(sendDir, "oneway.bin");
+                File.WriteAllBytes(file, content);
+
+                server = StartUdpReceiver("127.0.0.1", port, recvDir);
+                var waiter = WatchUdpDelivery(server);
+                var client = new TransferUdpClient("127.0.0.1", port, file);
+                client.SendAsync().Wait(30000);
+
+                string got = WaitUdp(waiter, 15000);
+                Assert.NotNull(got, "one-way file delivered");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(got)),
+                    "one-way delivered bytes match");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        private static void UdpOneWayEmptyFile()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_u0_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_u0_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdpServer server = null;
+            try
+            {
+                string file = Path.Combine(sendDir, "empty.bin");
+                File.WriteAllBytes(file, new byte[0]);
+
+                server = StartUdpReceiver("127.0.0.1", port, recvDir);
+                var waiter = WatchUdpDelivery(server);
+                var client = new TransferUdpClient("127.0.0.1", port, file);
+                client.SendAsync().Wait(30000);
+
+                string got = WaitUdp(waiter, 15000);
+                Assert.NotNull(got, "empty one-way file delivered");
+                Assert.Equal(0L, new FileInfo(got).Length, "empty file is empty");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// The one-way reliability model under real loss: pass 1 through a proxy that
+        /// drops every 5th DATA datagram leaves the receiver with a sparse .part and NO
+        /// final file; a re-send (through a now-clean proxy, and after a receiver
+        /// RESTART — the .part file on disk is the state) fills exactly the gaps and
+        /// completes. This is the "re-send is the retry" contract.
+        /// </summary>
+        private static void UdpOneWayLossyResume()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_ul_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_ul_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdpServer server = null;
+            LossyUdpProxy proxy = null;
+            try
+            {
+                var content = new byte[512 * 1024];
+                new Random(302).NextBytes(content);
+                string file = Path.Combine(sendDir, "lossy.bin");
+                File.WriteAllBytes(file, content);
+
+                server = StartUdpReceiver("127.0.0.1", port, recvDir);
+                proxy = new LossyUdpProxy(new IPEndPoint(IPAddress.Loopback, port), delegate(byte[] b)
+                {
+                    // Drop every 5th DATA frame; START/END always pass
+                    return b[3] != 0x02 || BitConverter.ToInt32(b, 20) % 5 != 3;
+                });
+
+                var waiter1 = WatchUdpDelivery(server);
+                var client1 = new TransferUdpClient("127.0.0.1", proxy.Port, file);
+                client1.SendAsync().Wait(60000);
+                Thread.Sleep(800); // let the receiver chew what arrived
+
+                Assert.False(File.Exists(Path.Combine(recvDir, "lossy.bin")),
+                    "lossy pass 1 must not deliver a file");
+                Assert.True(Directory.GetFiles(Path.Combine(recvDir, ".udp"), "*.part").Length == 1,
+                    "partial .part file kept after the lossy pass");
+
+                // Receiver restart: disk is the state
+                server.Stop();
+                server = StartUdpReceiver("127.0.0.1", port, recvDir);
+
+                proxy.Forward = delegate(byte[] b) { return true; };
+                var waiter2 = WatchUdpDelivery(server);
+                var client2 = new TransferUdpClient("127.0.0.1", proxy.Port, file);
+                client2.SendAsync().Wait(60000);
+
+                string got = WaitUdp(waiter2, 15000);
+                Assert.NotNull(got, "re-send completed the file after receiver restart");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(got)),
+                    "gap-filled bytes match the original");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                if (proxy != null) proxy.Dispose();
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>Hostile datagrams (bad magic/version/shape/truncations and random
+        /// noise) must neither crash the receiver nor produce files; a subsequent good
+        /// send still works.</summary>
+        private static void UdpOneWayGarbageRejected()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_ug_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_ug_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdpServer server = null;
+            try
+            {
+                var content = new byte[64 * 1024];
+                new Random(303).NextBytes(content);
+                string file = Path.Combine(sendDir, "good.bin");
+                File.WriteAllBytes(file, content);
+
+                server = StartUdpReceiver("127.0.0.1", port, recvDir);
+
+                using (var udp = new UdpClient())
+                {
+                    var target = new IPEndPoint(IPAddress.Loopback, port);
+                    byte[] head = UdpOneWay.BuildHeader(UdpOneWay.FrameStart, Guid.NewGuid());
+                    // bad magic / bad version / truncated START / absurd shape / noise
+                    byte[][] junk =
+                    {
+                        new byte[] { 0x58, 0x59, 1, 1, 0, 0, 0, 0 },
+                        Utils.CopyBytes(new byte[] { (byte)'T', (byte)'U', 9, 1 }, 0, 4),
+                        Utils.CopyBytes(head, 0, UdpOneWay.HeaderSize - 1),
+                        Utils.CopyBytes(head, 0, UdpOneWay.HeaderSize),
+                        new byte[13],
+                    };
+                    for (int i = 0; i < junk.Length; i++)
+                        udp.Send(junk[i], junk[i].Length, target);
+                    // a plausible START with an absurd size (rejected by the cap)
+                    var absurd = Utils.CopyBytes(head, 0, UdpOneWay.HeaderSize + 54);
+                    Buffer.BlockCopy(BitConverter.GetBytes(long.MaxValue - 1), 0, absurd, UdpOneWay.HeaderSize, 8);
+                    udp.Send(absurd, absurd.Length, target);
+                    var noise = new byte[70000];
+                    new Random(9).NextBytes(noise);
+                    udp.Send(noise, 65500, target);
+                }
+
+                Thread.Sleep(400);
+                Assert.Equal(0, Directory.GetFiles(recvDir, "*", SearchOption.AllDirectories)
+                    .Length - Directory.GetDirectories(recvDir).Length,
+                    "no files from hostile datagrams");
+
+                var waiter = WatchUdpDelivery(server);
+                var client = new TransferUdpClient("127.0.0.1", port, file);
+                client.SendAsync().Wait(30000);
+                string got = WaitUdp(waiter, 15000);
+                Assert.NotNull(got, "good send still works after the garbage");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(got)), "bytes match");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>v4-any and v6-any one-way receivers share one port number (the
+        /// families are independent UDP stacks), each serving its own family.</summary>
+        private static void UdpV4V6SamePort()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_uv_s_" + Guid.NewGuid().ToString("N"));
+            string recv4 = Path.Combine(TempBase(), "tr_uv_r4_" + Guid.NewGuid().ToString("N"));
+            string recv6 = Path.Combine(TempBase(), "tr_uv_r6_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recv4);
+            Directory.CreateDirectory(recv6);
+            TransferUdpServer s4 = null, s6 = null;
+            try
+            {
+                var content = new byte[128 * 1024];
+                new Random(304).NextBytes(content);
+                string file = Path.Combine(sendDir, "both.bin");
+                File.WriteAllBytes(file, content);
+
+                s4 = StartUdpReceiver("0.0.0.0", port, recv4);
+                s6 = StartUdpReceiver("::", port, recv6);
+
+                var waiter4 = WatchUdpDelivery(s4);
+                var waiter6 = WatchUdpDelivery(s6);
+                var c4 = new TransferUdpClient("127.0.0.1", port, file);
+                c4.SendAsync().Wait(30000);
+                var c6 = new TransferUdpClient("::1", port, file);
+                c6.SendAsync().Wait(30000);
+
+                string got4 = WaitUdp(waiter4, 15000);
+                string got6 = WaitUdp(waiter6, 15000);
+                Assert.NotNull(got4, "v4 one-way delivered");
+                Assert.NotNull(got6, "v6 one-way delivered");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(got4)), "v4 bytes match");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(got6)), "v6 bytes match");
+            }
+            finally
+            {
+                if (s4 != null) { try { s4.Stop(); } catch { } }
+                if (s6 != null) { try { s6.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recv4, true); } catch { }
+                try { Directory.Delete(recv6, true); } catch { }
+            }
+        }
+
+        /// <summary>An address that is not on any interface is "unavailable", not
+        /// "busy" — the probe reports free (indeterminate) so the real bind surfaces
+        /// the accurate error instead of a misleading port-change offer.</summary>
+        private static void AddressPortProbeUnavailableAddr()
+        {
+            Assert.True(Utils.IsAddressPortFree(System.Net.IPAddress.Parse("203.0.113.99"), 19555, true),
+                "unavailable v4 address reports indeterminate");
+            Assert.True(Utils.IsAddressPortFree(System.Net.IPAddress.Parse("2001:db8::99"), 19555, false),
+                "unavailable v6 address reports indeterminate");
+        }
+
+        /// <summary>
+        /// The two server tabs are family-scoped wildcards: a v4-only ("0.0.0.0" +
+        /// TcpBindMode.IPv4Only) and a v6-only ("::" + IPv6Only) listener may share one
+        /// port number, each family reaches its own listener — and, the point of the
+        /// scoping, a lone v4-only listener REFUSES a ::1 client (that reachability
+        /// belongs to the legacy dual-stack "" mode).
+        /// </summary>
+        private static void FamilyTabsCoexist()
+        {
+            string sendDir = Path.Combine(TempBase(), "tr_ft_s_" + Guid.NewGuid().ToString("N"));
+            string recv4 = Path.Combine(TempBase(), "tr_ft_r4_" + Guid.NewGuid().ToString("N"));
+            string recv6 = Path.Combine(TempBase(), "tr_ft_r6_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recv4);
+            Directory.CreateDirectory(recv6);
+            TransferServer s4 = null, s6 = null;
+            try
+            {
+                var content = new byte[256 * 1024];
+                new Random(210).NextBytes(content);
+                string file = Path.Combine(sendDir, "tab.bin");
+                File.WriteAllBytes(file, content);
+
+                // Part A: family scoping — a lone v4-only listener refuses ::1
+                int soloPort = FindFreePort();
+                var solo = new TransferServer("0.0.0.0", soloPort, recv4, 4194304, TcpBindMode.IPv4Only);
+                var soloStarted = new ManualResetEvent(false);
+                solo.OnStarted += () => soloStarted.Set();
+                solo.Start();
+                if (!soloStarted.WaitOne(5000)) throw new Exception("solo v4 server did not start");
+                bool refused = false;
+                try { new TransferClient("::1", soloPort, file).SendAsync().Wait(8000); }
+                catch { refused = true; }
+                solo.Stop();
+                Assert.True(refused, "v4-only wildcard must refuse a ::1 client (dual-stack is the '' mode)");
+
+                // Part B: both families listen on the SAME port and each serves its own
+                int port = FindFreePort();
+                var started4 = new ManualResetEvent(false);
+                s4 = new TransferServer("0.0.0.0", port, recv4, 4194304, TcpBindMode.IPv4Only);
+                s4.OnStarted += () => started4.Set();
+                s4.Start();
+                if (!started4.WaitOne(5000)) throw new Exception("v4 server did not start");
+
+                var started6 = new ManualResetEvent(false);
+                s6 = new TransferServer("::", port, recv6, 4194304, TcpBindMode.IPv6Only);
+                s6.OnStarted += () => started6.Set();
+                s6.Start();
+                if (!started6.WaitOne(5000)) throw new Exception("v6 server did not start on the same port");
+
+                new TransferClient("127.0.0.1", port, file).SendAsync().Wait(30000);
+                new TransferClient("::1", port, file).SendAsync().Wait(30000);
+                Thread.Sleep(400);
+                Assert.True(Utils.ConstantTimeEquals(content,
+                    File.ReadAllBytes(Path.Combine(recv4, "tab.bin"))), "v4 client landed in the v4 server's dir");
+                Assert.True(Utils.ConstantTimeEquals(content,
+                    File.ReadAllBytes(Path.Combine(recv6, "tab.bin"))), "v6 client landed in the v6 server's dir");
+            }
+            finally
+            {
+                if (s4 != null) { try { s4.Stop(); } catch { } }
+                if (s6 != null) { try { s6.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recv4, true); } catch { }
+                try { Directory.Delete(recv6, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// UDT has no dual-mode socket — the family tabs bind two independent UDP
+        /// sockets (v4-any and v6-any) which must coexist on one port and each serve
+        /// its own family.
+        /// </summary>
+        private static void UdtFamilySamePort()
+        {
+            string sendDir = Path.Combine(TempBase(), "tr_ftu_s_" + Guid.NewGuid().ToString("N"));
+            string recv4 = Path.Combine(TempBase(), "tr_ftu_r4_" + Guid.NewGuid().ToString("N"));
+            string recv6 = Path.Combine(TempBase(), "tr_ftu_r6_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recv4);
+            Directory.CreateDirectory(recv6);
+            TransferUdtServer s4 = null, s6 = null;
+            try
+            {
+                var content = new byte[256 * 1024];
+                new Random(211).NextBytes(content);
+                string file = Path.Combine(sendDir, "tabu.bin");
+                File.WriteAllBytes(file, content);
+
+                int port = FindFreePort();
+                var started4 = new ManualResetEvent(false);
+                s4 = new TransferUdtServer("0.0.0.0", port, recv4);
+                s4.OnStarted += () => started4.Set();
+                s4.Start();
+                if (!started4.WaitOne(5000)) throw new Exception("v4 UDT server did not start");
+
+                var started6 = new ManualResetEvent(false);
+                s6 = new TransferUdtServer("::", port, recv6);
+                s6.OnStarted += () => started6.Set();
+                s6.Start();
+                if (!started6.WaitOne(5000)) throw new Exception("v6 UDT server did not start on the same port");
+
+                new TransferUdtClient("127.0.0.1", port, file).SendAsync().Wait(60000);
+                new TransferUdtClient("::1", port, file).SendAsync().Wait(60000);
+                Thread.Sleep(400);
+                Assert.True(Utils.ConstantTimeEquals(content,
+                    File.ReadAllBytes(Path.Combine(recv4, "tabu.bin"))), "v4 UDT client landed in the v4 server's dir");
+                Assert.True(Utils.ConstantTimeEquals(content,
+                    File.ReadAllBytes(Path.Combine(recv6, "tabu.bin"))), "v6 UDT client landed in the v6 server's dir");
+            }
+            finally
+            {
+                if (s4 != null) { try { s4.Stop(); } catch { } }
+                if (s6 != null) { try { s6.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recv4, true); } catch { }
+                try { Directory.Delete(recv6, true); } catch { }
+            }
+        }
+
+        /// <summary>The conflict rule behind the tab port check: same port + same
+        /// family + (equal or one wildcard). Cross-family and cross-port never conflict.</summary>
+        private static void BindConflictRules()
+        {
+            var any4 = System.Net.IPAddress.Any;
+            var any6 = System.Net.IPAddress.IPv6Any;
+            var v4a = System.Net.IPAddress.Parse("192.168.1.5");
+            var v4b = System.Net.IPAddress.Parse("10.0.0.1");
+            var v6a = System.Net.IPAddress.Parse("2001:db8::1");
+            var v6b = System.Net.IPAddress.Parse("fd00::2");
+
+            Assert.True(Utils.BindConflicts(any4, any4, 1000, 1000), "v4 wildcard vs itself");
+            Assert.True(Utils.BindConflicts(any4, v4a, 1000, 1000), "v4 wildcard covers a specific v4");
+            Assert.True(Utils.BindConflicts(v4a, any4, 1000, 1000), "specific v4 covered by the v4 wildcard");
+            Assert.True(Utils.BindConflicts(v4a, v4a, 1000, 1000), "identical v4 specifics conflict");
+            Assert.False(Utils.BindConflicts(v4a, v4b, 1000, 1000), "distinct v4 specifics coexist");
+            Assert.False(Utils.BindConflicts(any4, any6, 1000, 1000), "v4 and v6 wildcards are independent stacks");
+            Assert.False(Utils.BindConflicts(v4a, v6a, 1000, 1000), "specific v4 and v6 coexist");
+            Assert.False(Utils.BindConflicts(any4, v4a, 1000, 1001), "different ports never conflict");
+            Assert.True(Utils.BindConflicts(any6, v6b, 1000, 1000), "v6 wildcard covers a specific v6");
+            Assert.False(Utils.BindConflicts(null, any4, 1000, 1000), "null bind never conflicts");
+
+            Assert.True(Utils.IsWildcardAddress(any4) && Utils.IsWildcardAddress(any6), "wildcards detected");
+            Assert.False(Utils.IsWildcardAddress(v4a), "specific v4 is not a wildcard");
+            Assert.False(Utils.IsWildcardAddress(v6a), "specific v6 is not a wildcard");
+        }
+
+        /// <summary>The exact-address port probe: probing the exact address detects a
+        /// listener on that same address, and the v6 wildcard probe (a v6-only socket)
+        /// is unaffected by v4 binds — the two families are independent stacks.
+        /// (Wildcard-vs-specific COexistence is OS-dependent and deliberately not
+        /// pinned; the app's own listeners additionally go through BindConflicts.)</summary>
+        private static void AddressPortProbeFamilyScoped()
+        {
+            int port = FindFreePort();
+            Assert.True(Utils.IsAddressPortFree(System.Net.IPAddress.IPv6Any, port, true),
+                "v6 wildcard probe passes on a free port");
+            var hold = new TcpListener(System.Net.IPAddress.Any, port);
+            hold.Start();
+            try
+            {
+                Assert.False(Utils.IsAddressPortFree(System.Net.IPAddress.Any, port, true),
+                    "v4 wildcard probe sees the identical wildcard listener");
+                Assert.True(Utils.IsAddressPortFree(System.Net.IPAddress.IPv6Any, port, true),
+                    "v6 wildcard probe is unaffected by a v4 bind");
+            }
+            finally
+            {
+                hold.Stop();
+            }
+
+            // Same-address detection for a specific bind as well
+            int port2 = FindFreePort();
+            var hold2 = new TcpListener(System.Net.IPAddress.Loopback, port2);
+            hold2.Start();
+            try
+            {
+                Assert.False(Utils.IsAddressPortFree(System.Net.IPAddress.Loopback, port2, true),
+                    "loopback probe sees the identical loopback listener");
+            }
+            finally
+            {
+                hold2.Stop();
+            }
         }
 
         /// <summary>
@@ -144,6 +753,97 @@ namespace TrFileTransfer.Tests
         /// the client must send ONLY the complement, proven by the server's chunk log
         /// showing a resume pass with no byte at offset 0.
         /// </summary>
+        /// <summary>Regression for "UDT concurrent send fails when the one-way UDP
+        /// server runs on the adjacent port": SendAsync used to pick chunk source
+        /// ports starting at serverPort+1, and the UDT socket's SO_REUSEADDR bind
+        /// silently shadowed the UDP server already holding that port — the handshake
+        /// response landed on the UDP server and the chunk connect timed out. Chunk
+        /// connections must use ephemeral ports when the user set no source port.</summary>
+        private static void UdtChunkSendAdjacentUdpServer()
+        {
+            // Find a server port whose ADJACENT port is UDP-bindable on loopback,
+            // so the bare-UDP server can actually hold the collision port.
+            int port = 0;
+            for (int attempt = 0; attempt < 32; attempt++)
+            {
+                int candidate = FindFreePort();
+                if (candidate != 0 && Utils.IsPortFree(candidate + 1, false, true)) { port = candidate; break; }
+            }
+            Assert.True(port != 0, "found a port whose neighbour is UDP-free");
+
+            string sendDir = Path.Combine(TempBase(), "tr_adj_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_adj_r_" + Guid.NewGuid().ToString("N"));
+            string udpDir = Path.Combine(TempBase(), "tr_adj_u_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            Directory.CreateDirectory(udpDir);
+            TransferUdtServer udtServer = null;
+            TransferUdpServer udpServer = null;
+            try
+            {
+                var content = new byte[58880];
+                new Random(5).NextBytes(content);
+                string file = Path.Combine(sendDir, "adj.bin");
+                File.WriteAllBytes(file, content);
+
+                var started = new ManualResetEvent(false);
+                udtServer = new TransferUdtServer("127.0.0.1", port, recvDir);
+                udtServer.OnStarted += () => started.Set();
+                udtServer.Start();
+                // The collision port: serverPort+1, exactly what the old SendAsync probed first
+                udpServer = new TransferUdpServer("127.0.0.1", port + 1, udpDir);
+                udpServer.Start();
+                if (!started.WaitOne(5000))
+                    throw new Exception("UDT server did not start within 5s");
+                Assert.True(udpServer.IsRunning, "one-way UDP server holds serverPort+1");
+
+                var concurrent = new ConcurrentTransfer("127.0.0.1", port, file, 2, false);
+                var done = new ManualResetEvent(false);
+                Exception error = null;
+                concurrent.OnTransferComplete += () => done.Set();
+                concurrent.OnError += m => { error = new Exception(m); done.Set(); };
+                var task = concurrent.SendAsync(Guid.NewGuid());
+                if (!done.WaitOne(30000))
+                    throw new Exception("Concurrent send did not finish within 30s");
+                if (error != null)
+                    throw new Exception("Concurrent send failed: " + error.Message);
+                try { task.Wait(5000); }
+                catch (Exception ex) { throw new Exception("SendAsync threw on a successful send: " + ex.Message); }
+
+                var received = Path.Combine(recvDir, "adj.bin");
+                for (int i = 0; i < 50 && !File.Exists(received); i++) Thread.Sleep(100);
+                Assert.True(File.Exists(received), "received file exists at " + received);
+                var info = new FileInfo(received);
+                Assert.True(info.Length == content.Length, "received size matches");
+            }
+            finally
+            {
+                try { if (udtServer != null) udtServer.Stop(); } catch { }
+                try { if (udpServer != null) udpServer.Stop(); } catch { }
+            }
+        }
+
+        /// <summary>A failed concurrent send must THROW, not only fire OnError — the
+        /// caller (GUI / future CLI) otherwise reports a completed send that never
+        /// happened.</summary>
+        private static void ConcurrentSendThrowsWhenNoServer()
+        {
+            int port = FindFreePort(); // reserved, but nothing will listen on it
+            string sendDir = Path.Combine(TempBase(), "tr_thr_s_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            string file = Path.Combine(sendDir, "no.bin");
+            File.WriteAllBytes(file, new byte[4096]);
+
+            var concurrent = new ConcurrentTransfer("127.0.0.1", port, file, 2, true);
+            bool threw = false;
+            try
+            {
+                concurrent.SendAsync().Wait(20000);
+            }
+            catch { threw = true; }
+            Assert.True(threw, "SendAsync throws when every chunk connection fails");
+        }
+
         private static void ChunkCoverageResume(bool isUdt)
         {
             int port = FindFreePort();

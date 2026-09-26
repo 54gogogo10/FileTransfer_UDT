@@ -54,16 +54,68 @@ namespace TrFileTransfer
         private readonly List<string> _recentFiles = new List<string>();
         private readonly List<DeviceInfo> _knownDevices = new List<DeviceInfo>();
         private Guid? _pendingResumeSession;
-        private TransferServer _server;
+        /// <summary>Server protocols the tabs represent (also the persisted key suffix).</summary>
+        private enum ServerProto { Tcp, Udt, Udp }
+
+        /// <summary>One server tab per protocol. Each tab multi-selects bind addresses
+        /// (family wildcards and/or specific interfaces) and starts ONE LISTENER PER
+        /// SELECTED ADDRESS on its port. Tabs are independent and may share a port
+        /// number across TRANSPORTS (TCP vs UDP-riding); same-transport overlaps are
+        /// caught before anything binds.</summary>
+        private sealed class ServerTab
+        {
+            public ServerProto Proto;
+            public TabItem Tab;
+            public BindMultiSelect Bind;
+            public TextBox Port;
+            public Button Start;
+            public Button Stop;
+            /// <summary>One running listener and the address it serves.</summary>
+            public sealed class ListenerRef
+            {
+                public object Server;
+                public IPAddress Bind;
+            }
+            public readonly List<ListenerRef> Listeners = new List<ListenerRef>();
+            public int ActivePort;
+            public readonly Dictionary<IPEndPoint, Border> Cards = new Dictionary<IPEndPoint, Border>();
+            public bool Running { get { return Listeners.Count > 0; } }
+            public void AddListener(object server, IPAddress bind)
+            {
+                Listeners.Add(new ListenerRef { Server = server, Bind = bind });
+            }
+            /// <summary>Removes the entry for a stopped listener; the paired bind
+            /// address goes with it (parallel-list truncation would misattribute
+            /// addresses when listeners stop out of order).</summary>
+            public void RemoveListener(object server)
+            {
+                for (int i = 0; i < Listeners.Count; i++)
+                {
+                    if (ReferenceEquals(Listeners[i].Server, server))
+                    {
+                        Listeners.RemoveAt(i);
+                        return;
+                    }
+                }
+            }
+            public string Name { get { return Proto == ServerProto.Tcp ? "TCP" : (Proto == ServerProto.Udt ? "UDT" : "UDP"); } }
+            /// <summary>Both UDT and one-way UDP ride the UDP transport — they collide
+            /// with each other on the same family+port, not just with their own kind.</summary>
+            public bool RidesUdpTransport { get { return Proto != ServerProto.Tcp; } }
+        }
+        private readonly List<ServerTab> _serverTabs = new List<ServerTab>();
+        private ServerTab _tabTcp, _tabUdt, _tabUdp;
         private TransferClient _client;
-        private TransferUdtServer _serverUdt;
         private TransferUdtClient _clientUdt;
+        /// <summary>Active one-way UDP send, held so the Cancel button can stop it.</summary>
+        private TransferUdpClient _clientUdp;
         /// <summary>Active parallel (concurrency > 1) single-file send, held so the
         /// Cancel button can actually stop it.</summary>
         private ConcurrentTransfer _concurrent;
-        private int _serverCount;
-        private readonly Dictionary<IPEndPoint, Border> _tcpCards = new Dictionary<IPEndPoint, Border>();
-        private readonly Dictionary<IPEndPoint, Border> _udtCards = new Dictionary<IPEndPoint, Border>();
+        /// <summary>Pairing code shared by every running server endpoint. Cleared when
+        /// the last server stops so the next session generates a fresh code (a client
+        /// has a single code field — per-tab codes would be unusable).</summary>
+        private string _activePairingCode;
         private readonly StatsStore _stats = new StatsStore(StatsStore.DefaultPath);
         /// <summary>Receive confirmations already granted this session (ip → granted at),
         /// so concurrent-chunk and follow-up sends do not re-prompt.</summary>
@@ -118,13 +170,18 @@ namespace TrFileTransfer
         {
             UiChrome.ApplyDark(this, mica: true);
 
-            // Fit the default window to the screen (small laptops get a smaller but usable window)
+            // Fit the default window to the screen (small laptops get a smaller but
+            // usable window). MinWidth must cover the two side-by-side cards: their
+            // fixed inner rows (server: six action buttons; client: IP + port + three
+            // protocol radios + send) bottom out around 1180 dpx, and below their
+            // combined minimum WPF clips the right card instead of squeezing it —
+            // v2.14's protocol tabs outgrew the old 1080/900 constants.
             double waW = SystemParameters.WorkArea.Width;
             double waH = SystemParameters.WorkArea.Height;
-            Width = Math.Min(1080, waW - 24);
-            Height = Math.Min(840, waH - 24);
-            MinWidth = Math.Min(900, Width);
-            MinHeight = Math.Min(720, Height);
+            Width = Math.Min(1240, waW - 24);
+            Height = Math.Min(860, waH - 24);
+            MinWidth = Math.Min(1180, Width);
+            MinHeight = Math.Min(700, Height);
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
 
             // Load config first — control initialization reads settings that must
@@ -134,6 +191,7 @@ namespace TrFileTransfer
             InitializeComponent();
             SetupTrayIcon();
             SetupSectionIcons();
+            InitServerTabs();
             UpdateThemeButton();
             WireFieldValidation();
             LoadKnownDevices();
@@ -229,7 +287,7 @@ namespace TrFileTransfer
 
         private void WireFieldValidation()
         {
-            foreach (var box in new[] { _txtPortS, _txtPortC })
+            foreach (var box in new[] { _txtPortTcp, _txtPortUdt, _txtPortUdp, _txtPortC })
             {
                 box.PreviewTextInput += BlockNonDigits;
                 box.TextChanged += (s, e) => ValidatePortBox((TextBox)s);
@@ -327,6 +385,49 @@ namespace TrFileTransfer
             bool ok = IsValidIp(t);
             SetFieldError(_txtServerIp, !ok, ok ? null : L.FieldIpInvalid);
             return ok;
+        }
+
+        /// <summary>Wires the x:Name'd tab controls into the ServerTab records the
+        /// start/stop logic works against.</summary>
+        private void InitServerTabs()
+        {
+            _tabTcp = new ServerTab
+            {
+                Proto = ServerProto.Tcp, Tab = _tabTcpItem, Bind = _bindTcp, Port = _txtPortTcp,
+                Start = _btnStartTcp, Stop = _btnStopTcp
+            };
+            _tabUdt = new ServerTab
+            {
+                Proto = ServerProto.Udt, Tab = _tabUdtItem, Bind = _bindUdt, Port = _txtPortUdt,
+                Start = _btnStartUdt, Stop = _btnStopUdt
+            };
+            _tabUdp = new ServerTab
+            {
+                Proto = ServerProto.Udp, Tab = _tabUdpItem, Bind = _bindUdp, Port = _txtPortUdp,
+                Start = _btnStartUdp, Stop = _btnStopUdp
+            };
+            _serverTabs.Add(_tabTcp);
+            _serverTabs.Add(_tabUdt);
+            _serverTabs.Add(_tabUdp);
+            foreach (var t in _serverTabs)
+                t.Bind.SelectionChanged += () => SaveTabBindConfig(t);
+        }
+
+        /// <summary>Persists a tab's bind selection lazily (every toggle).</summary>
+        private static void SaveTabBindConfig(ServerTab t)
+        {
+            Config.Set("ServerBind" + t.Name, string.Join(";", t.Bind.GetSelectedAddresses().Select(a => a.ToString()).ToArray()));
+        }
+
+        private bool AnyServerRunning()
+        {
+            return _serverTabs.Any(t => t.Running);
+        }
+
+        private void SetTabHeader(ServerTab t)
+        {
+            // Running marker in the header: at a glance which protocols are serving
+            t.Tab.Header = t.Name + (t.Running ? "  ●" : "");
         }
 
         // ==================== Help ====================
@@ -500,12 +601,20 @@ namespace TrFileTransfer
             _lblHeader.Text = L.AppTitle;
 
             _hdrServer.Text = L.ServerSettings;
-            _lblBind.Text = L.BindAddress;
-            _lblPortS.Text = L.Port;
+            _lblBindTcp.Text = L.BindAddress;
+            _lblBindUdt.Text = L.BindAddress;
+            _lblBindUdp.Text = L.BindAddress;
+            _lblPortTcp.Text = L.Port;
+            _lblPortUdt.Text = L.Port;
+            _lblPortUdp.Text = L.Port;
             _lblSaveDir.Text = L.SaveTo;
             _btnBrowseDir.Content = L.Browse;
-            _btnStartServer.Content = L.StartServer;
-            _btnStopServer.Content = L.StopServer;
+            _btnStartTcp.Content = L.StartServer;
+            _btnStopTcp.Content = L.StopServer;
+            _btnStartUdt.Content = L.StartServer;
+            _btnStopUdt.Content = L.StopServer;
+            _btnStartUdp.Content = L.StartServer;
+            _btnStopUdp.Content = L.StopServer;
             _btnOpenDir.Content = L.OpenSaveDir;
             _btnRecent.Content = L.RecentFiles;
 
@@ -523,21 +632,26 @@ namespace TrFileTransfer
             _btnResumeList.Content = L.ResumeBtn;
             _chkVerifyHash.Content = L.VerifyHashLabel;
             _lblSpeed.Text = L.SpeedLimitLabel;
+            _numSpeed.ToolTip = L.SpeedLimitTip;
             _btnQueue.Content = L.QueueBtn;
             _btnScan.Content = L.ScanBtn;
             _chkMonitor.Content = L.MonitorMode;
             _lblConcurrency.Text = L.ConcurrencyLabel;
+            _numConcurrency.ToolTip = L.ConcurrencyTip;
             _lblSrcPort.Text = L.SrcPortLabel;
+            _numSrcPort.ToolTip = L.SrcPortTip;
 
             _hdrProgressS.Text = L.ServerProgress;
             _hdrProgressC.Text = L.ClientProgress;
 
             _hdrLog.Text = L.LogGroup;
             _btnExportLog.Content = L.ExportLog;
+            _btnClearLog.Content = L.ClearLogBtn;
             _btnCheckUpdate.Content = L.UpdBtn;
             _btnHelp.Content = L.HelpBtn;
             UpdateThemeButton();
             _chkPairing.Content = L.PairingLabel;
+            _rbClientUdp.ToolTip = L.UdpOneWayHint;
             _btnSendText.Content = L.SendTextBtn;
             _btnFanOut.Content = L.FanOutBtn;
             _lblPairingC.Text = L.PairingClientLabel;
@@ -566,23 +680,22 @@ namespace TrFileTransfer
             // Language
             _cmbLang.SelectedIndex = Config.Get("Language", "English") == "中文" ? 1 : 0;
 
-            // Protocol
-            _chkServerTcp.IsChecked = Config.GetBool("ServerTCP", true);
-            _chkServerUdt.IsChecked = Config.GetBool("ServerUDT", false);
+            // Server — one tab per protocol, seeded once from the older layouts
+            SeedProtocolConfig();
             string clientProto = Config.Get("ClientProtocol", "TCP");
-            _rbClientTcp.IsChecked = clientProto != "UDT";
+            _rbClientTcp.IsChecked = clientProto != "UDT" && clientProto != "UDP";
             _rbClientUdt.IsChecked = clientProto == "UDT";
+            _rbClientUdp.IsChecked = clientProto == "UDP";
 
-            // Server
-            _txtPortS.Text = Config.Get("ServerPort", "8080");
+            _txtPortTcp.Text = Config.Get("ServerPortTCP", "8080");
+            _txtPortUdt.Text = Config.Get("ServerPortUDT", "8080");
+            _txtPortUdp.Text = Config.Get("ServerPortUDP", "8080");
             _txtSaveDir.Text = Config.Get("SaveDir", Environment.GetFolderPath(Environment.SpecialFolder.Desktop));
-            string bind = Config.Get("ServerBind", "");
-            if (!string.IsNullOrWhiteSpace(bind))
+            foreach (var t in _serverTabs)
             {
-                for (int i = 0; i < _cmbBind.Items.Count; i++)
-                {
-                    if ((_cmbBind.Items[i] as string) == bind) { _cmbBind.SelectedIndex = i; break; }
-                }
+                t.Bind.SetSelected(ParseBindList(Config.Get("ServerBind" + t.Name, null)));
+                if (t.Bind.IsEmptySelection)
+                    t.Bind.SetSelected(new[] { IPAddress.Any, IPAddress.IPv6Any });
             }
 
             // Client
@@ -598,15 +711,92 @@ namespace TrFileTransfer
             _txtPairing.Text = Config.Get("PairingCode", "");
         }
 
+        /// <summary>Parses a persisted bind list ("0.0.0.0;::1;…"). Null/empty/garbage
+        /// entries are skipped; an empty result makes the caller apply the default
+        /// (both family wildcards).</summary>
+        private static List<IPAddress> ParseBindList(string raw)
+        {
+            var list = new List<IPAddress>();
+            if (string.IsNullOrEmpty(raw)) return list;
+            foreach (string part in raw.Split(';'))
+            {
+                IPAddress ip;
+                if (IPAddress.TryParse(part.Trim(), out ip) && !list.Contains(ip))
+                    list.Add(ip);
+            }
+            return list;
+        }
+
+        /// <summary>Migration into the per-protocol tab layout. Sources, newest first:
+        /// the per-family keys (2.14) and the single-panel keys (≤2.13). A protocol
+        /// enabled on either family inherits that family's bind; the port comes from
+        /// the first family that had the protocol on. Runs once per key.</summary>
+        private static void SeedProtocolConfig()
+        {
+            string[] protos = { "TCP", "UDT", "UDP" };
+            foreach (string proto in protos)
+            {
+                if (Config.Get("ServerBind" + proto, null) != null) continue;
+
+                bool onV4 = Config.GetBool("Server" + proto + "V4", proto == "TCP");
+                bool onV6 = Config.GetBool("Server" + proto + "V6", proto == "TCP");
+                var binds = new List<string>();
+                string portV4 = Config.Get("ServerPortV4", null);
+                string portV6 = Config.Get("ServerPortV6", null);
+                string port = null;
+                if (onV4)
+                {
+                    binds.Add(NormalizeBindForList(Config.Get("ServerBindV4", ""), false));
+                    port = string.IsNullOrWhiteSpace(portV4) ? Config.Get("ServerPort", "8080") : portV4;
+                }
+                if (onV6)
+                {
+                    binds.Add(NormalizeBindForList(Config.Get("ServerBindV6", ""), true));
+                    if (port == null)
+                        port = string.IsNullOrWhiteSpace(portV6) ? Config.Get("ServerPort", "8080") : portV6;
+                }
+                if (binds.Count == 0)
+                {
+                    // Protocol was off in the old layout — start from the classic defaults
+                    binds.Add(NormalizeBindForList("", false));
+                    port = Config.Get("ServerPort", "8080");
+                }
+                Config.Set("ServerBind" + proto, string.Join(";", binds.ToArray()));
+                if (Config.Get("ServerPort" + proto, null) == null)
+                    Config.Set("ServerPort" + proto, port);
+            }
+        }
+
+        /// <summary>One bind entry for the persisted list: a family's wildcard when the
+        /// old value was wildcard-ish, else the literal.</summary>
+        private static string NormalizeBindForList(string legacyValue, bool v6)
+        {
+            IPAddress ip;
+            if (IPAddress.TryParse((legacyValue ?? "").Split(' ')[0].Trim(), out ip))
+            {
+                bool isV6 = ip.AddressFamily == AddressFamily.InterNetworkV6;
+                if (isV6 == v6) return ip.ToString();
+            }
+            return v6 ? "::" : "0.0.0.0";
+        }
+
         private void SaveConfig()
         {
             Config.Set("Language", _cmbLang.SelectedIndex == 1 ? "中文" : "English");
-            Config.SetBool("ServerTCP", _chkServerTcp.IsChecked == true);
-            Config.SetBool("ServerUDT", _chkServerUdt.IsChecked == true);
-            Config.Set("ClientProtocol", _rbClientUdt.IsChecked == true ? "UDT" : "TCP");
-            Config.Set("ServerPort", _txtPortS.Text.Trim());
+            foreach (var t in _serverTabs)
+            {
+                Config.Set("ServerPort" + t.Name, t.Port.Text.Trim());
+                Config.Set("ServerBind" + t.Name,
+                    string.Join(";", t.Bind.GetSelectedAddresses().Select(a => a.ToString()).ToArray()));
+            }
+            // Legacy mirrors keep a downgrade installable without surprises
+            Config.Set("ServerPort", _txtPortTcp.Text.Trim());
+            Config.SetBool("ServerTCP", true);
+            Config.SetBool("ServerUDT", _tabUdt.Running || Config.GetBool("ServerUDT", false));
+            Config.Set("ClientProtocol",
+                _rbClientUdp.IsChecked == true ? "UDP"
+                : (_rbClientUdt.IsChecked == true ? "UDT" : "TCP"));
             Config.Set("SaveDir", _txtSaveDir.Text.Trim());
-            Config.Set("ServerBind", _cmbBind.SelectedItem as string ?? "");
             Config.Set("ClientIP", _txtServerIp.Text.Trim());
             Config.Set("ClientPort", _txtPortC.Text.Trim());
             Config.Set("LastPath", _txtFile.Text.Trim());
@@ -622,13 +812,15 @@ namespace TrFileTransfer
 
         private void PopulateBindAddresses()
         {
-            string allText = L.BindAll;
-            int previousSelection = _cmbBind.SelectedIndex;
-
-            _cmbBind.Items.Clear();
-            // "All" is dual-mode since 2.13: one listener accepts IPv4 AND IPv6
-            _cmbBind.Items.Add(allText);
-
+            // One shared catalog for every protocol tab: the two family wildcards plus
+            // every interface address (v4 and v6; link-local v6 skipped). SetItems
+            // keeps selections by IPAddress value, and RefreshLabels re-reads the
+            // localized wildcard captions.
+            var items = new List<KeyValuePair<IPAddress, string>>
+            {
+                new KeyValuePair<IPAddress, string>(IPAddress.Any, L.BindAllV4),
+                new KeyValuePair<IPAddress, string>(IPAddress.IPv6Any, L.BindAllV6)
+            };
             try
             {
                 foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
@@ -640,29 +832,24 @@ namespace TrFileTransfer
                     {
                         // Skip autoconf/link-local v6 noise (fe80::/64); global and
                         // site-local v6 addresses are listed.
-                        bool v4 = addr.Address.AddressFamily == AddressFamily.InterNetwork;
-                        bool v6 = addr.Address.AddressFamily == AddressFamily.InterNetworkV6
+                        bool isV4 = addr.Address.AddressFamily == AddressFamily.InterNetwork;
+                        bool isV6Usable = addr.Address.AddressFamily == AddressFamily.InterNetworkV6
                             && !addr.Address.IsIPv6LinkLocal && !addr.Address.IsIPv6SiteLocal;
-                        if (v4 || v6)
-                        {
-                            string ip = addr.Address.ToString();
-                            if (!_cmbBind.Items.Contains(ip))
-                                _cmbBind.Items.Add(ip);
-                        }
+                        if ((isV4 || isV6Usable) && !items.Exists(kv => kv.Key.Equals(addr.Address)))
+                            items.Add(new KeyValuePair<IPAddress, string>(addr.Address, addr.Address.ToString()));
                     }
                 }
             }
             catch { }
 
-            if (_cmbBind.Items.Count == 1)
+            if (items.Count == 2)
             {
-                _cmbBind.Items.Add("127.0.0.1");
+                items.Add(new KeyValuePair<IPAddress, string>(IPAddress.Loopback, IPAddress.Loopback.ToString()));
+                items.Add(new KeyValuePair<IPAddress, string>(IPAddress.IPv6Loopback, IPAddress.IPv6Loopback.ToString()));
             }
 
-            if (previousSelection >= 0 && previousSelection < _cmbBind.Items.Count)
-                _cmbBind.SelectedIndex = previousSelection;
-            else
-                _cmbBind.SelectedIndex = 0;
+            foreach (var t in _serverTabs)
+                t.Bind.SetItems(items);
         }
 
         // ==================== Auto update ====================
@@ -1029,6 +1216,7 @@ namespace TrFileTransfer
                 ServerIp = _txtServerIp.Text.Trim(),
                 Port = port,
                 IsUdp = _rbClientUdt.IsChecked == true,
+                IsRawUdp = _rbClientUdp.IsChecked == true,
                 SrcPort = _numSrcPort.Value,
                 Concurrency = _numConcurrency.Value,
                 VerifyHash = _chkVerifyHash.IsChecked == true,
@@ -1038,8 +1226,9 @@ namespace TrFileTransfer
 
         private async Task<bool> ExecuteQueuedTask(QueuedTask t)
         {
-            return await StartTransfer(t.FilePath, t.IsFolder, t.ServerIp, t.Port, !t.IsUdp,
-                t.SrcPort, t.Concurrency, t.VerifyHash, t.SpeedLimit, null);
+            return await StartTransfer(t.FilePath, t.IsFolder, t.ServerIp, t.Port,
+                !t.IsUdp && !t.IsRawUdp,
+                t.SrcPort, t.Concurrency, t.VerifyHash, t.SpeedLimit, null, null, t.IsRawUdp);
         }
 
         // ==================== Device discovery ====================
@@ -1198,6 +1387,11 @@ namespace TrFileTransfer
             }
 
             bool isUdt = _rbClientUdt.IsChecked == true;
+            if (_rbClientUdp.IsChecked == true)
+            {
+                MessageBox.Show(this, L.UdpNotForText, L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
             _btnSendText.IsEnabled = false;
             try
             {
@@ -1245,12 +1439,53 @@ namespace TrFileTransfer
             return await done.Task.ConfigureAwait(true);
         }
 
-        // ==================== Server start / stop ====================
+        // ==================== Server start / stop (per protocol tab) ====================
 
-        private void BtnStartServer_Click(object sender, RoutedEventArgs e)
+        /// <summary>Client protocol switch: the single port box follows the protocol.
+        /// Three coexisting servers usually cannot share one port number (UDT and
+        /// one-way UDP collide), so the box likely still holds another protocol's
+        /// port — a one-way UDP send to it vanishes without any error. Rewrites only
+        /// when the current port provably belongs to a different protocol tab; a
+        /// hand-typed port matching no tab is left alone.</summary>
+        private void RdoClientProto_Checked(object sender, RoutedEventArgs e)
+        {
+            var rb = sender as RadioButton;
+            if (rb == null || rb.IsChecked != true || !IsLoaded) return;
+            ServerTab selected = rb == _rbClientTcp ? _tabTcp : (rb == _rbClientUdt ? _tabUdt : _tabUdp);
+            int current;
+            if (!int.TryParse(_txtPortC.Text.Trim(), out current)) return;
+            int want = selected.Running ? selected.ActivePort : ParsePortText(selected.Port.Text);
+            if (want <= 0 || want == current) return;
+            foreach (ServerTab t in _serverTabs)
+            {
+                if (t == selected) continue;
+                int tPort = t.Running ? t.ActivePort : ParsePortText(t.Port.Text);
+                if (tPort == current)
+                {
+                    _txtPortC.Text = want.ToString();
+                    AddLog(L.ClientPortFollowed(selected.Name, want.ToString()));
+                    return;
+                }
+            }
+        }
+
+        private static int ParsePortText(string s)
+        {
+            int p;
+            return int.TryParse((s ?? "").Trim(), out p) ? p : 0;
+        }
+
+        private void BtnStartTcp_Click(object sender, RoutedEventArgs e) { StartProtocolTab(_tabTcp); }
+        private void BtnStartUdt_Click(object sender, RoutedEventArgs e) { StartProtocolTab(_tabUdt); }
+        private void BtnStartUdp_Click(object sender, RoutedEventArgs e) { StartProtocolTab(_tabUdp); }
+        private void BtnStopTcp_Click(object sender, RoutedEventArgs e) { StopProtocolTab(_tabTcp); }
+        private void BtnStopUdt_Click(object sender, RoutedEventArgs e) { StopProtocolTab(_tabUdt); }
+        private void BtnStopUdp_Click(object sender, RoutedEventArgs e) { StopProtocolTab(_tabUdp); }
+
+        private void StartProtocolTab(ServerTab tab)
         {
             int port;
-            if (!int.TryParse(_txtPortS.Text.Trim(), out port) || port < 1 || port > 65535)
+            if (!int.TryParse(tab.Port.Text.Trim(), out port) || port < 1 || port > 65535)
             {
                 MessageBox.Show(this, L.InvalidPort, L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
                 return;
@@ -1261,190 +1496,273 @@ namespace TrFileTransfer
                 MessageBox.Show(this, L.DirNotExist, L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
                 return;
             }
-
-            // The combo stores display strings — the first item is a localized label
-            // ("所有接口 (IPv4 + IPv6)"), not an address. Anything that is not a bare
-            // IP literal means "all interfaces": TCP treats it as the dual-stack
-            // unspecified bind, UDT as its historic v4-any bind.
-            string bindAddr = (_cmbBind.SelectedItem as string ?? "").Split(' ')[0].Trim();
-            IPAddress bindLiteral;
-            if (!IPAddress.TryParse(bindAddr, out bindLiteral))
-                bindAddr = "";
-
-            if (_chkServerTcp.IsChecked != true && _chkServerUdt.IsChecked != true)
+            List<IPAddress> targets = tab.Bind.GetSelectedAddresses();
+            if (targets.Count == 0)
             {
-                MessageBox.Show(this, L.NoProtocolSelected, L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
+                MessageBox.Show(this, L.BindPickAtLeastOne, L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
                 return;
             }
 
-            // Port availability pre-check: offer the next free port when busy
-            bool needTcp = _chkServerTcp.IsChecked == true, needUdp = _chkServerUdt.IsChecked == true;
-            if (!Utils.IsPortFree(port, needTcp, needUdp))
+            // ---- Port conflict detection (before anything binds) ----
+            // 1) our own running listeners: same transport (TCP vs TCP; UDT AND one-way
+            //    UDP both ride UDP) + same port + same-family address overlap
+            // 2) the OS: probing every target address on the exact port
+            List<string> conflicts = new List<string>();
+            foreach (IPAddress target in targets)
             {
-                int alt = Utils.FindFreePortFrom(port + 1, needTcp, needUdp);
-                if (alt == 0)
+                string inProcess = FindRunningConflict(tab, target, port);
+                if (inProcess != null) conflicts.Add(inProcess + " @ " + target);
+                else if (!Utils.IsAddressPortFree(target, port, tab.Proto == ServerProto.Tcp))
+                    conflicts.Add(L.TabConflictOsHeld + " @ " + target);
+            }
+            if (conflicts.Count > 0)
+            {
+                // All targets blocked by other processes → keep the classic "next free
+                // port" offer; anything partial is a real conflict the user must solve
+                bool allOsHeld = conflicts.Count == targets.Count
+                    && conflicts.All(c => c.StartsWith(L.TabConflictOsHeld));
+                if (allOsHeld)
                 {
-                    MessageBox.Show(this, L.PortBusyNoAlt(port), L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
-                    return;
-                }
-                if (MessageBox.Show(this, L.PortBusyOffer(port, alt), L.DlgError,
-                    MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes)
-                {
-                    port = alt;
-                    _txtPortS.Text = alt.ToString();
+                    int alt = FindFreePortAllTargets(tab, targets, port + 1);
+                    if (alt != 0 && MessageBox.Show(this, L.PortBusyOffer(port, alt), L.DlgError,
+                            MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes)
+                    {
+                        port = alt;
+                        tab.Port.Text = alt.ToString();
+                    }
+                    else return;
                 }
                 else
                 {
+                    MessageBox.Show(this, L.TabConflictsDetail(tab.Name, port.ToString(),
+                        string.Join("\n", conflicts.ToArray())),
+                        L.DlgError, MessageBoxButton.OK, MessageBoxImage.Warning);
                     return;
                 }
             }
 
-            DisableServerInputs();
-            _serverCount = 0;
+            DisableTabInputs(tab);
+            tab.ActivePort = port;
 
-            // A fresh pairing code per server session keeps old codes from lingering
+            // One pairing code shared by every running endpoint (a client has a
+            // single code field). One-way UDP has no handshake to carry it — the
+            // code simply does not apply there.
             string pairingCode = null;
-            if (_chkPairing.IsChecked == true)
+            if (_chkPairing.IsChecked == true && tab.Proto != ServerProto.Udp)
             {
-                pairingCode = WireAuth.GeneratePairingCode(
-                    Math.Max(4, Math.Min(12, Config.GetInt("PairingLength", 6))));
-                _lblPairingCode.Text = pairingCode;
+                pairingCode = _activePairingCode;
+                if (string.IsNullOrEmpty(pairingCode))
+                {
+                    pairingCode = WireAuth.GeneratePairingCode(
+                        Math.Max(4, Math.Min(12, Config.GetInt("PairingLength", 6))));
+                    _lblPairingCode.Text = pairingCode;
+                }
+                _activePairingCode = pairingCode;
             }
 
-            if (_chkServerTcp.IsChecked == true)
+            int startedCount = 0;
+            foreach (IPAddress target in targets)
             {
-                bool tcpStarted = false;
-                var tcpServer = new TransferServer(bindAddr, port, GetArchiveDir(saveDir));
-                tcpServer.PairingCode = pairingCode;
-                ApplyServerOptions(tcpServer);
-                tcpServer.OnLog += msg => RunOnUi(() => AddLog(msg));
-                tcpServer.OnError += msg => RunOnUi(() => _lblStatusS.Text = L.ErrorPrefix + msg);
-                tcpServer.OnFileReceived += (path, size) => RunOnUi(() => OnFileReceived(path, size));
-                tcpServer.OnTextReceived += t => RunOnUi(() => OnTextReceived(t));
-                tcpServer.OnClientProgress += (ep, p) => RunOnUi(() =>
-                {
-                    var card = GetOrCreateTcpCard(ep);
-                    UpdateCardProgress(card, p);
-                });
-                tcpServer.OnClientTransferComplete += ep => RunOnUi(() =>
-                {
-                    Border card;
-                    if (_tcpCards.TryGetValue(ep, out card)) { UpdateCardComplete(card); _tcpCards.Remove(ep); }
-                });
-                tcpServer.OnTransferComplete += () => RunOnUi(() =>
-                {
-                    foreach (var c in _tcpCards.Values) UpdateCardComplete(c);
-                    _tcpCards.Clear();
-                    _lblStatusS.Text = L.Listening;
-                });
-                tcpServer.OnStarted += () => RunOnUi(() =>
-                {
-                    tcpStarted = true;
-                    _serverCount++;
-                    OnServerStarted();
-                });
-                tcpServer.OnStopped += () => RunOnUi(() =>
-                {
-                    if (!tcpStarted) return; // start failed, ignore
-                    foreach (var c in _tcpCards.Values) UpdateCardComplete(c);
-                    _tcpCards.Clear();
-                    _server = null;
-                    OnServerStopped();
-                });
-                _server = tcpServer;
-                tcpServer.Start();
+                bool started = tab.Proto == ServerProto.Tcp
+                    ? StartTcpListener(tab, target, port, saveDir, pairingCode)
+                    : tab.Proto == ServerProto.Udt
+                        ? StartUdtListener(tab, target, port, saveDir, pairingCode)
+                        : StartUdpListener(tab, target, port, saveDir);
+                if (started) startedCount++;
             }
 
-            if (_chkServerUdt.IsChecked == true)
+            if (startedCount == 0)
             {
-                bool udtStarted = false;
-                var udtServer = new TransferUdtServer(bindAddr, port, GetArchiveDir(saveDir));
-                udtServer.PairingCode = pairingCode;
-                ApplyServerOptionsUdt(udtServer);
-                udtServer.OnLog += msg => RunOnUi(() => AddLog(msg));
-                udtServer.OnError += msg => RunOnUi(() => _lblStatusS.Text = L.ErrorPrefix + msg);
-                udtServer.OnFileReceived += (path, size) => RunOnUi(() => OnFileReceived(path, size));
-                udtServer.OnTextReceived += t => RunOnUi(() => OnTextReceived(t));
-                udtServer.OnClientProgress += (ep, p) => RunOnUi(() =>
-                {
-                    var card = GetOrCreateUdtCard(ep);
-                    UpdateCardProgress(card, p);
-                });
-                udtServer.OnClientTransferComplete += ep => RunOnUi(() =>
-                {
-                    Border card;
-                    if (_udtCards.TryGetValue(ep, out card)) { UpdateCardComplete(card); _udtCards.Remove(ep); }
-                });
-                udtServer.OnTransferComplete += () => RunOnUi(() =>
-                {
-                    foreach (var c in _udtCards.Values) UpdateCardComplete(c);
-                    _udtCards.Clear();
-                    _lblStatusS.Text = L.Listening;
-                });
-                udtServer.OnStarted += () => RunOnUi(() =>
-                {
-                    udtStarted = true;
-                    _serverCount++;
-                    OnServerStarted();
-                });
-                udtServer.OnStopped += () => RunOnUi(() =>
-                {
-                    if (!udtStarted) return;
-                    foreach (var c in _udtCards.Values) UpdateCardComplete(c);
-                    _udtCards.Clear();
-                    _serverUdt = null;
-                    OnServerStopped();
-                });
-                _serverUdt = udtServer;
-                udtServer.Start();
-            }
-
-            if (_serverCount == 0)
-            {
-                // Both protocols failed to start
-                EnableServerInputs();
+                // Every listener failed (each logged its own bind error)
+                EnableTabInputs(tab);
                 MessageBox.Show(this, L.ServerStartFailed, L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
             }
-            else
+            UpdateSharedServerState();
+        }
+
+        /// <summary>First port ≥ start where every target address probes free.</summary>
+        private static int FindFreePortAllTargets(ServerTab tab, List<IPAddress> targets, int start)
+        {
+            bool tcp = tab.Proto == ServerProto.Tcp;
+            for (int p = start; p < start + 128; p++)
             {
-                // Advertise the server over UDP so LAN clients can discover it
-                int dPort = Config.GetInt("DiscoveryPort", DiscoveryProtocol.DefaultPort);
-                if (_discoveryServer == null) _discoveryServer = new DiscoveryServer(dPort);
-                _discoveryServer.Start(Environment.MachineName, port,
-                    _chkServerTcp.IsChecked == true, _chkServerUdt.IsChecked == true, pairingCode != null);
+                bool all = true;
+                foreach (IPAddress a in targets)
+                {
+                    if (!Utils.IsAddressPortFree(a, p, tcp)) { all = false; break; }
+                }
+                if (all) return p;
             }
+            return 0;
         }
 
-        private void DisableServerInputs()
+        /// <summary>Description of the running listener this (tab, address, port) would
+        /// collide with, or null. UDT and one-way UDP check against BOTH UDP-riding
+        /// kinds — they share the transport.</summary>
+        private string FindRunningConflict(ServerTab starting, IPAddress bind, int port)
         {
-            _chkServerTcp.IsEnabled = false;
-            _chkServerUdt.IsEnabled = false;
-            _chkPairing.IsEnabled = false;
-            _cmbLang.IsEnabled = false;
-            _cmbBind.IsEnabled = false;
-            _txtPortS.IsEnabled = false;
-            _txtSaveDir.IsEnabled = false;
-            _btnBrowseDir.IsEnabled = false;
+            foreach (var t in _serverTabs)
+            {
+                if (!t.Running || t.ActivePort != port) continue;
+                bool sameTransport = t.Proto == starting.Proto
+                    || (t.RidesUdpTransport && starting.RidesUdpTransport);
+                if (!sameTransport) continue;
+                foreach (var lr in t.Listeners)
+                {
+                    if (Utils.BindConflicts(bind, lr.Bind, port, t.ActivePort))
+                        return t.Name;
+                }
+            }
+            return null;
         }
 
-        private void EnableServerInputs()
+        /// <summary>Starts one TCP listener on one address. Wildcards are family-scoped
+        /// (TcpBindMode), which is what lets TCP share a port number with anything not
+        /// TCP. Returns true when OnStarted fired.</summary>
+        private bool StartTcpListener(ServerTab tab, IPAddress bind, int port, string saveDir, string pairingCode)
         {
-            _btnStartServer.IsEnabled = true;
-            _btnStopServer.IsEnabled = false;
-            _chkServerTcp.IsEnabled = true;
-            _chkServerUdt.IsEnabled = true;
-            _chkPairing.IsEnabled = true;
-            _cmbLang.IsEnabled = true;
-            _cmbBind.IsEnabled = true;
-            _txtPortS.IsEnabled = true;
-            _txtSaveDir.IsEnabled = true;
-            _btnBrowseDir.IsEnabled = true;
+            bool started = false;
+            var server = new TransferServer(bind.ToString(), port, GetArchiveDir(saveDir), 4194304,
+                Utils.IsWildcardAddress(bind) && bind.AddressFamily == AddressFamily.InterNetworkV6
+                    ? TcpBindMode.IPv6Only
+                    : (Utils.IsWildcardAddress(bind) ? TcpBindMode.IPv4Only : TcpBindMode.DualStack));
+            server.PairingCode = pairingCode;
+            ApplyServerOptions(server);
+            server.OnLog += msg => RunOnUi(() => AddLog(msg));
+            server.OnError += msg => RunOnUi(() => _lblStatusS.Text = L.ErrorPrefix + msg);
+            server.OnFileReceived += (path, size) => RunOnUi(() => OnFileReceived(path, size));
+            server.OnTextReceived += t => RunOnUi(() => OnTextReceived(t));
+            server.OnClientProgress += (ep, p) => RunOnUi(() =>
+                UpdateCardProgress(GetOrCreateCard(tab.Cards, ep), p));
+            server.OnClientTransferComplete += ep => RunOnUi(() => CompleteCard(tab.Cards, ep));
+            server.OnTransferComplete += () => RunOnUi(() =>
+            {
+                CompleteAllCards(tab.Cards);
+                if (AnyServerRunning()) _lblStatusS.Text = L.Listening;
+            });
+            server.OnStarted += () => RunOnUi(() =>
+            {
+                started = true;
+                OnTabStarted(tab);
+            });
+            server.OnStopped += () => RunOnUi(() =>
+            {
+                CompleteAllCards(tab.Cards);
+                tab.RemoveListener(server);
+                OnTabStopped(tab);
+            });
+            tab.AddListener(server, bind);
+            server.Start();
+            return started;
         }
 
-        private void OnServerStarted()
+        private bool StartUdtListener(ServerTab tab, IPAddress bind, int port, string saveDir, string pairingCode)
         {
-            _btnStartServer.IsEnabled = false;
-            _btnStopServer.IsEnabled = true;
+            bool started = false;
+            // UDT4 has no dual-mode socket: the wildcard is the family's any-address
+            string udtBind = Utils.IsWildcardAddress(bind)
+                ? (bind.AddressFamily == AddressFamily.InterNetworkV6 ? "::" : "0.0.0.0") : bind.ToString();
+            var server = new TransferUdtServer(udtBind, port, GetArchiveDir(saveDir));
+            server.PairingCode = pairingCode;
+            ApplyServerOptionsUdt(server);
+            server.OnLog += msg => RunOnUi(() => AddLog(msg));
+            server.OnError += msg => RunOnUi(() => _lblStatusS.Text = L.ErrorPrefix + msg);
+            server.OnFileReceived += (path, size) => RunOnUi(() => OnFileReceived(path, size));
+            server.OnTextReceived += t => RunOnUi(() => OnTextReceived(t));
+            server.OnClientProgress += (ep, p) => RunOnUi(() =>
+                UpdateCardProgress(GetOrCreateCard(tab.Cards, ep), p));
+            server.OnClientTransferComplete += ep => RunOnUi(() => CompleteCard(tab.Cards, ep));
+            server.OnTransferComplete += () => RunOnUi(() =>
+            {
+                CompleteAllCards(tab.Cards);
+                if (AnyServerRunning()) _lblStatusS.Text = L.Listening;
+            });
+            server.OnStarted += () => RunOnUi(() =>
+            {
+                started = true;
+                OnTabStarted(tab);
+            });
+            server.OnStopped += () => RunOnUi(() =>
+            {
+                CompleteAllCards(tab.Cards);
+                tab.RemoveListener(server);
+                OnTabStopped(tab);
+            });
+            tab.AddListener(server, bind);
+            server.Start();
+            return started;
+        }
+
+        private bool StartUdpListener(ServerTab tab, IPAddress bind, int port, string saveDir)
+        {
+            bool started = false;
+            // One-way receiver: family-scoped wildcard like the UDT tab. No pairing
+            // code, no receive confirmation, no receive rate limit — none of them can
+            // cross a link with no return path. The IP filter still gates every datagram.
+            var server = new TransferUdpServer(
+                Utils.IsWildcardAddress(bind)
+                    ? (bind.AddressFamily == AddressFamily.InterNetworkV6 ? "::" : "0.0.0.0") : bind.ToString(),
+                port, GetArchiveDir(saveDir));
+            ApplyServerOptionsUdp(server);
+            server.OnLog += msg => RunOnUi(() => AddLog(msg));
+            server.OnError += msg => RunOnUi(() => _lblStatusS.Text = L.ErrorPrefix + msg);
+            server.OnFileReceived += (path, size) => RunOnUi(() => OnFileReceived(path, size));
+            server.OnClientProgress += (ep, p) => RunOnUi(() =>
+                UpdateCardProgress(GetOrCreateCard(tab.Cards, ep), p));
+            server.OnClientTransferComplete += ep => RunOnUi(() => CompleteCard(tab.Cards, ep));
+            server.OnStarted += () => RunOnUi(() =>
+            {
+                started = true;
+                OnTabStarted(tab);
+            });
+            server.OnStopped += () => RunOnUi(() =>
+            {
+                CompleteAllCards(tab.Cards);
+                tab.RemoveListener(server);
+                OnTabStopped(tab);
+            });
+            tab.AddListener(server, bind);
+            server.Start();
+            return started;
+        }
+
+        private void StopProtocolTab(ServerTab tab)
+        {
+            // Snapshot first: Stop() fires OnStopped synchronously, whose handler
+            // removes from Listeners while we iterate
+            var toStop = tab.Listeners.Select(l => l.Server).ToList();
+            foreach (var s in toStop)
+            {
+                var tcp = s as TransferServer;
+                if (tcp != null) { tcp.Stop(); continue; }
+                var udt = s as TransferUdtServer;
+                if (udt != null) { udt.Stop(); continue; }
+                var udp = s as TransferUdpServer;
+                if (udp != null) udp.Stop();
+            }
+            UpdateSharedServerState();
+        }
+
+        private void DisableTabInputs(ServerTab t)
+        {
+            t.Bind.IsEnabled = false;
+            t.Port.IsEnabled = false;
+            t.Start.IsEnabled = false;
+        }
+
+        private void EnableTabInputs(ServerTab t)
+        {
+            t.Bind.IsEnabled = true;
+            t.Port.IsEnabled = true;
+            t.Start.IsEnabled = true;
+            t.Stop.IsEnabled = false;
+        }
+
+        private void OnTabStarted(ServerTab tab)
+        {
+            tab.Start.IsEnabled = false;
+            tab.Stop.IsEnabled = true;
+            SetTabHeader(tab);
             _lblStatusS.Text = L.Listening;
 
             // One-time firewall guidance — local probes cannot detect external blocks,
@@ -1460,13 +1778,54 @@ namespace TrFileTransfer
             }
         }
 
-        private void OnServerStopped()
+        private void OnTabStopped(ServerTab tab)
         {
-            if (_serverCount > 0) _serverCount--;
-            if (_serverCount > 0) return; // still have other servers running
-            EnableServerInputs();
-            _lblStatusS.Text = L.ServerStopped;
+            SetTabHeader(tab);
+            if (tab.Running) return; // sibling listeners still serving
+            EnableTabInputs(tab);
+            UpdateSharedServerState();
         }
+
+        /// <summary>Shared (card-level) server inputs follow "any endpoint running":
+        /// save dir / pairing freeze while any tab serves, and the pairing session
+        /// code is dropped once everything stops.</summary>
+        private void UpdateSharedServerState()
+        {
+            bool any = AnyServerRunning();
+            _lblStatusS.Text = any ? L.Listening : L.ServerStopped;
+            _txtSaveDir.IsEnabled = !any;
+            _btnBrowseDir.IsEnabled = !any;
+            _chkPairing.IsEnabled = !any;
+            if (!any) _activePairingCode = null;
+            UpdateLanguageLock();
+            RefreshDiscovery();
+        }
+
+        /// <summary>Language switching locks while a transfer or any server is active
+        /// (L is a plain static — mid-transfer retranslation is unsupported).</summary>
+        private void UpdateLanguageLock()
+        {
+            _cmbLang.IsEnabled = !AnyServerRunning() && _btnSend.IsEnabled;
+        }
+
+        /// <summary>Advertises over UDP discovery (an IPv4 broadcast protocol). One
+        /// endpoint per response: the TCP tab when running, else the UDT tab — one-way
+        /// UDP has no discovery flag and is not advertised.</summary>
+        private void RefreshDiscovery()
+        {
+            var advertise = _tabTcp.Running ? _tabTcp : (_tabUdt.Running ? _tabUdt : null);
+            if (advertise == null)
+            {
+                if (_discoveryServer != null) { _discoveryServer.Stop(); _discoveryServer = null; }
+                return;
+            }
+            if (_discoveryServer == null)
+                _discoveryServer = new DiscoveryServer(Config.GetInt("DiscoveryPort", DiscoveryProtocol.DefaultPort));
+            _discoveryServer.Start(Environment.MachineName, advertise.ActivePort,
+                advertise.Proto == ServerProto.Tcp, advertise.Proto == ServerProto.Udt,
+                _chkPairing.IsChecked == true);
+        }
+
 
         // ==================== Receive policy (options dialog, IP filter, confirm) ====================
 
@@ -1493,6 +1852,17 @@ namespace TrFileTransfer
             server.IpAllowed = IpFilterPass;
             server.ConfirmRequest = AskReceiveConfirmation;
             server.ReceiveSpeedLimit = (long)Config.GetInt("RecvSpeedLimit", 0) * 1024;
+        }
+
+        /// <summary>One-way UDP receiver options: the IP filter and per-device layout
+        /// apply; pairing / receive-confirmation / receive rate limit cannot — there is
+        /// no return path to negotiate on.</summary>
+        private void ApplyServerOptionsUdp(TransferUdpServer server)
+        {
+            server.OnSessionStats += stats => RecordReceived(stats);
+            server.PerDeviceFolder = Config.GetBool("PerDeviceFolder", false);
+            server.ResolveDeviceName = ResolveDeviceNameForIp;
+            server.IpAllowed = IpFilterPass;
         }
 
         /// <summary>IP filter decision — evaluated per connection from Config.</summary>
@@ -1623,8 +1993,14 @@ namespace TrFileTransfer
         private void BtnSyncSessions_Click(object sender, RoutedEventArgs e)
         {
             // Prefer a running server's (possibly archived) directory; fall back to the box
-            string dir = _server != null ? _server.SaveDirectory
-                : (_serverUdt != null ? _serverUdt.SaveDirectory : null);
+            string dir = null;
+            foreach (var t in _serverTabs)
+            {
+                var tcp = t.Listeners.Select(l => l.Server).OfType<TransferServer>().FirstOrDefault();
+                if (tcp != null) { dir = tcp.SaveDirectory; break; }
+                var udt = t.Listeners.Select(l => l.Server).OfType<TransferUdtServer>().FirstOrDefault();
+                if (udt != null) { dir = udt.SaveDirectory; break; }
+            }
             if (string.IsNullOrEmpty(dir)) dir = _txtSaveDir.Text.Trim();
             var dlg = new SyncSessionsDialog(GetArchiveDir(dir)) { Owner = this };
             dlg.ShowDialog();
@@ -1644,14 +2020,6 @@ namespace TrFileTransfer
             SaveKnownDevices();
         }
 
-        private void BtnStopServer_Click(object sender, RoutedEventArgs e)
-        {
-            _serverCount = 0; // reset before stopping so OnStopped handlers see zero
-            if (_discoveryServer != null) { _discoveryServer.Stop(); _discoveryServer = null; }
-            if (_server != null) { _server.Stop(); _server = null; }
-            if (_serverUdt != null) { _serverUdt.Stop(); _serverUdt = null; }
-        }
-
         // ==================== Client send ====================
 
         private async void BtnSend_Click(object sender, RoutedEventArgs e)
@@ -1659,6 +2027,7 @@ namespace TrFileTransfer
             string path = _txtFile.Text.Trim();
             bool isFolder = _chkFolder.IsChecked == true;
             bool isMonitor = _chkMonitor.IsChecked == true;
+            bool isRawUdp = _rbClientUdp.IsChecked == true;
 
             // Validate IP and port (shared)
             int port;
@@ -1682,12 +2051,24 @@ namespace TrFileTransfer
             // Monitor mode branch
             if (isMonitor)
             {
+                if (isRawUdp)
+                {
+                    MessageBox.Show(this, L.UdpSingleFileOnly, L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
+                    return;
+                }
                 if (!Directory.Exists(path))
                 {
                     MessageBox.Show(this, L.MonitorDirNotExist, L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
                     return;
                 }
                 StartMonitoring(path, ip, port);
+                return;
+            }
+
+            // One-way UDP sends a single file — nothing else rides a return-less link
+            if (isRawUdp && isFolder)
+            {
+                MessageBox.Show(this, L.UdpSingleFileOnly, L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
                 return;
             }
 
@@ -1698,8 +2079,9 @@ namespace TrFileTransfer
 
             // Resume is only valid for single-connection sends, and only when the
             // selected file/folder still matches the one recorded in the resume state.
+            // One-way UDP has no session negotiation to resume into.
             Guid? resumeSession = null;
-            if (concurrency == 1 && _pendingResumeSession.HasValue)
+            if (!isRawUdp && concurrency == 1 && _pendingResumeSession.HasValue)
             {
                 if (isFolder)
                 {
@@ -1720,7 +2102,7 @@ namespace TrFileTransfer
             }
 
             await StartTransfer(path, isFolder, ip, port, isTcp, srcPort, concurrency,
-                _chkVerifyHash.IsChecked == true, _numSpeed.Value * 1024, resumeSession);
+                _chkVerifyHash.IsChecked == true, _numSpeed.Value * 1024, resumeSession, null, isRawUdp);
         }
 
         /// <summary>
@@ -1732,7 +2114,7 @@ namespace TrFileTransfer
         /// </summary>
         private async Task<bool> StartTransfer(string path, bool isFolder, string ip, int port,
             bool isTcp, int srcPort, int concurrency, bool verifyHash, int speedLimit, Guid? resumeSession,
-            Guid? chunkSession = null)
+            Guid? chunkSession = null, bool isRawUdp = false)
         {
             try
             {
@@ -1749,6 +2131,11 @@ namespace TrFileTransfer
                     MessageBox.Show(this, L.FileNotFound, L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
                     return false;
                 }
+                if (isRawUdp && isFolder)
+                {
+                    MessageBox.Show(this, L.UdpSingleFileOnly, L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
+                    return false;
+                }
 
                 // A fresh send invalidates any leftover pause snapshot
                 _pauseState = null;
@@ -1758,6 +2145,26 @@ namespace TrFileTransfer
                 _btnPause.Content = L.PauseBtn;
 
                 DisableClientInputs();
+
+                // One-way UDP: fire the datagrams and be done — no session, no pause,
+                // no retry (a re-send IS the retry, and it fills the receiver's gaps)
+                if (isRawUdp)
+                {
+                    var udpWatch = System.Diagnostics.Stopwatch.StartNew();
+                    AddLog(L.UdpOneWayHint);
+                    int chunkSize = Math.Max(1, Math.Min(UdpOneWay.MaxChunkSize,
+                        Config.GetInt("UdpChunkSize", UdpOneWay.DefaultChunkSize)));
+                    var udpClient = new TransferUdpClient(ip, port, path, chunkSize, srcPort, speedLimit);
+                    _clientUdp = udpClient;
+                    bool udpOk = await WireUdpClientAndSendAsync(udpClient).ConfigureAwait(true);
+                    _clientUdp = null;
+                    if (udpOk && !_pauseRequested)
+                    {
+                        RecordSent(ip, MeasurePathBytes(path, false), 1,
+                            udpWatch.Elapsed.TotalSeconds, PathDisplayName(path), path);
+                    }
+                    return udpOk;
+                }
 
                 bool syncMode = isFolder && _chkSync.IsChecked == true;
                 Guid pauseSession = resumeSession.HasValue ? resumeSession.Value
@@ -1930,6 +2337,33 @@ namespace TrFileTransfer
         {
             return (_client != null && _client.WasCancelled)
                 || (_clientUdt != null && _clientUdt.WasCancelled);
+        }
+
+        /// <summary>Wires the one-way UDP client's events (progress card, logs) and
+        /// awaits the send. Returns false when the client reported an error (the error
+        /// itself is already logged via OnError).</summary>
+        private async Task<bool> WireUdpClientAndSendAsync(TransferUdpClient c)
+        {
+            var card = RunOnUiSync(() => CreateTransferCard(_progressPanelC));
+            bool failed = false;
+            c.OnLog += msg => RunOnUi(() => AddLog(msg));
+            c.OnProgress += p => RunOnUi(() => UpdateCardProgress(card, p));
+            c.OnError += msg => RunOnUi(() =>
+            {
+                AddLog(_pauseRequested ? L.C_Paused : (L.ErrorPrefix + msg));
+                failed = true;
+                ResetClientUI();
+                UpdateCardComplete(card);
+            });
+            c.OnTransferComplete += () => RunOnUi(() =>
+            {
+                ResetClientUI();
+                UpdateCardComplete(card);
+                Notify(L.NotifySendDone, L.TransferComplete);
+            });
+            c.OnStopped += () => RunOnUi(() => UpdateCardComplete(card));
+            await c.SendAsync().ConfigureAwait(true);
+            return !failed;
         }
 
         /// <summary>Locks in the paused state: keep the snapshot, arm the resume button.
@@ -2183,6 +2617,8 @@ namespace TrFileTransfer
                 _client.Cancel();
             if (_clientUdt != null)
                 _clientUdt.Cancel();
+            if (_clientUdp != null)
+                _clientUdp.Cancel();
             _btnCancel.IsEnabled = false;
             _lblStatusC.Text = L.Cancelling;
         }
@@ -2193,6 +2629,7 @@ namespace TrFileTransfer
             _btnCancel.IsEnabled = true;
             _rbClientTcp.IsEnabled = false;
             _rbClientUdt.IsEnabled = false;
+            _rbClientUdp.IsEnabled = false;
             _cmbLang.IsEnabled = false;
             _txtServerIp.IsEnabled = false;
             _txtPortC.IsEnabled = false;
@@ -2223,12 +2660,9 @@ namespace TrFileTransfer
                 _btnPause.IsEnabled = false;
                 _btnPause.Content = L.PauseBtn;
             }
-            if (!_btnStopServer.IsEnabled)
-            {
-                _cmbLang.IsEnabled = true;
-            }
             _rbClientTcp.IsEnabled = true;
             _rbClientUdt.IsEnabled = true;
+            _rbClientUdp.IsEnabled = true;
             _txtServerIp.IsEnabled = true;
             _txtPortC.IsEnabled = true;
             _txtFile.IsEnabled = true;
@@ -2245,6 +2679,7 @@ namespace TrFileTransfer
             _btnFanOut.IsEnabled = true;
             _btnSendText.IsEnabled = true;
             _txtPairing.IsEnabled = true;
+            UpdateLanguageLock();
         }
 
         // ==================== Fan-out: one file/folder to many devices in parallel ====================
@@ -2252,6 +2687,11 @@ namespace TrFileTransfer
         private void BtnFanOut_Click(object sender, RoutedEventArgs e)
         {
             if (_chkMonitor.IsChecked == true || _monitorCts != null) return;
+            if (_rbClientUdp.IsChecked == true)
+            {
+                MessageBox.Show(this, L.UdpNotForFanOut, L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
             bool isFolder = _chkFolder.IsChecked == true;
             string path = _txtFile.Text.Trim();
             if (isFolder ? !Directory.Exists(path) : !File.Exists(path))
@@ -2396,26 +2836,33 @@ namespace TrFileTransfer
             public DateTime LastUpdate;
         }
 
-        private Border GetOrCreateTcpCard(IPEndPoint ep)
+        private Border GetOrCreateCard(Dictionary<IPEndPoint, Border> cards, IPEndPoint ep)
         {
             Border card;
-            if (!_tcpCards.TryGetValue(ep, out card))
+            if (!cards.TryGetValue(ep, out card))
             {
                 card = CreateTransferCard(_progressPanelS);
-                _tcpCards[ep] = card;
+                cards[ep] = card;
             }
             return card;
         }
 
-        private Border GetOrCreateUdtCard(IPEndPoint ep)
+        private static void CompleteCard(Dictionary<IPEndPoint, Border> cards, IPEndPoint ep)
         {
             Border card;
-            if (!_udtCards.TryGetValue(ep, out card))
+            if (cards.TryGetValue(ep, out card))
             {
-                card = CreateTransferCard(_progressPanelS);
-                _udtCards[ep] = card;
+                UpdateCardComplete(card);
+                cards.Remove(ep);
             }
-            return card;
+        }
+
+        /// <summary>Completes and forgets every card a tab's server owns (server
+        /// stopping must not touch the OTHER tab's live cards).</summary>
+        private static void CompleteAllCards(Dictionary<IPEndPoint, Border> cards)
+        {
+            foreach (var c in cards.Values) UpdateCardComplete(c);
+            cards.Clear();
         }
 
         private Border CreateTransferCard(StackPanel parent)
@@ -2483,7 +2930,7 @@ namespace TrFileTransfer
                 L.EtaShort, FormatEta(p));
         }
 
-        private void UpdateCardComplete(Border card)
+        private static void UpdateCardComplete(Border card)
         {
             if (card.Tag == null) return; // already completed
             card.Tag = null;
@@ -2498,6 +2945,14 @@ namespace TrFileTransfer
         }
 
         // ==================== Log ====================
+
+        /// <summary>Clears the on-screen log only — the daily files under
+        /// %AppData%\TrFileTransfer\logs stay as diagnostic evidence.</summary>
+        private void BtnClearLog_Click(object sender, RoutedEventArgs e)
+        {
+            _lstLog.Items.Clear();
+            AddLog(L.LogCleared);
+        }
 
         private void BtnExportLog_Click(object sender, RoutedEventArgs e)
         {
@@ -2826,10 +3281,8 @@ namespace TrFileTransfer
             {
                 try { _monitorCts.Cancel(); } catch { }
             }
-            if (_server != null)
-                _server.Stop();
-            if (_serverUdt != null)
-                _serverUdt.Stop();
+            foreach (var t in _serverTabs)
+                StopProtocolTab(t);
             if (_client != null)
                 _client.Cancel();
             if (_clientUdt != null)

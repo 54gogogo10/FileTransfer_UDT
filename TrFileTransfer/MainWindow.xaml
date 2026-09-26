@@ -13,7 +13,7 @@
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="12"/>
             <RowDefinition Height="*"/>
-            <RowDefinition Height="12"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
         </Grid.RowDefinitions>
 
@@ -70,27 +70,98 @@
                         <TextBlock x:Name="_hdrServer" Style="{StaticResource SectionTitle}" Margin="7,0,0,0"/>
                     </StackPanel>
 
-                    <!-- Bind / port / protocols -->
-                    <Grid Grid.Row="1" Margin="0,0,0,8">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="70"/>
-                            <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="Auto"/>
-                        </Grid.ColumnDefinitions>
-                        <TextBlock x:Name="_lblBind" Style="{StaticResource FieldLabel}" Margin="0,0,6,0"/>
-                        <ComboBox x:Name="_cmbBind" Grid.Column="1" Style="{StaticResource CmbInput}"
-                                  VerticalAlignment="Center"/>
-                        <TextBlock x:Name="_lblPortS" Grid.Column="2" Style="{StaticResource FieldLabel}" Margin="8,0,6,0"/>
-                        <TextBox x:Name="_txtPortS" Grid.Column="3" Style="{StaticResource TxtInput}"
-                                 VerticalAlignment="Center"/>
-                        <CheckBox x:Name="_chkServerTcp" Grid.Column="4" Style="{StaticResource ChkBox}"
-                                  Content="TCP" Margin="10,0,0,0" VerticalAlignment="Center"/>
-                        <CheckBox x:Name="_chkServerUdt" Grid.Column="5" Style="{StaticResource ChkBox}"
-                                  Content="UDT" Margin="10,0,0,0" VerticalAlignment="Center"/>
-                    </Grid>
+                    <!-- Bind / port — one tab per protocol; each tab multi-selects its
+                         bind addresses (wildcards + interfaces) and owns its port -->
+                    <TabControl x:Name="_tabServerProto" Grid.Row="1" Margin="0,0,0,8"
+                                Style="{StaticResource TabModern}" Background="Transparent">
+                        <TabItem x:Name="_tabTcpItem" Style="{StaticResource TabModernItem}" Header="TCP">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+                                <Grid Grid.Row="0" Margin="0,0,0,7">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="66"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="_lblBindTcp" Style="{StaticResource FieldLabel}" Margin="0,0,6,0"/>
+                                    <local:BindMultiSelect x:Name="_bindTcp" Grid.Column="1" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="_lblPortTcp" Grid.Column="2" Style="{StaticResource FieldLabel}" Margin="8,0,6,0"/>
+                                    <TextBox x:Name="_txtPortTcp" Grid.Column="3" Style="{StaticResource TxtInput}"
+                                             VerticalAlignment="Center"/>
+                                </Grid>
+                                <DockPanel Grid.Row="1" LastChildFill="False">
+                                    <StackPanel Orientation="Horizontal" DockPanel.Dock="Right">
+                                        <Button x:Name="_btnStartTcp" Style="{StaticResource BtnPrimary}" MinWidth="72"
+                                                Click="BtnStartTcp_Click"/>
+                                        <Button x:Name="_btnStopTcp" Style="{StaticResource BtnSecondary}" MinWidth="72"
+                                                Margin="8,0,0,0" IsEnabled="False" Click="BtnStopTcp_Click"/>
+                                    </StackPanel>
+                                </DockPanel>
+                            </Grid>
+                        </TabItem>
+                        <TabItem x:Name="_tabUdtItem" Style="{StaticResource TabModernItem}" Header="UDT">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+                                <Grid Grid.Row="0" Margin="0,0,0,7">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="66"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="_lblBindUdt" Style="{StaticResource FieldLabel}" Margin="0,0,6,0"/>
+                                    <local:BindMultiSelect x:Name="_bindUdt" Grid.Column="1" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="_lblPortUdt" Grid.Column="2" Style="{StaticResource FieldLabel}" Margin="8,0,6,0"/>
+                                    <TextBox x:Name="_txtPortUdt" Grid.Column="3" Style="{StaticResource TxtInput}"
+                                             VerticalAlignment="Center"/>
+                                </Grid>
+                                <DockPanel Grid.Row="1" LastChildFill="False">
+                                    <StackPanel Orientation="Horizontal" DockPanel.Dock="Right">
+                                        <Button x:Name="_btnStartUdt" Style="{StaticResource BtnPrimary}" MinWidth="72"
+                                                Click="BtnStartUdt_Click"/>
+                                        <Button x:Name="_btnStopUdt" Style="{StaticResource BtnSecondary}" MinWidth="72"
+                                                Margin="8,0,0,0" IsEnabled="False" Click="BtnStopUdt_Click"/>
+                                    </StackPanel>
+                                </DockPanel>
+                            </Grid>
+                        </TabItem>
+                        <TabItem x:Name="_tabUdpItem" Style="{StaticResource TabModernItem}" Header="UDP">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+                                <Grid Grid.Row="0" Margin="0,0,0,7">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="66"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="_lblBindUdp" Style="{StaticResource FieldLabel}" Margin="0,0,6,0"/>
+                                    <local:BindMultiSelect x:Name="_bindUdp" Grid.Column="1" VerticalAlignment="Center"/>
+                                    <TextBlock x:Name="_lblPortUdp" Grid.Column="2" Style="{StaticResource FieldLabel}" Margin="8,0,6,0"/>
+                                    <TextBox x:Name="_txtPortUdp" Grid.Column="3" Style="{StaticResource TxtInput}"
+                                             VerticalAlignment="Center"/>
+                                </Grid>
+                                <DockPanel Grid.Row="1" LastChildFill="False">
+                                    <StackPanel Orientation="Horizontal" DockPanel.Dock="Right">
+                                        <Button x:Name="_btnStartUdp" Style="{StaticResource BtnPrimary}" MinWidth="72"
+                                                Click="BtnStartUdp_Click"/>
+                                        <Button x:Name="_btnStopUdp" Style="{StaticResource BtnSecondary}" MinWidth="72"
+                                                Margin="8,0,0,0" IsEnabled="False" Click="BtnStopUdp_Click"/>
+                                    </StackPanel>
+                                </DockPanel>
+                            </Grid>
+                        </TabItem>
+                    </TabControl>
 
                     <!-- Save dir -->
                     <Grid Grid.Row="2" Margin="0,0,0,8">
@@ -106,19 +177,9 @@
                                 MinWidth="64" Margin="8,0,0,0" Click="BtnBrowseDir_Click"/>
                     </Grid>
 
-                    <!-- Actions: start/stop left, open/recent right -->
+                    <!-- Actions: open/recent (start/stop live inside each family tab) -->
                     <Grid Grid.Row="3" Margin="0,0,0,8">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="*"/>
-                        </Grid.ColumnDefinitions>
-                        <StackPanel Orientation="Horizontal">
-                            <Button x:Name="_btnStartServer" Style="{StaticResource BtnPrimary}" MinWidth="88"
-                                    Click="BtnStartServer_Click"/>
-                            <Button x:Name="_btnStopServer" Style="{StaticResource BtnSecondary}" MinWidth="88"
-                                    Margin="8,0,0,0" IsEnabled="False" Click="BtnStopServer_Click"/>
-                        </StackPanel>
-                        <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right">
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                             <Button x:Name="_btnOpenDir" Style="{StaticResource BtnSecondary}" MinWidth="76"
                                     Click="BtnOpenDir_Click"/>
                             <Button x:Name="_btnRecent" Style="{StaticResource BtnSecondary}" MinWidth="76"
@@ -193,6 +254,7 @@
                             <ColumnDefinition Width="Auto"/>
                             <ColumnDefinition Width="Auto"/>
                             <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
                         </Grid.ColumnDefinitions>
                         <TextBlock x:Name="_lblServerIp" Style="{StaticResource FieldLabel}" Margin="0,0,6,0"/>
                         <TextBox x:Name="_txtServerIp" Grid.Column="1" Style="{StaticResource TxtInput}"
@@ -201,10 +263,15 @@
                         <TextBox x:Name="_txtPortC" Grid.Column="3" Style="{StaticResource TxtInput}"
                                  VerticalAlignment="Center"/>
                         <RadioButton x:Name="_rbClientTcp" Grid.Column="4" Style="{StaticResource RdoBox}"
-                                     Content="TCP" Margin="10,0,0,0" VerticalAlignment="Center"/>
+                                     Content="TCP" Margin="10,0,0,0" VerticalAlignment="Center"
+                                     Checked="RdoClientProto_Checked"/>
                         <RadioButton x:Name="_rbClientUdt" Grid.Column="5" Style="{StaticResource RdoBox}"
-                                     Content="UDT" Margin="10,0,0,0" VerticalAlignment="Center"/>
-                        <Button x:Name="_btnSend" Grid.Column="6" Style="{StaticResource BtnPrimary}" MinWidth="76"
+                                     Content="UDT" Margin="10,0,0,0" VerticalAlignment="Center"
+                                     Checked="RdoClientProto_Checked"/>
+                        <RadioButton x:Name="_rbClientUdp" Grid.Column="6" Style="{StaticResource RdoBox}"
+                                     Content="UDP" Margin="10,0,0,0" VerticalAlignment="Center"
+                                     Checked="RdoClientProto_Checked"/>
+                        <Button x:Name="_btnSend" Grid.Column="7" Style="{StaticResource BtnPrimary}" MinWidth="76"
                                 Margin="10,0,0,0" Click="BtnSend_Click"/>
                     </Grid>
 
@@ -242,7 +309,7 @@
                     <StackPanel Grid.Row="4" Orientation="Horizontal" Margin="0,0,0,8">
                         <StackPanel Orientation="Vertical" Margin="0,0,10,0">
                             <TextBlock x:Name="_lblSrcPort" Style="{StaticResource FieldLabelSmall}"/>
-                            <local:NumericBox x:Name="_numSrcPort" Width="84" Min="0" Max="65535" Margin="0,4,0,0"/>
+                            <local:NumericBox x:Name="_numSrcPort" Width="76" Min="0" Max="65535" Margin="0,4,0,0"/>
                         </StackPanel>
                         <StackPanel Orientation="Vertical" Margin="0,0,10,0">
                             <TextBlock x:Name="_lblConcurrency" Style="{StaticResource FieldLabelSmall}"/>
@@ -250,13 +317,13 @@
                         </StackPanel>
                         <StackPanel Orientation="Vertical" Margin="0,0,0,0">
                             <TextBlock x:Name="_lblSpeed" Style="{StaticResource FieldLabelSmall}"/>
-                            <local:NumericBox x:Name="_numSpeed" Width="100" Min="0" Max="1048576" Margin="0,4,0,0"/>
+                            <local:NumericBox x:Name="_numSpeed" Width="88" Min="0" Max="1048576" Margin="0,4,0,0"/>
                         </StackPanel>
                         <Rectangle Width="1" Height="30" RadiusX="0.5" RadiusY="0.5"
                                    Fill="{DynamicResource Brush.CardBorder}" VerticalAlignment="Center" Margin="12,0"/>
                         <StackPanel Orientation="Vertical">
                             <TextBlock x:Name="_lblPairingC" Style="{StaticResource FieldLabelSmall}"/>
-                            <TextBox x:Name="_txtPairing" Width="96" MaxLength="12" Style="{StaticResource TxtInput}"
+                            <TextBox x:Name="_txtPairing" Width="106" MaxLength="12" Style="{StaticResource TxtInput}"
                                      Margin="0,4,0,0"/>
                         </StackPanel>
                     </StackPanel>
@@ -348,6 +415,10 @@
         </Grid>
 
         <!-- ==================== Log console ==================== -->
+        <!-- Drag the splitter to rebalance transfer cards vs. log height -->
+        <GridSplitter Grid.Row="4" Style="{StaticResource SplitterH}" Height="12"
+                      HorizontalAlignment="Stretch" ResizeBehavior="PreviousAndNext"
+                      ResizeDirection="Rows" ShowsPreview="False"/>
         <Border Grid.Row="5" Style="{StaticResource Card}">
             <Grid>
                 <Grid.RowDefinitions>
@@ -365,8 +436,10 @@
                 </StackPanel>
                 <ListBox x:Name="_lstLog" Grid.Row="1" Style="{StaticResource LogList}" Margin="0,0,0,8"/>
                 <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right">
+                    <Button x:Name="_btnClearLog" Style="{StaticResource BtnSecondary}" MinWidth="88"
+                            Click="BtnClearLog_Click"/>
                     <Button x:Name="_btnExportLog" Style="{StaticResource BtnSecondary}" MinWidth="104"
-                            Click="BtnExportLog_Click"/>
+                            Margin="8,0,0,0" Click="BtnExportLog_Click"/>
                 </StackPanel>
             </Grid>
         </Border>
