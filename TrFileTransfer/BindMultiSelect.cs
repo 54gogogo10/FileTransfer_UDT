@@ -97,12 +97,10 @@ namespace TrFileTransfer
             foreach (var kv in items)
             {
                 IPAddress addr = kv.Key;
-                bool wildcard = Utils.IsWildcardAddress(addr);
                 var box = new CheckBox
                 {
                     Style = (Style)TryFindResource("ChkBox"),
                     Content = kv.Value,
-                    Tag = wildcard ? "wildcard" : null,
                     Margin = new Thickness(0, 0, 0, 4),
                     MinWidth = 170,
                     HorizontalAlignment = HorizontalAlignment.Left

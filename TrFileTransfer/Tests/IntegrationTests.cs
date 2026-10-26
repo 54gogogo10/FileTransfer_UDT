@@ -147,6 +147,8 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_UDP_OneWay_SingleFile", UdpOneWaySingleFile, 1);
             runner.Run("Integration_UDP_OneWay_EmptyFile", UdpOneWayEmptyFile, 1);
             runner.Run("Integration_UDP_OneWay_LossyResume", UdpOneWayLossyResume, 1);
+            runner.Run("Integration_UDP_OneWay_ProgressThrottled", UdpOneWayProgressThrottled, 1);
+            runner.Run("Integration_UDP_OneWay_DuplicateSkip", UdpOneWayDuplicateSkip, 1);
             runner.Run("Integration_UDP_OneWay_GarbageRejected", UdpOneWayGarbageRejected, 1);
             runner.Run("Integration_UDP_V4V6_SamePort", UdpV4V6SamePort, 1);
             runner.Run("Integration_TCP_MultiAddressSamePort", TcpMultiAddressSamePort, 1);
@@ -435,6 +437,104 @@ namespace TrFileTransfer.Tests
             {
                 if (server != null) { try { server.Stop(); } catch { } }
                 if (proxy != null) proxy.Dispose();
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// The receiver throttles OnClientProgress to the sender's 100ms cadence:
+        /// at ~1.2 KB per datagram, a per-chunk event feed would flood the UI
+        /// dispatcher (1 GiB ≈ 900K dispatches). On loopback nothing drops, so an
+        /// unthrottled feed fires exactly once per chunk; a throttled one stays far
+        /// below even on a slow runner (loopback needs microseconds per chunk, so
+        /// crossing chunks/4 would require a >4ms-per-datagram pace).
+        /// </summary>
+        private static void UdpOneWayProgressThrottled()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_upt_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_upt_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdpServer server = null;
+            try
+            {
+                var content = new byte[512 * 1024];
+                new Random(303).NextBytes(content);
+                string file = Path.Combine(sendDir, "throttle.bin");
+                File.WriteAllBytes(file, content);
+
+                server = StartUdpReceiver("127.0.0.1", port, recvDir);
+                var waiter = WatchUdpDelivery(server);
+                int events = 0;
+                server.OnClientProgress += delegate { Interlocked.Increment(ref events); };
+
+                var client = new TransferUdpClient("127.0.0.1", port, file);
+                client.SendAsync().Wait(30000);
+                string got = WaitUdp(waiter, 15000);
+                Assert.NotNull(got, "throttled-progress file delivered");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(got)),
+                    "throttled-progress bytes match");
+
+                long totalChunks = (content.Length + UdpOneWay.DefaultChunkSize - 1)
+                    / UdpOneWay.DefaultChunkSize;
+                Assert.True(events < totalChunks / 4,
+                    "progress events throttled: " + events + " events for " + totalChunks + " chunks");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// DuplicateFiles=skip applies to one-way UDP the way it does to TCP/UDT
+        /// 0x00: a re-send of a byte-identical file must NOT create a "_1" sibling —
+        /// the fresh copy is dropped and the on-disk original survives. The skip
+        /// path still reports the survivor through OnFileReceived.
+        /// </summary>
+        private static void UdpOneWayDuplicateSkip()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_ud_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_ud_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdpServer server = null;
+            try
+            {
+                var content = new byte[300 * 1024];
+                new Random(304).NextBytes(content);
+                string file = Path.Combine(sendDir, "dup.bin");
+                File.WriteAllBytes(file, content);
+
+                server = StartUdpReceiver("127.0.0.1", port, recvDir);
+                server.SkipDuplicateFiles = true;
+
+                var waiter1 = WatchUdpDelivery(server);
+                var client1 = new TransferUdpClient("127.0.0.1", port, file);
+                client1.SendAsync().Wait(30000);
+                string first = WaitUdp(waiter1, 15000);
+                Assert.NotNull(first, "first one-way delivery landed");
+
+                var waiter2 = WatchUdpDelivery(server);
+                var client2 = new TransferUdpClient("127.0.0.1", port, file);
+                client2.SendAsync().Wait(30000);
+                string second = WaitUdp(waiter2, 15000);
+                Assert.NotNull(second, "duplicate pass completed (skip path reports the survivor)");
+
+                Assert.True(Directory.GetFiles(recvDir, "*.bin").Length == 1,
+                    "duplicate skipped: no _1 sibling, exactly one file");
+                Assert.Equal(first, second, "skip reports the survivor, not a renamed copy");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(second)),
+                    "surviving file content unchanged");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
                 try { Directory.Delete(sendDir, true); } catch { }
                 try { Directory.Delete(recvDir, true); } catch { }
             }

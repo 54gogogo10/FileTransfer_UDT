@@ -1856,11 +1856,12 @@ namespace TrFileTransfer
 
         /// <summary>One-way UDP receiver options: the IP filter and per-device layout
         /// apply; pairing / receive-confirmation / receive rate limit cannot — there is
-        /// no return path to negotiate on.</summary>
+        /// no return path to negotiate on. Dedup applies at finalize time.</summary>
         private void ApplyServerOptionsUdp(TransferUdpServer server)
         {
             server.OnSessionStats += stats => RecordReceived(stats);
             server.PerDeviceFolder = Config.GetBool("PerDeviceFolder", false);
+            server.SkipDuplicateFiles = Config.Get("DuplicateFiles", "rename") == "skip";
             server.ResolveDeviceName = ResolveDeviceNameForIp;
             server.IpAllowed = IpFilterPass;
         }

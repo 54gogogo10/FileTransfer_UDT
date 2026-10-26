@@ -39,7 +39,7 @@ namespace TrFileTransfer
         public const long MaxChunks = 16 * 1024 * 1024; // 16M chunks @ 1200B ≈ 19 GiB cover
         public const int MaxNameLen = 255;
         /// <summary>Concurrent in-flight sessions cap. Every session holds a file
-        /// handle plus a coverage bitmap (worst case ~16 MB at MaxChunks), so an
+        /// handle plus a coverage bit set (worst case ~2 MB at MaxChunks), so an
         /// unbounded table is a memory/handle-exhaustion DoS for a datagram blaster.
         /// Excess evicts the most-idle session — a legitimate re-send re-STARTs anyway.</summary>
         public const int MaxSessions = 64;
@@ -86,6 +86,10 @@ namespace TrFileTransfer
         private volatile bool _isRunning;
         private readonly Dictionary<Guid, UdpRecvSession> _sessions = new Dictionary<Guid, UdpRecvSession>();
         private readonly object _sessionLock = new object();
+        /// <summary>Finalizations run on the pool but one at a time: GetUniqueSavePath
+        /// + Move must not interleave across sessions (two racing finalizes would pick
+        /// the same final path and one would lose its part file).</summary>
+        private readonly object _finalizeGate = new object();
         private Timer _gc;
 
         /// <summary>Fired for every log message.</summary>
@@ -108,6 +112,9 @@ namespace TrFileTransfer
         public Func<string, bool> IpAllowed;
         /// <summary>Save each sender's files under a per-device subdirectory.</summary>
         public bool PerDeviceFolder;
+        /// <summary>When a name-colliding file already exists byte-identical, drop the
+        /// fresh copy instead of saving it with a suffix (same rule as TCP/UDT 0x00).</summary>
+        public bool SkipDuplicateFiles;
         /// <summary>Maps a sender IP to a friendly device folder name.</summary>
         public Func<string, string> ResolveDeviceName;
 
@@ -336,7 +343,8 @@ namespace TrFileTransfer
                     emptyToFinalize = s;
                 }
             }
-            if (emptyToFinalize != null) FinalizeSession(emptyToFinalize, from);
+            if (emptyToFinalize != null)
+                Task.Run(delegate { lock (_finalizeGate) FinalizeSession(emptyToFinalize, from); });
         }
 
         private void HandleData(byte[] buf, Guid session, IPEndPoint from)
@@ -352,8 +360,15 @@ namespace TrFileTransfer
             int payloadStart = UdpOneWay.HeaderSize + 4;
             int payloadLen = buf.Length - payloadStart;
             long coveredBytes = s.WriteChunk(chunkIndex, payloadLen, buf, payloadStart);
-            if (coveredBytes >= 0 && s.TotalSize > 0)
+            // Progress feed is throttled to the sender's 100ms cadence: a datagram
+            // is only ~1.2 KB, so per-chunk events would flood the UI dispatcher
+            // (a 1 GiB send ≈ 900K dispatches). Only the receive loop touches
+            // LastProgressUtc; the completing chunk always reports.
+            bool reachedEnd = coveredBytes >= s.TotalSize;
+            if (coveredBytes >= 0 && s.TotalSize > 0
+                && (reachedEnd || (DateTime.UtcNow - s.LastProgressUtc).TotalMilliseconds >= 100))
             {
+                s.LastProgressUtc = DateTime.UtcNow;
                 double secs = Math.Max(0.001, (DateTime.UtcNow - s.StartedUtc).TotalSeconds);
                 var prog = new TransferProgress
                 {
@@ -374,7 +389,8 @@ namespace TrFileTransfer
                     // Remove-first: exactly one finalize, and it runs without the lock
                     if (_sessions.Remove(session)) finalize = true;
                 }
-                if (finalize) FinalizeSession(s, from);
+                if (finalize)
+                    Task.Run(delegate { lock (_finalizeGate) FinalizeSession(s, from); });
             }
         }
 
@@ -389,7 +405,9 @@ namespace TrFileTransfer
 
         /// <summary>Whole-file SHA256 check, then rename into the save dir. The caller
         /// has already removed the session from the table, so this runs at most once
-        /// per session and OUTSIDE the session lock (hashing may take seconds).</summary>
+        /// per session; it runs on a pool thread behind _finalizeGate — hashing a
+        /// multi-GB part takes seconds and must not stall the receive loop (every
+        /// OTHER session's datagrams keep draining meanwhile).</summary>
         private void FinalizeSession(UdpRecvSession s, IPEndPoint from)
         {
             // The writer handle (ReadWrite) must go first: opening the file for hashing
@@ -426,7 +444,34 @@ namespace TrFileTransfer
                     try { Directory.CreateDirectory(dir); } catch { dir = _saveDirectory; }
                 }
             }
+            string basePath = Path.Combine(dir, s.FileName);
             string finalPath = Utils.GetUniqueSavePath(dir, s.FileName);
+            // Skip-duplicates mirrors the TCP/UDT 0x00 rule: only when the name
+            // actually collided (the unique path renamed), and only when the survivor
+            // is byte-identical — s.ExpectedHash is already verified against the
+            // received bytes at this point, so one digest of the old file decides.
+            if (SkipDuplicateFiles
+                && !string.Equals(finalPath, basePath, StringComparison.OrdinalIgnoreCase)
+                && ExistingFileMatches(basePath, s.TotalSize, s.ExpectedHash))
+            {
+                Log(L.S_DuplicateSkipped(s.FileName));
+                s.Discard(); // the on-disk original wins; the fresh copy is dropped
+                var recvDup = OnFileReceived;
+                if (recvDup != null) recvDup(basePath, s.TotalSize);
+                var statsDup = new WireSessionStats
+                {
+                    Peer = s.PeerIp,
+                    Bytes = s.TotalSize,
+                    Files = 1,
+                    Detail = s.FileName,
+                    Path = basePath
+                };
+                var shDup = OnSessionStats;
+                if (shDup != null) shDup(statsDup);
+                var doneDup = OnClientTransferComplete;
+                if (doneDup != null) doneDup(from);
+                return;
+            }
             try
             {
                 s.MoveTo(finalPath);
@@ -463,6 +508,32 @@ namespace TrFileTransfer
             if (sh != null) sh(stats);
             var done3 = OnClientTransferComplete;
             if (done3 != null) done3(from);
+        }
+
+        /// <summary>Duplicate check against an already-saved file: size first, then
+        /// the whole-file digest — cache-aware, so a file this receiver delivered
+        /// earlier answers from the journal without a disk read (same decision chain
+        /// as ServerWire.VerifyFullHashFile).</summary>
+        private static bool ExistingFileMatches(string path, long size, byte[] expected)
+        {
+            try
+            {
+                long existSize, existMTime;
+                if (!FileHashCache.Stat(path, out existSize, out existMTime)) return false;
+                if (existSize != size) return false;
+                var cache = FileHashCache.ForServer;
+                bool cached;
+                if (cache.TryMatch(path, existSize, existMTime, expected, out cached))
+                    return cached;
+                byte[] hash = ClientWire.ComputeFileHash(path, CancellationToken.None);
+                if (hash == null) return false;
+                cache.StoreIfUnchanged(path, hash, existSize, existMTime);
+                return Utils.ConstantTimeEquals(expected, hash);
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         /// <summary>Closes sessions idle past the window; .part files stay on disk so a
@@ -530,8 +601,14 @@ namespace TrFileTransfer
             public readonly string PartPath;
             public readonly DateTime StartedUtc = DateTime.UtcNow;
             public DateTime LastHeard = DateTime.UtcNow;
+            /// <summary>Last OnClientProgress emission (receive-loop thread only).</summary>
+            public DateTime LastProgressUtc = DateTime.MinValue;
             private FileStream _fs;
-            private readonly bool[] _covered;
+            // Coverage as a bit set rather than bool[]: a hostile START can declare
+            // 16M chunks (19 GiB @ 1200B) without ever sending a byte, and the part
+            // file itself is sparse — bool[] would commit 16 MB per session (64 such
+            // sessions ≈ 1 GB of RAM); bits cut that eightfold.
+            private readonly byte[] _coveredBits;
             private long _coveredBytes;
             private readonly object _io = new object();
 
@@ -548,7 +625,7 @@ namespace TrFileTransfer
                 ExpectedHash = hash;
                 PeerIp = peerIp;
                 PartPath = Path.Combine(partDir, id.ToString("N") + ".part");
-                _covered = new bool[totalChunks];
+                _coveredBits = new byte[(totalChunks + 7) / 8];
                 try { Directory.CreateDirectory(partDir); } catch { }
                 try
                 {
@@ -602,7 +679,9 @@ namespace TrFileTransfer
                 lock (_io)
                 {
                     if (_fs == null) return -1; // part file unusable — finalize will say why
-                    if (_covered[chunkIndex]) return _coveredBytes; // re-send: already have it
+                    int bitByte = chunkIndex >> 3;
+                    int bitMask = 1 << (chunkIndex & 7);
+                    if ((_coveredBits[bitByte] & bitMask) != 0) return _coveredBytes; // re-send: already have it
                     try
                     {
                         _fs.Seek((long)chunkIndex * ChunkSize, SeekOrigin.Begin);
@@ -612,7 +691,7 @@ namespace TrFileTransfer
                     {
                         return -1;
                     }
-                    _covered[chunkIndex] = true;
+                    _coveredBits[bitByte] |= (byte)bitMask;
                     _coveredBytes += payloadLen;
                     return _coveredBytes;
                 }
@@ -755,7 +834,17 @@ namespace TrFileTransfer
                     for (long i = 0; i < totalChunks; i++)
                     {
                         ct.ThrowIfCancellationRequested();
-                        int n = await fs.ReadAsync(chunk, 0, _chunkSize, ct).ConfigureAwait(false);
+                        // Fill the chunk completely: a short read would emit an
+                        // undersized frame, and the receiver permanently rejects any
+                        // chunk whose length differs from the declared shape — the
+                        // coverage would never reach complete while we report done.
+                        int n = 0;
+                        while (n < _chunkSize)
+                        {
+                            int r = await fs.ReadAsync(chunk, n, _chunkSize - n, ct).ConfigureAwait(false);
+                            if (r <= 0) break;
+                            n += r;
+                        }
                         if (n <= 0) break;
                         Buffer.BlockCopy(BitConverter.GetBytes((int)i), 0, frame, UdpOneWay.HeaderSize, 4);
                         Buffer.BlockCopy(chunk, 0, frame, UdpOneWay.HeaderSize + 4, n);
