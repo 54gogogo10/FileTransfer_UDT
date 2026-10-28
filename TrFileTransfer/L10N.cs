@@ -335,6 +335,40 @@ namespace TrFileTransfer
                 ? string.Format("单向发送完毕: {0}（{1}，{2}秒）。对方是否收齐需在其日志确认", name, size, secs)
                 : string.Format("One-way send finished: {0} ({1}, {2}s). Confirm receipt on the receiver's side", name, size, secs);
         }
+        public static string UdpC_Pass(object pass, object total)
+        {
+            return IsChinese
+                ? string.Format("—— 第 {0}/{1} 轮重发开始（补足丢包）——", pass, total)
+                : string.Format("-- pass {0}/{1}: re-sending to cover losses --", pass, total);
+        }
+        public static string UdpC_FecOn(object groupSize)
+        {
+            return IsChinese
+                ? string.Format("前向纠错已启用：{0} 分片一组（XOR 奇偶 + 交错发送），突发丢包免重传恢复", groupSize)
+                : string.Format("FEC on: groups of {0} chunks (XOR parity + interleaving) — bursts recover without retransmit", groupSize);
+        }
+        public static string UdpS_ParityRecovered(object name, object group)
+        {
+            return IsChinese
+                ? string.Format("FEC 恢复丢失分片：{0}（组起始分片 {1}）", name, group)
+                : string.Format("FEC recovered a lost chunk: {0} (group start {1})", name, group);
+        }
+        public static string UdpS_AlreadyDelivered(object name)
+        {
+            return IsChinese
+                ? string.Format("会话 {0} 刚已完整接收，本轮重复数据被忽略", name)
+                : string.Format("Session {0} was just delivered; this repeat pass is ignored", name);
+        }
+        public static string UdpPassesLabel { get { return IsChinese ? "重发轮数" : "Passes"; } }
+        public static string UdpPassesHint
+        {
+            get
+            {
+                return IsChinese
+                    ? "单向 UDP 专用：自动连发 N 轮对抗丢包（接收方不产生重复文件）"
+                    : "One-way UDP only: re-send N passes to ride out loss (no duplicates on the receiver)";
+            }
+        }
         public static string UdpC_Cancelled(string name)
         {
             return IsChinese
@@ -682,6 +716,15 @@ namespace TrFileTransfer
         public static string HttpShareBtn { get { return IsChinese ? "共享" : "Share"; } }
         public static string HttpPortLabel { get { return IsChinese ? "HTTP:" : "HTTP:"; } }
         public static string HttpShareUploadBtn { get { return IsChinese ? "上传" : "Upload"; } }
+        public static string HttpShareDeleteBtn { get { return IsChinese ? "删除" : "Delete"; } }
+        public static string HttpShareCancelBtn { get { return IsChinese ? "取消" : "Cancel"; } }
+        public static string HttpShareDeleteTitle { get { return IsChinese ? "删除文件" : "Delete file"; } }
+        public static string HttpShareDeleteConfirm(object name, object size)
+        {
+            return IsChinese
+                ? string.Format("确定删除文件 {0}（{1}）？此操作不可恢复。", name, size)
+                : string.Format("Delete file {0} ({1})? This cannot be undone.", name, size);
+        }
         public static string HttpShareStop { get { return IsChinese ? "停止" : "Stop"; } }
         public static string ShareQrBtn { get { return IsChinese ? "二维码" : "QR Code"; } }
         public static string HttpShareOn(object url)
@@ -833,27 +876,32 @@ namespace TrFileTransfer
             {
                 return IsChinese
                     ? "用法:\r\n" +
-                      "  TrFileTransfer send --ip <IP> --port <端口> [--tcp|--udt] --file <路径|--folder <路径>\r\n" +
-                      "        [--code <配对码>] [--limit <KB/s>] [--srcport <端口>] [--nocompress] [--noencrypt]\r\n" +
-                      "  TrFileTransfer recv --port <端口> [--out <目录>] [--tcp|--udt] [--code <配对码>] [--count <N>]\r\n" +
+                      "  TrFileTransfer send --ip <IP> --port <端口> [--tcp|--udt|--udp] --file <路径|--folder <路径>\r\n" +
+                      "        [--code <配对码>] [--limit <KB/s>] [--srcport <端口>] [--nocompress] [--noencrypt] [--passes <N>] [--nofec]\r\n" +
+                      "  TrFileTransfer recv --port <端口> [--out <目录>] [--tcp|--udt|--udp] [--code <配对码>] [--count <N>]\r\n" +
                       "  TrFileTransfer sync --folder <目录> --ip <IP> --port <端口> [--tcp|--udt]\r\n" +
                       "        [--code <配对码>] [--limit <KB/s>] [--srcport <端口>] [--nocompress] [--noencrypt]\r\n" +
                       "  TrFileTransfer verify --dir <目录>\r\n" +
                       "\r\n" +
-                      "send: 发送一个文件或文件夹后退出（退出码 0=成功）。\r\n" +
+                      "send: 发送一个文件或文件夹后退出（退出码 0=成功）。--udp 为单向传输：仅单文件，\r\n" +
+                      "      无配对码/加密/压缩；--passes <N> 自动连发 N 轮对抗丢包；默认启用前向纠错\r\n" +
+                      "      （XOR 奇偶 + 交错发送），--nofec 关闭。\r\n" +
                       "recv: 接收直到 Ctrl+C，或收到 --count 个文件后退出。\r\n" +
                       "sync: 增量同步一个文件夹（只传差异），适合任务计划程序定时备份。\r\n" +
                       "verify: 用本地校验缓存核对目录中文件是否与接收时一致（发现改动退出码为 1）。\r\n" +
                       "默认协议 TCP；--nocompress/--noencrypt 关闭压缩/加密协商。"
                     : "Usage:\r\n" +
-                      "  TrFileTransfer send --ip <IP> --port <port> [--tcp|--udt] --file <path|--folder <path>\r\n" +
-                      "        [--code <pairing code>] [--limit <KB/s>] [--srcport <port>] [--nocompress] [--noencrypt]\r\n" +
-                      "  TrFileTransfer recv --port <port> [--out <dir>] [--tcp|--udt] [--code <pairing code>] [--count <N>]\r\n" +
+                      "  TrFileTransfer send --ip <IP> --port <port> [--tcp|--udt|--udp] --file <path|--folder <path>\r\n" +
+                      "        [--code <pairing code>] [--limit <KB/s>] [--srcport <port>] [--nocompress] [--noencrypt] [--passes <N>] [--nofec]\r\n" +
+                      "  TrFileTransfer recv --port <port> [--out <dir>] [--tcp|--udt|--udp] [--code <pairing code>] [--count <N>]\r\n" +
                       "  TrFileTransfer sync --folder <dir> --ip <IP> --port <port> [--tcp|--udt]\r\n" +
                       "        [--code <pairing code>] [--limit <KB/s>] [--srcport <port>] [--nocompress] [--noencrypt]\r\n" +
                       "  TrFileTransfer verify --dir <dir>\r\n" +
                       "\r\n" +
-                      "send: sends one file or folder, then exits (exit code 0 = success).\r\n" +
+                      "send: sends one file or folder, then exits (exit code 0 = success). --udp is\r\n" +
+                      "      one-way: single file only, no code/encryption/compression; --passes <N>\r\n" +
+                      "      re-sends the whole file N times to ride out loss. Forward error\r\n" +
+                      "      correction (XOR parity + interleaving) is on by default; --nofec disables it.\r\n" +
                       "recv: receives until Ctrl+C, or until --count files have arrived.\r\n" +
                       "sync: incremental folder sync (differences only) — for scheduled backups.\r\n" +
                       "verify: checks the directory's files against the local digest cache\r\n" +
@@ -890,6 +938,15 @@ namespace TrFileTransfer
             return IsChinese
                 ? string.Format("接收中（{0} 端口 {1}）→ {2}，Ctrl+C 退出。", proto, port, dir)
                 : string.Format("Receiving ({0} port {1}) → {2}; Ctrl+C to quit.", proto, port, dir);
+        }
+        public static string CliUdpIgnoresCode
+        {
+            get
+            {
+                return IsChinese
+                    ? "提示：单向 UDP 无回传链路，--code 不适用，已忽略。"
+                    : "Note: one-way UDP has no return path -- --code does not apply and is ignored.";
+            }
         }
         public static string CliRecvCountDone(object n)
         {
@@ -1131,8 +1188,8 @@ namespace TrFileTransfer
             get
             {
                 return IsChinese
-                    ? "分号分隔，支持通配符，如 192.168.1.*;10.0.0.5"
-                    : "Semicolon-separated; wildcards allowed, e.g. 192.168.1.*;10.0.0.5";
+                    ? "分号分隔，支持通配符与 CIDR，如 192.168.1.*;10.0.0.5;fd00::/8"
+                    : "Semicolon-separated; wildcards and CIDR allowed, e.g. 192.168.1.*;10.0.0.5;fd00::/8";
             }
         }
         public static string ROPerDevice { get { return IsChinese ? "按设备分目录保存" : "Per-device subfolders"; } }
@@ -1176,6 +1233,31 @@ namespace TrFileTransfer
             return IsChinese
                 ? string.Format("将删除会话目录 \"{0}\"（{1} 个文件，共 {2}）及其校验记录。\n下次同步将完整重传全部内容。确定？", name, files, size)
                 : string.Format("Delete session directory \"{0}\" ({1} files, {2}) and its digests?\nThe next sync will re-transfer everything.", name, files, size);
+        }
+
+        /// <summary>List row for an unfinished one-way UDP receive (.part file).</summary>
+        public static string SyncUdpRow(object name, object size)
+        {
+            return IsChinese
+                ? string.Format("[UDP 未完成] {0} — {1}", name, size)
+                : string.Format("[UDP partial] {0} — {1}", name, size);
+        }
+
+        public static string SyncPartResetConfirm(object name, object size)
+        {
+            return IsChinese
+                ? string.Format("将删除未完成的单向 UDP 接收分片 {0}（{1}）。\n下次该文件重发时将从零开始接收。确定？", name, size)
+                : string.Format("Delete the unfinished one-way UDP part {0} ({1})?\nThe next send of that file starts over from zero.", name, size);
+        }
+
+        public static string SyncPartDeleteFailed
+        {
+            get
+            {
+                return IsChinese
+                    ? "删除失败：文件可能正被接收会话占用，或已被其他程序锁定。"
+                    : "Delete failed: the file may be held by an active receive or locked by another process.";
+            }
         }
 
         // ---- Transfer statistics ----

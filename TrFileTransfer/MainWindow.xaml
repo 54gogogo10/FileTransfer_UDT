@@ -321,10 +321,15 @@
                         </StackPanel>
                         <Rectangle Width="1" Height="30" RadiusX="0.5" RadiusY="0.5"
                                    Fill="{DynamicResource Brush.CardBorder}" VerticalAlignment="Center" Margin="12,0"/>
-                        <StackPanel Orientation="Vertical">
+                        <StackPanel Orientation="Vertical" Margin="0,0,10,0">
                             <TextBlock x:Name="_lblPairingC" Style="{StaticResource FieldLabelSmall}"/>
                             <TextBox x:Name="_txtPairing" Width="106" MaxLength="12" Style="{StaticResource TxtInput}"
                                      Margin="0,4,0,0"/>
+                        </StackPanel>
+                        <StackPanel Orientation="Vertical">
+                            <TextBlock x:Name="_lblUdpPasses" Style="{StaticResource FieldLabelSmall}"/>
+                            <local:NumericBox x:Name="_numUdpPasses" Width="56" Min="1" Max="5" Margin="0,4,0,0"
+                                              ToolTipService.ShowOnDisabled="True"/>
                         </StackPanel>
                     </StackPanel>
 

@@ -117,6 +117,7 @@ namespace TrFileTransfer
         /// has a single code field — per-tab codes would be unusable).</summary>
         private string _activePairingCode;
         private readonly StatsStore _stats = new StatsStore(StatsStore.DefaultPath);
+        private readonly TextHistoryStore _textHistory = new TextHistoryStore(TextHistoryStore.DefaultPath);
         /// <summary>Receive confirmations already granted this session (ip → granted at),
         /// so concurrent-chunk and follow-up sends do not re-prompt.</summary>
         private readonly Dictionary<string, DateTime> _confirmedReceives = new Dictionary<string, DateTime>();
@@ -308,7 +309,9 @@ namespace TrFileTransfer
 
         private static void BlockIpChars(object sender, TextCompositionEventArgs e)
         {
-            e.Handled = e.Text.Any(c => !char.IsDigit(c) && c != '.');
+            // ':' admitted so an IPv6 literal can be typed (2.14 v6 support); final
+            // validity is judged by ValidateIpLive / the send-time hard gate
+            e.Handled = e.Text.Any(c => !char.IsDigit(c) && c != '.' && c != ':');
         }
 
         /// <summary>Flags (or clears) the red invalid state on a field.</summary>
@@ -333,13 +336,15 @@ namespace TrFileTransfer
                 SetFieldError(box, false, null);
                 return;
             }
-            if (t.Any(c => !char.IsDigit(c) && c != '.'))
+            // A colon means the user is typing an IPv6 literal — only final judgement
+            // applies there (IsValidIp / the send-time gate accept v6 literals)
+            if (t.IndexOf(':') < 0 && t.Any(c => !char.IsDigit(c) && c != '.'))
             {
                 SetFieldError(box, true, L.FieldIpInvalid);
                 return;
             }
             // While typing, only judge complete-looking addresses (3+ dots)
-            bool ok = t.Count(c => c == '.') < 3 || IPAddress.TryParse(t, out IPAddress probe);
+            bool ok = t.IndexOf(':') >= 0 || t.Count(c => c == '.') < 3 || IPAddress.TryParse(t, out IPAddress probe);
             SetFieldError(box, !ok, ok ? null : L.FieldIpInvalid);
         }
 
@@ -655,6 +660,8 @@ namespace TrFileTransfer
             _btnSendText.Content = L.SendTextBtn;
             _btnFanOut.Content = L.FanOutBtn;
             _lblPairingC.Text = L.PairingClientLabel;
+            _lblUdpPasses.Text = L.UdpPassesLabel;
+            _numUdpPasses.ToolTip = L.UdpPassesHint;
             _lblHttpPort.Text = L.HttpPortLabel;
             if (_httpShare == null || !_httpShare.IsRunning)
                 _btnHttpShare.Content = L.HttpShareBtn;
@@ -701,13 +708,17 @@ namespace TrFileTransfer
             // Client
             _txtServerIp.Text = Config.Get("ClientIP", "127.0.0.1");
             _txtPortC.Text = Config.Get("ClientPort", "8080");
-            _txtFile.Text = Config.Get("LastPath", "");
+            // Client — checkbox assignment LAST-but-one: setting IsChecked fires the
+            // Checked/Unchecked handlers, which clear the path box; restoring LastPath
+            // before that made the restore dead code (the box was empty every launch)
             _chkFolder.IsChecked = Config.GetBool("FolderMode", false);
             _chkSync.IsChecked = Config.GetBool("SyncMode", false);
             _chkSync.IsEnabled = _chkFolder.IsChecked == true && !Config.GetBool("MonitorMode", false);
             _chkMonitor.IsChecked = Config.GetBool("MonitorMode", false);
+            _txtFile.Text = Config.Get("LastPath", "");
             _numConcurrency.Value = Math.Max(1, Math.Min(8, Config.GetInt("Concurrency", 4)));
             _numSrcPort.Value = Math.Max(0, Math.Min(65535, Config.GetInt("SrcPort", 0)));
+            _numUdpPasses.Value = Math.Max(1, Math.Min(5, Config.GetInt("UdpPasses", 1)));
             _txtPairing.Text = Config.Get("PairingCode", "");
         }
 
@@ -806,6 +817,7 @@ namespace TrFileTransfer
             Config.SetBool("VerifyHash", _chkVerifyHash.IsChecked == true);
             Config.SetInt("Concurrency", _numConcurrency.Value);
             Config.SetInt("SrcPort", _numSrcPort.Value);
+            Config.SetInt("UdpPasses", _numUdpPasses.Value);
             Config.Set("PairingCode", _txtPairing.Text.Trim());
             Config.Save();
         }
@@ -1359,8 +1371,9 @@ namespace TrFileTransfer
             string preview = ServerWire.Preview(text);
             AddLog(L.S_TextReceived(preview));
             Notify(L.NotifyTextTitle, preview);
+            _textHistory.Add(text); // survives restarts — the dialog itself does not
             if (_textRecvDialog == null || !_textRecvDialog.IsLoaded)
-                _textRecvDialog = new TextReceivedDialog(text);
+                _textRecvDialog = new TextReceivedDialog(text, L.TextReceivedTitle, _textHistory.Load());
             else
                 _textRecvDialog.AppendMessage(text);
             _textRecvDialog.Owner = this;
@@ -1622,6 +1635,7 @@ namespace TrFileTransfer
         private bool StartTcpListener(ServerTab tab, IPAddress bind, int port, string saveDir, string pairingCode)
         {
             bool started = false;
+            bool beganKeepAlive = false;
             var server = new TransferServer(bind.ToString(), port, GetArchiveDir(saveDir), 4194304,
                 Utils.IsWildcardAddress(bind) && bind.AddressFamily == AddressFamily.InterNetworkV6
                     ? TcpBindMode.IPv6Only
@@ -1637,16 +1651,24 @@ namespace TrFileTransfer
             server.OnClientTransferComplete += ep => RunOnUi(() => CompleteCard(tab.Cards, ep));
             server.OnTransferComplete += () => RunOnUi(() =>
             {
-                CompleteAllCards(tab.Cards);
+                // No CompleteAllCards here: this event fires per completed transfer on
+                // the SHARED server, so one client's finish wiped every other
+                // client's in-flight card. Per-connection cards are finalized by
+                // OnClientTransferComplete (each connection's own finally).
                 if (AnyServerRunning()) _lblStatusS.Text = L.Listening;
             });
             server.OnStarted += () => RunOnUi(() =>
             {
                 started = true;
+                beganKeepAlive = true;
+                KeepAwake.Begin(); // a serving machine must not sleep through sends
                 OnTabStarted(tab);
             });
             server.OnStopped += () => RunOnUi(() =>
             {
+                // Bind failures fire OnStopped without OnStarted: End-ing an
+                // un begun ref would drain a sibling listener's hold instead
+                if (beganKeepAlive) KeepAwake.End();
                 CompleteAllCards(tab.Cards);
                 tab.RemoveListener(server);
                 OnTabStopped(tab);
@@ -1659,6 +1681,7 @@ namespace TrFileTransfer
         private bool StartUdtListener(ServerTab tab, IPAddress bind, int port, string saveDir, string pairingCode)
         {
             bool started = false;
+            bool beganKeepAlive = false;
             // UDT4 has no dual-mode socket: the wildcard is the family's any-address
             string udtBind = Utils.IsWildcardAddress(bind)
                 ? (bind.AddressFamily == AddressFamily.InterNetworkV6 ? "::" : "0.0.0.0") : bind.ToString();
@@ -1674,16 +1697,24 @@ namespace TrFileTransfer
             server.OnClientTransferComplete += ep => RunOnUi(() => CompleteCard(tab.Cards, ep));
             server.OnTransferComplete += () => RunOnUi(() =>
             {
-                CompleteAllCards(tab.Cards);
+                // No CompleteAllCards here: this event fires per completed transfer on
+                // the SHARED server, so one client's finish wiped every other
+                // client's in-flight card. Per-connection cards are finalized by
+                // OnClientTransferComplete (each connection's own finally).
                 if (AnyServerRunning()) _lblStatusS.Text = L.Listening;
             });
             server.OnStarted += () => RunOnUi(() =>
             {
                 started = true;
+                beganKeepAlive = true;
+                KeepAwake.Begin(); // a serving machine must not sleep through sends
                 OnTabStarted(tab);
             });
             server.OnStopped += () => RunOnUi(() =>
             {
+                // Bind failures fire OnStopped without OnStarted: End-ing an
+                // un begun ref would drain a sibling listener's hold instead
+                if (beganKeepAlive) KeepAwake.End();
                 CompleteAllCards(tab.Cards);
                 tab.RemoveListener(server);
                 OnTabStopped(tab);
@@ -1696,6 +1727,7 @@ namespace TrFileTransfer
         private bool StartUdpListener(ServerTab tab, IPAddress bind, int port, string saveDir)
         {
             bool started = false;
+            bool beganKeepAlive = false;
             // One-way receiver: family-scoped wildcard like the UDT tab. No pairing
             // code, no receive confirmation, no receive rate limit — none of them can
             // cross a link with no return path. The IP filter still gates every datagram.
@@ -1713,10 +1745,15 @@ namespace TrFileTransfer
             server.OnStarted += () => RunOnUi(() =>
             {
                 started = true;
+                beganKeepAlive = true;
+                KeepAwake.Begin(); // a serving machine must not sleep through sends
                 OnTabStarted(tab);
             });
             server.OnStopped += () => RunOnUi(() =>
             {
+                // Bind failures fire OnStopped without OnStarted: End-ing an
+                // un begun ref would drain a sibling listener's hold instead
+                if (beganKeepAlive) KeepAwake.End();
                 CompleteAllCards(tab.Cards);
                 tab.RemoveListener(server);
                 OnTabStopped(tab);
@@ -2117,6 +2154,11 @@ namespace TrFileTransfer
             bool isTcp, int srcPort, int concurrency, bool verifyHash, int speedLimit, Guid? resumeSession,
             Guid? chunkSession = null, bool isRawUdp = false)
         {
+            // No system sleep mid-transfer. First thing in the try: every validation
+            // below returns through the same finally, so Begin/End always pair — an
+            // unpaired End would release a SERVER's ref (they hold one each) and let
+            // the machine sleep mid-serving.
+            KeepAwake.Begin();
             try
             {
                 if (isFolder)
@@ -2156,12 +2198,16 @@ namespace TrFileTransfer
                     int chunkSize = Math.Max(1, Math.Min(UdpOneWay.MaxChunkSize,
                         Config.GetInt("UdpChunkSize", UdpOneWay.DefaultChunkSize)));
                     var udpClient = new TransferUdpClient(ip, port, path, chunkSize, srcPort, speedLimit);
+                    udpClient.Passes = _numUdpPasses.Value; // loss recovery for a link with no feedback
+                    udpClient.FecEnabled = Config.GetBool("UdpFec", true); // XOR parity + interleaving
                     _clientUdp = udpClient;
                     bool udpOk = await WireUdpClientAndSendAsync(udpClient).ConfigureAwait(true);
                     _clientUdp = null;
                     if (udpOk && !_pauseRequested)
                     {
-                        RecordSent(ip, MeasurePathBytes(path, false), 1,
+                        // Off the UI thread: a folder-size walk is a full tree scan
+                        long sentBytes = await Task.Run(() => MeasurePathBytes(path, false)).ConfigureAwait(true);
+                        RecordSent(ip, sentBytes, 1,
                             udpWatch.Elapsed.TotalSeconds, PathDisplayName(path), path);
                     }
                     return udpOk;
@@ -2312,7 +2358,8 @@ namespace TrFileTransfer
                     FinalizePause();
                     return false;
                 }
-                RecordSent(ip, MeasurePathBytes(path, isFolder), isFolder ? 0 : 1,
+                long sentTotal = await Task.Run(() => MeasurePathBytes(path, isFolder)).ConfigureAwait(true);
+                RecordSent(ip, sentTotal, isFolder ? 0 : 1,
                     sendWatch.Elapsed.TotalSeconds, PathDisplayName(path), path);
                 RememberDevice(ip, port, !isTcp);
                 return true;
@@ -2330,6 +2377,7 @@ namespace TrFileTransfer
             }
             finally
             {
+                KeepAwake.End();
                 try { RunOnUi(ResetClientUI); } catch { }
             }
         }
@@ -2640,6 +2688,7 @@ namespace TrFileTransfer
             _chkMonitor.IsEnabled = false;
             _numConcurrency.IsEnabled = false;
             _numSrcPort.IsEnabled = false;
+            _numUdpPasses.IsEnabled = false;
             _btnResumeList.IsEnabled = false;
             _chkVerifyHash.IsEnabled = false;
             _numSpeed.IsEnabled = false;
@@ -2672,6 +2721,7 @@ namespace TrFileTransfer
             _chkMonitor.IsEnabled = true;
             _numConcurrency.IsEnabled = true;
             _numSrcPort.IsEnabled = true;
+            _numUdpPasses.IsEnabled = true;
             _btnResumeList.IsEnabled = true;
             _chkVerifyHash.IsEnabled = true;
             _numSpeed.IsEnabled = true;
@@ -2728,12 +2778,18 @@ namespace TrFileTransfer
 
             lock (_fanOutClients) _fanOutClients.Clear();
             _fanOutRunning = true;
+            KeepAwake.Begin(); // released in FinalizeFanOut (every client's OnStopped lands there)
             int total = targets.Count;
             int finished = 0;
             int okCount = 0;
+            // One size walk for the whole fan-out, not one per target (each walk is a
+            // full directory-tree scan)
+            long fanOutBytes = MeasurePathBytes(path, isFolder);
 
-            foreach (var t in targets)
+            try
             {
+                foreach (var t in targets)
+                {
                 var card = RunOnUiSync(() => CreateTransferCard(_progressPanelC));
 
                 if (isTcp)
@@ -2750,7 +2806,7 @@ namespace TrFileTransfer
                     {
                         UpdateCardComplete(card);
                         Interlocked.Increment(ref okCount);
-                        RecordSent(t.Ip, MeasurePathBytes(path, isFolder), isFolder ? 0 : 1, 0,
+                        RecordSent(t.Ip, fanOutBytes, isFolder ? 0 : 1, 0,
                             PathDisplayName(path), path);
                         RememberDevice(t.Ip, t.Port, false);
                     });
@@ -2777,7 +2833,7 @@ namespace TrFileTransfer
                     {
                         UpdateCardComplete(card);
                         Interlocked.Increment(ref okCount);
-                        RecordSent(t.Ip, MeasurePathBytes(path, isFolder), isFolder ? 0 : 1, 0,
+                        RecordSent(t.Ip, fanOutBytes, isFolder ? 0 : 1, 0,
                             PathDisplayName(path), path);
                         RememberDevice(t.Ip, t.Port, true);
                     });
@@ -2790,12 +2846,24 @@ namespace TrFileTransfer
                     lock (_fanOutClients) _fanOutClients.Add(client);
                     var _ = isFolder ? client.SendFolderAsync(path) : client.SendAsync();
                 }
+                }
+            }
+            catch (Exception ex)
+            {
+                // Setup blew up mid-loop: no client may ever reach OnStopped, so
+                // FinalizeFanOut would never run — release the keepalive and the
+                // panel here or the machine never sleeps again
+                KeepAwake.End();
+                _fanOutRunning = false;
+                AddLog(L.ErrorPrefix + ex.Message);
+                try { ResetClientUI(); } catch { }
             }
         }
 
         private void FinalizeFanOut(int okCount, int total)
         {
             _fanOutRunning = false;
+            KeepAwake.End();
             lock (_fanOutClients) _fanOutClients.Clear();
             AddLog(L.FanOutDone(okCount, total));
             if (!_trayExit) Notify(L.NotifySendDone, L.FanOutDone(okCount, total));
@@ -2842,7 +2910,10 @@ namespace TrFileTransfer
             Border card;
             if (!cards.TryGetValue(ep, out card))
             {
-                card = CreateTransferCard(_progressPanelS);
+                // Server cards carry the peer's name: with several senders at once,
+                // a bare endpoint says nothing about whose transfer this is
+                card = CreateTransferCard(_progressPanelS,
+                    DeviceDisplay.NameFor(_knownDevices, ep.Address.ToString()));
                 cards[ep] = card;
             }
             return card;
@@ -2866,11 +2937,28 @@ namespace TrFileTransfer
             cards.Clear();
         }
 
-        private Border CreateTransferCard(StackPanel parent)
+        private Border CreateTransferCard(StackPanel parent, string header = null)
         {
-            // Two rows: progress bar on top, status text below — stacking them in
-            // one cell made the text overlap the bar
+            // Progress bar on top, status text below — stacking them in one cell
+            // made the text overlap the bar. An optional header line (server cards:
+            // the peer's device name) sits above the bar.
             var grid = new Grid();
+            int nextRow = 0;
+            if (!string.IsNullOrEmpty(header))
+            {
+                var head = new TextBlock
+                {
+                    FontSize = 11.5,
+                    FontWeight = FontWeights.SemiBold,
+                    Foreground = (Brush)FindResource("Brush.TextPrimary"),
+                    TextTrimming = TextTrimming.CharacterEllipsis,
+                    Margin = new Thickness(0, 0, 0, 4),
+                    Text = header
+                };
+                grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                Grid.SetRow(head, nextRow++);
+                grid.Children.Add(head);
+            }
             grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             var bar = new ProgressBar
@@ -2881,7 +2969,7 @@ namespace TrFileTransfer
                 Value = 0,
                 Margin = new Thickness(0, 0, 0, 5)
             };
-            Grid.SetRow(bar, 0);
+            Grid.SetRow(bar, nextRow++);
             grid.Children.Add(bar);
             var lbl = new TextBlock
             {
@@ -2890,7 +2978,7 @@ namespace TrFileTransfer
                 TextTrimming = TextTrimming.CharacterEllipsis,
                 Text = ""
             };
-            Grid.SetRow(lbl, 1);
+            Grid.SetRow(lbl, nextRow);
             grid.Children.Add(lbl);
             var border = new Border
             {
@@ -3036,6 +3124,23 @@ namespace TrFileTransfer
 
         private void StartMonitoring(string folderPath, string ip, int port)
         {
+            // Fallible setup FIRST: a failure here (ACL denial on the sent-folder)
+            // must not leave the panel disabled and _monitorCts set — that blocked
+            // queue/scan/fan-out until the user found the Cancel button, and the
+            // exception surfaced as the global crash dialog.
+            string sentDir;
+            try
+            {
+                sentDir = Path.Combine(folderPath, "已发送文件");
+                Directory.CreateDirectory(sentDir);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, L.MonitorDirNotExist + Environment.NewLine + ex.Message,
+                    L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+
             ClearPauseState(); // monitor mode replaces any paused send
             _monitorCts = new CancellationTokenSource();
             _monitorSrcPort = _numSrcPort.Value;
@@ -3048,14 +3153,15 @@ namespace TrFileTransfer
             _lblStatusC.Text = L.MonitorWaiting;
             AddLog(L.MonitorStarted(folderPath));
 
-            string sentDir = Path.Combine(folderPath, "已发送文件");
-            Directory.CreateDirectory(sentDir);
-
+            // After the last fallible line: if Begin ran before CreateDirectory and
+            // that threw, StopMonitoring would never run to release the ref
+            KeepAwake.Begin(); // a sleeping machine misses watcher events
             Task.Run(() => MonitorLoop(folderPath, ip, port, sentDir, _monitorCts.Token));
         }
 
         private void StopMonitoring()
         {
+            KeepAwake.End();
             // Clear the CTS: several UI guards test `_monitorCts != null` to mean
             // "monitoring is active", so leaving it set here would permanently disable
             // the queue/scan/fan-out buttons for the rest of the process lifetime.
@@ -3177,7 +3283,10 @@ namespace TrFileTransfer
                 RunOnUi(() =>
                 {
                     AddLog(L.MonitorFileSent(fileName));
-                    _lblStatusC.Text = L.MonitorWaiting;
+                    // Monitoring may have been stopped while this send was in flight
+                    // (the client is not cancellable mid-file) — do not resurrect the
+                    // "waiting" status over the stopped one
+                    if (_monitorCts != null) _lblStatusC.Text = L.MonitorWaiting;
                     RememberDevice(ip, port, !_monitorIsTcp);
                 });
             }
@@ -3288,6 +3397,10 @@ namespace TrFileTransfer
                 _client.Cancel();
             if (_clientUdt != null)
                 _clientUdt.Cancel();
+            if (_clientUdp != null)
+                _clientUdp.Cancel();
+            if (_concurrent != null)
+                _concurrent.Cancel();
             // Remove the tray icon before teardown, otherwise it lingers until hover
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();

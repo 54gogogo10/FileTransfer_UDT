@@ -162,11 +162,13 @@ namespace TrFileTransfer
             _isRunning = true;
             _wasCancelled = false;
 
-            var startedHandler = OnStarted;
-            if (startedHandler != null) startedHandler();
-
             try
             {
+                // Inside the try: a throwing handler must not leave IsRunning stuck
+                // with OnStopped never firing.
+                var startedHandler = OnStarted;
+                if (startedHandler != null) startedHandler();
+
                 await transferAction(_cts.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
@@ -177,11 +179,20 @@ namespace TrFileTransfer
             catch (ObjectDisposedException)
             {
                 // Cancel() during the connect phase disposes the socket, which
-                // surfaces as ODE rather than OCE — still a deliberate cancel
+                // surfaces as ODE rather than OCE — still a deliberate cancel. Any
+                // other ODE is a real lifecycle failure: swallowing it made the
+                // transfer read as success to the caller.
                 if (_cts != null && _cts.IsCancellationRequested)
                 {
                     _wasCancelled = true;
                     Log(L.C_TransferCancelled);
+                }
+                else
+                {
+                    Log(L.C_Error("object disposed"));
+                    var handler = OnError;
+                    if (handler != null) handler("object disposed");
+                    throw;
                 }
             }
             catch (Exception ex)
@@ -386,15 +397,19 @@ namespace TrFileTransfer
             _cts = new CancellationTokenSource();
             _isRunning = true;
             _wasCancelled = false;
-            var startedHandler = OnStarted;
-            if (startedHandler != null) startedHandler();
             try
             {
+                // Inside the try: same wedged-IsRunning reasoning as RunTransfer.
+                var startedHandler = OnStarted;
+                if (startedHandler != null) startedHandler();
+
                 var auth = await OpenAndAuthenticateResultAsync(_cts.Token, 0x02).ConfigureAwait(false);
-                if (!auth.ChunkSessions)
-                    return null;
+                // The stream is live on EVERY return path — the old-peer early return
+                // used to leak the connection until GC finalized it.
                 using (var ws = auth.Stream)
                 {
+                    if (!auth.ChunkSessions)
+                        return null;
                     return await ClientWire.QueryChunkCoverage(ws, chunkSession, _cts.Token).ConfigureAwait(false);
                 }
             }

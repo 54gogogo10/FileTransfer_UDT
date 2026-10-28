@@ -119,6 +119,9 @@ namespace TrFileTransfer
                 }
             }, token).ContinueWith(delegate(Task<VerifyReport> t)
             {
+                // Marshaled explicitly: ContinueWith without a scheduler runs on the
+                // thread pool, where the first UI touch threw and the whole results
+                // rendering silently died (the scan finished, the dialog showed nothing).
                 _running = false;
                 _btnStart.Content = L.LibVerifyStart;
                 _bar.Value = 1;
@@ -138,7 +141,7 @@ namespace TrFileTransfer
                 _status.Text = report.Changed.Count == 0 && report.Unverified.Count == 0 && report.Skipped.Count == 0
                     ? L.LibVerifyAllOk + " (" + report.Verified.Count + ")"
                     : L.CliVerifySummary(report.Verified.Count, report.Changed.Count, report.Unverified.Count, report.Skipped.Count);
-            });
+            }, TaskScheduler.FromCurrentSynchronizationContext());
         }
     }
 }

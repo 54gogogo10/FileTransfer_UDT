@@ -20,6 +20,8 @@ namespace TrFileTransfer
             public string DisplayName;
             public long Bytes;
             public int Files;
+            /// <summary>One-way UDP unfinished receive (.part file), not a 0x04 dir.</summary>
+            public bool IsUdpPart;
         }
 
         private readonly string _saveDir;
@@ -98,6 +100,22 @@ namespace TrFileTransfer
                 string label = name + "  —  " + files + " " + L.SyncFilesWord + ", " + Utils.FormatSize(bytes);
                 _list.Items.Add(new ListBoxItem { Content = label, Tag = row });
             }
+
+            // Unfinished one-way UDP receives live beside the sessions as .part files;
+            // deleting an ACTIVE receive fails on its open handle — exactly right.
+            foreach (var part in UdpPartStore.ListParts(_saveDir))
+            {
+                string name = Path.GetFileName(part.Path);
+                var row = new SessionRow
+                {
+                    Dir = part.Path,
+                    DisplayName = name,
+                    Bytes = part.Bytes,
+                    Files = 1,
+                    IsUdpPart = true
+                };
+                _list.Items.Add(new ListBoxItem { Content = L.SyncUdpRow(name, Utils.FormatSize(part.Bytes)), Tag = row });
+            }
         }
 
         private void ResetSelected()
@@ -105,6 +123,20 @@ namespace TrFileTransfer
             var item = _list.SelectedItem as ListBoxItem;
             var row = item == null ? null : item.Tag as SessionRow;
             if (row == null) return;
+
+            if (row.IsUdpPart)
+            {
+                // One-way UDP leftovers: a single sparse file, no digest cache ties
+                string partDetail = L.SyncPartResetConfirm(row.DisplayName, Utils.FormatSize(row.Bytes));
+                if (MessageBox.Show(this, partDetail, L.SyncReset,
+                        MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+                    return;
+                if (!UdpPartStore.DeletePart(row.Dir))
+                    MessageBox.Show(this, L.SyncPartDeleteFailed, L.DlgError,
+                        MessageBoxButton.OK, MessageBoxImage.Warning);
+                Reload();
+                return;
+            }
 
             string detail = L.SyncResetConfirm(row.DisplayName, row.Files, Utils.FormatSize(row.Bytes));
             var confirm = new Window

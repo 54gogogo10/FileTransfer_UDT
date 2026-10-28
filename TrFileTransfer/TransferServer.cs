@@ -20,6 +20,12 @@ namespace TrFileTransfer
         private readonly TcpBindMode _bindMode;
         private volatile bool _isRunning;
         private readonly ServerWireContext _wire = new ServerWireContext();
+        /// <summary>Accepted connections still being served. Stop() closes them so a
+        /// handler blocked in a read on a silent peer (no FIN/RST — a pulled cable, an
+        /// asleep laptop) unblocks immediately, the same teardown the UDT server does;
+        /// TCP reads have no timeout to interrupt them otherwise.</summary>
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<TcpClient, byte> _clients
+            = new System.Collections.Concurrent.ConcurrentDictionary<TcpClient, byte>();
 
         /// <summary>Fired for every log message.</summary>
         public event Action<string> OnLog;
@@ -241,6 +247,13 @@ namespace TrFileTransfer
                 if (listener != null) listener.Stop();
             }
             catch { }
+            // Close every accepted client so in-flight handlers unblock now instead
+            // of hanging on a silent peer until the OS gives up
+            foreach (var kv in _clients)
+            {
+                try { kv.Key.Close(); } catch { }
+            }
+            _clients.Clear();
 
             // Persist incomplete resume sessions and dispose chunk trackers
             _wire.Shutdown();
@@ -305,11 +318,7 @@ namespace TrFileTransfer
             var connectedHandler = OnClientConnected;
             if (connectedHandler != null) connectedHandler(clientEp);
 
-            Action<TransferProgress> clientProgress = p =>
-            {
-                var ch = OnClientProgress; if (ch != null) ch(clientEp, p);
-            };
-            OnProgress += clientProgress;
+            _clients.TryAdd(client, 0);
 
             string clientIp = clientEp != null ? clientEp.Address.ToString() : null;
 
@@ -320,7 +329,19 @@ namespace TrFileTransfer
                     WireOutcome outcome;
                     using (var ws = new TcpWireStream(client.GetStream(), L.S_ConnClosedUnexpectedly))
                     {
-                        outcome = await ServerWire.HandleClientAsync(ws, _wire, ct, clientIp).ConfigureAwait(false);
+                        // Progress/completion callbacks are scoped to THIS connection via
+                        // the session hook: the parent's shared delegate fans every
+                        // connection's progress out to every subscribed handler, which
+                        // cross-filled concurrent clients' progress cards. OnProgress
+                        // still fires for anyone subscribed to the transport-level event.
+                        outcome = await ServerWire.HandleClientAsync(ws, _wire, ct, clientIp, delegate(ServerWireContext session)
+                        {
+                            session.Cb.Progress = delegate(TransferProgress p)
+                            {
+                                var ph = OnClientProgress; if (ph != null) ph(clientEp, p);
+                                var h = OnProgress; if (h != null) h(p);
+                            };
+                        }).ConfigureAwait(false);
                     }
 
                     RaiseSessionStats(outcome);
@@ -348,7 +369,8 @@ namespace TrFileTransfer
                 }
                 finally
                 {
-                    OnProgress -= clientProgress;
+                    byte removedFlag;
+                    _clients.TryRemove(client, out removedFlag);
                     // Fire on every connection end, not just clean finishes: a
                     // connection that died mid-transfer (pause/cancel/network drop)
                     // must still finalize the client's progress card, or the card

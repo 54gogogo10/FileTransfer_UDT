@@ -464,9 +464,13 @@ namespace TrFileTransfer
         }
 
         /// <summary>Reads the transfer type and dispatches. Throws on connection errors.
-        /// clientIp enables the policy gates (IP filter, per-device folders, session stats).</summary>
+        /// clientIp enables the policy gates (IP filter, per-device folders, session stats).
+        /// onSessionCreated (optional) runs once right after the per-connection context
+        /// clone is built, so a transport can scope callbacks (progress/completion) to
+        /// THIS connection — the parent context's delegates are process-shared and
+        /// fanning them out per connection cross-talks concurrent clients.</summary>
         public static async Task<WireOutcome> HandleClientAsync(IWireStream s, ServerWireContext ctx, CancellationToken ct,
-            string clientIp = null)
+            string clientIp = null, Action<ServerWireContext> onSessionCreated = null)
         {
             var outcome = new WireOutcome();
 
@@ -479,6 +483,7 @@ namespace TrFileTransfer
             }
 
             ctx = BeginSession(ctx, clientIp);
+            if (onSessionCreated != null) onSessionCreated(ctx);
             outcome.Session = ctx.Session;
 
             var typeBuf = new byte[1];
@@ -3565,7 +3570,12 @@ namespace TrFileTransfer
                         return false; // stale: re-read it and the entry refreshes itself
                     // Promote: a file that keeps being asked about stays in the live
                     // generation, so the periodic rotation drops the coldest entries.
-                    _current[path] = e;
+                    // Under the rotation lock with Insert — a promotion is also an
+                    // insert into _current and must not silently overshoot the cap.
+                    lock (_rotateLock)
+                    {
+                        _current[path] = e;
+                    }
                     hash = e.Hash;
                     return true;
                 }
@@ -3627,23 +3637,25 @@ namespace TrFileTransfer
 
         private void Insert(string path, long size, long mtime, byte[] hash)
         {
-            if (_current.Count >= Math.Max(1, MaxEntriesPerGeneration))
+            // The whole insert rides the rotation lock: a check-then-act split let N
+            // concurrent inserters squeeze past one rotation check and overshoot the
+            // generation cap together (8-thread storm measured Count=17 against the
+            // 2×8 bound). Store is per-file, not per-byte — the lock costs nothing
+            // next to the hash that produced the entry.
+            lock (_rotateLock)
             {
-                lock (_rotateLock)
+                if (_current.Count >= Math.Max(1, MaxEntriesPerGeneration))
                 {
-                    if (_current.Count >= Math.Max(1, MaxEntriesPerGeneration))
-                    {
-                        // Retire a whole generation instead of evicting entry by entry:
-                        // entries still in use are promoted back by TryGet, so what
-                        // disappears is whatever went two generations untouched.
-                        _previous = _current;
-                        _current = NewMap();
-                    }
+                    // Retire a whole generation instead of evicting entry by entry:
+                    // entries still in use are promoted back by TryGet, so what
+                    // disappears is whatever went two generations untouched.
+                    _previous = _current;
+                    _current = NewMap();
                 }
+                var entry = new Entry { Size = size, MTimeTicks = mtime, StoredTicks = DateTime.UtcNow.Ticks, Hash = hash };
+                _current[path] = entry;
+                Persist(path, entry);
             }
-            var entry = new Entry { Size = size, MTimeTicks = mtime, StoredTicks = DateTime.UtcNow.Ticks, Hash = hash };
-            _current[path] = entry;
-            Persist(path, entry);
         }
 
         // ==================== journal ====================

@@ -30,14 +30,28 @@ namespace TrFileTransfer
         public const byte FrameStart = 0x01;
         public const byte FrameData = 0x02;
         public const byte FrameEnd = 0x03;
+        /// <summary>Forward-error-correction parity frame (XOR of one group's chunk
+        /// payloads, padded to ChunkSize). Old receivers hit the unknown-type
+        /// fall-through and ignore it, so enabling FEC needs no negotiation.</summary>
+        public const byte FrameParity = 0x04;
 
         public const int HeaderSize = 20;   // magic(2) + ver(1) + type(1) + sessionId(16)
         public const int MinStartBody = 54; // size(8)+chunk(4)+total(8)+nameLen(2)+hash(32)
+        public const int MinParityBody = 5; // groupStart(4) + groupCount(1)
         public const byte Version = 1;
         public const int MaxChunkSize = 60000;   // datagram payload cap (IP-local, avoids fragmentation bombs)
         public const int DefaultChunkSize = 1200; // fits a typical 1500-byte MTU without fragmentation
         public const long MaxChunks = 16 * 1024 * 1024; // 16M chunks @ 1200B ≈ 19 GiB cover
         public const int MaxNameLen = 255;
+        /// <summary>Chunks per FEC group. With interleaved sending, same-group members
+        /// ride ≥GroupSize wire positions apart, so a burst of up to GroupSize-1
+        /// consecutive losses hits at most one member per group — recoverable from the
+        /// single XOR parity frame without any retransmission.</summary>
+        public const int FecGroupSize = 8;
+        /// <summary>Chunks per interleaving super-block (GroupSize × GroupSize). FEC
+        /// accumulators only need to cover one super-block, so parity memory stays at
+        /// GroupSize × ChunkSize regardless of file size.</summary>
+        public const int FecSuperBlock = FecGroupSize * FecGroupSize;
         /// <summary>Concurrent in-flight sessions cap. Every session holds a file
         /// handle plus a coverage bit set (worst case ~2 MB at MaxChunks), so an
         /// unbounded table is a memory/handle-exhaustion DoS for a datagram blaster.
@@ -69,6 +83,105 @@ namespace TrFileTransfer
             Buffer.BlockCopy(g, 0, b, 4, 16);
             return b;
         }
+
+        /// <summary>Interleaved send order for FEC: chunk indices in super-blocks of
+        /// GroupSize×GroupSize, read column-major within each block. Same-group members
+        /// end up exactly R wire positions apart, where R is the group count of that
+        /// super-block — R = GroupSize for every full block. The final partial block
+        /// is RE-PARTITIONED into more, smaller groups (size ⌈remainder/GroupSize⌉), so
+        /// its spacing rises to the group count instead of collapsing (the tail cannot
+        /// interleave against already-sent content; residual tail bursts wider than R
+        /// there are covered by re-send passes). Pure — the sender iterates it
+        /// directly, the receiver needs no mirror (parity frames are self-describing).
+        /// </summary>
+        public static System.Collections.Generic.IEnumerable<long> InterleavedChunkOrder(long totalChunks, int groupSize)
+        {
+            long super = (long)groupSize * groupSize;
+            for (long sbStart = 0; sbStart < totalChunks; sbStart += super)
+            {
+                long sbLen = Math.Min(super, totalChunks - sbStart);
+                int size = sbLen == super ? groupSize : (int)Math.Max(1, (sbLen + groupSize - 1) / groupSize);
+                int groups = (int)((sbLen + size - 1) / size);
+                for (int col = 0; col < size; col++)
+                {
+                    for (int g = 0; g < groups; g++)
+                    {
+                        if (g * (long)size + col < sbLen)
+                            yield return sbStart + g * (long)size + col;
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>Management of the receiver's on-disk .part files — the "disk is the
+    /// state" of one-way UDP. Listing and cleanup are pure file operations shared by
+    /// the UI; deleting the part of a LIVE session fails on the open handle (the
+    /// receiver holds it write-exclusive), which is exactly the desired refusal.</summary>
+    public static class UdpPartStore
+    {
+        public sealed class PartInfo
+        {
+            public string Path;
+            public long Bytes;
+            public DateTime LastWriteUtc;
+        }
+
+        public static string PartDir(string saveDir)
+        {
+            return Path.Combine(saveDir ?? "", ".udp");
+        }
+
+        /// <summary>All .part files under the save dir, path-sorted; empty when none.</summary>
+        public static List<PartInfo> ListParts(string saveDir)
+        {
+            var list = new List<PartInfo>();
+            if (string.IsNullOrEmpty(saveDir)) return list;
+            string dir = PartDir(saveDir);
+            if (!Directory.Exists(dir)) return list;
+            try
+            {
+                foreach (string p in Directory.GetFiles(dir, "*.part"))
+                {
+                    try
+                    {
+                        var fi = new FileInfo(p);
+                        list.Add(new PartInfo { Path = p, Bytes = fi.Length, LastWriteUtc = fi.LastWriteTimeUtc });
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            list.Sort(delegate(PartInfo a, PartInfo b)
+            {
+                return string.Compare(a.Path, b.Path, StringComparison.OrdinalIgnoreCase);
+            });
+            return list;
+        }
+
+        /// <summary>Deletes one part; false when missing or locked (live session).</summary>
+        public static bool DeletePart(string partPath)
+        {
+            try
+            {
+                if (!File.Exists(partPath)) return false;
+                File.Delete(partPath);
+                return !File.Exists(partPath);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>Deletes every listed part; returns how many actually went away.</summary>
+        public static int DeleteAll(string saveDir)
+        {
+            int n = 0;
+            foreach (PartInfo p in ListParts(saveDir))
+                if (DeletePart(p.Path)) n++;
+            return n;
+        }
     }
 
     /// <summary>Receiver for one-way UDP sends. Binds one family (v4-any, v6-any or a
@@ -86,6 +199,13 @@ namespace TrFileTransfer
         private volatile bool _isRunning;
         private readonly Dictionary<Guid, UdpRecvSession> _sessions = new Dictionary<Guid, UdpRecvSession>();
         private readonly object _sessionLock = new object();
+        /// <summary>Sessions delivered recently — a multi-pass sender re-STARTs the
+        /// same id every pass; suppressing re-delivery within the window keeps extra
+        /// passes from turning into _1 duplicate files. After the window (or a
+        /// restart) a repeat send delivers again, exactly as before.</summary>
+        private readonly Dictionary<Guid, DateTime> _delivered = new Dictionary<Guid, DateTime>();
+        private static readonly TimeSpan DeliveredWindow = TimeSpan.FromMinutes(10);
+        private const int MaxDeliveredMemory = 256;
         /// <summary>Finalizations run on the pool but one at a time: GetUniqueSavePath
         /// + Move must not interleave across sessions (two racing finalizes would pick
         /// the same final path and one would lose its part file).</summary>
@@ -261,6 +381,7 @@ namespace TrFileTransfer
             Guid session = new Guid(Utils.CopyBytes(buf, 4, 16));
             if (type == UdpOneWay.FrameStart) HandleStart(buf, session, from, peerIp);
             else if (type == UdpOneWay.FrameData) HandleData(buf, session, from);
+            else if (type == UdpOneWay.FrameParity) HandleParity(buf, session, from);
             else if (type == UdpOneWay.FrameEnd) TouchSession(session);
         }
 
@@ -292,6 +413,18 @@ namespace TrFileTransfer
 
             string fileName = Path.GetFileName(Utils.SanitizeRelativePath(rawName.Replace('\\', '_')));
             if (fileName.Length == 0) fileName = "udp_file";
+
+            lock (_sessionLock)
+            {
+                DateTime deliveredAt;
+                if (_delivered.TryGetValue(session, out deliveredAt)
+                    && DateTime.UtcNow - deliveredAt < DeliveredWindow)
+                {
+                    // Extra pass of a multi-pass send whose earlier pass already landed
+                    Log(L.UdpS_AlreadyDelivered(fileName));
+                    return;
+                }
+            }
 
             UdpRecvSession emptyToFinalize = null;
             lock (_sessionLock)
@@ -360,6 +493,17 @@ namespace TrFileTransfer
             int payloadStart = UdpOneWay.HeaderSize + 4;
             int payloadLen = buf.Length - payloadStart;
             long coveredBytes = s.WriteChunk(chunkIndex, payloadLen, buf, payloadStart);
+            // FEC reverse direction: this chunk may be the second-to-last missing
+            // member of a group whose parity is already cached — one attempt now
+            // finishes the group without waiting for anything else. The cached frame
+            // is self-describing (groupStart + count), so containment — not any
+            // shared partition math — finds it (the tail super-block re-partitions).
+            if (coveredBytes >= 0)
+            {
+                long hit;
+                if (s.FindCachedGroupContaining(chunkIndex, out hit))
+                    TryRecoverAndFinalize(s, hit, from, session);
+            }
             // Progress feed is throttled to the sender's 100ms cadence: a datagram
             // is only ~1.2 KB, so per-chunk events would flood the UI dispatcher
             // (a 1 GiB send ≈ 900K dispatches). Only the receive loop touches
@@ -387,6 +531,52 @@ namespace TrFileTransfer
                 lock (_sessionLock)
                 {
                     // Remove-first: exactly one finalize, and it runs without the lock
+                    if (_sessions.Remove(session)) finalize = true;
+                }
+                if (finalize)
+                    Task.Run(delegate { lock (_finalizeGate) FinalizeSession(s, from); });
+            }
+        }
+
+        /// <summary>FEC parity frame: XOR of one group's chunk payloads. Cached (small,
+        /// bounded) and immediately attempted — if exactly one member of the group is
+        /// missing, the parity reconstructs it; otherwise the cache lets a LATER data
+        /// chunk trigger the recovery once the group narrows to one hole.</summary>
+        private void HandleParity(byte[] buf, Guid session, IPEndPoint from)
+        {
+            if (buf.Length < UdpOneWay.HeaderSize + UdpOneWay.MinParityBody) return;
+            UdpRecvSession s;
+            lock (_sessionLock)
+            {
+                if (!_sessions.TryGetValue(session, out s)) return; // unknown/finished
+                s.Touch();
+            }
+            int p = UdpOneWay.HeaderSize;
+            int groupStart = BitConverter.ToInt32(buf, p); p += 4;
+            int groupCount = buf[p]; p += 1;
+            int payloadLen = buf.Length - p;
+            if (groupStart < 0 || groupStart >= s.TotalChunks
+                || groupCount < 1 || groupCount > UdpOneWay.FecGroupSize
+                || groupStart + groupCount > s.TotalChunks
+                || payloadLen != s.ChunkSize)
+                return; // corrupt/hostile parity — ignored, coverage unaffected
+
+            s.StoreParity(groupStart, groupCount, buf, p, payloadLen);
+            TryRecoverAndFinalize(s, groupStart, from, session);
+        }
+
+        /// <summary>Runs one recovery attempt for a group and, if the session thereby
+        /// completed, performs the remove-first finalize dance (hash + rename off the
+        /// receive loop, same as the DATA path).</summary>
+        private void TryRecoverAndFinalize(UdpRecvSession s, long groupStart, IPEndPoint from, Guid session)
+        {
+            if (s.TryRecoverGroup(groupStart))
+                Log(L.UdpS_ParityRecovered(s.FileName, groupStart.ToString()));
+            if (s.IsComplete)
+            {
+                bool finalize = false;
+                lock (_sessionLock)
+                {
                     if (_sessions.Remove(session)) finalize = true;
                 }
                 if (finalize)
@@ -486,6 +676,11 @@ namespace TrFileTransfer
             }
 
             Log(L.UdpS_Delivered(s.FileName, Utils.FormatSize(s.TotalSize)));
+            lock (_sessionLock)
+            {
+                _delivered[s.Id] = DateTime.UtcNow;
+                if (_delivered.Count > MaxDeliveredMemory) PruneDeliveredUnlocked();
+            }
             try
             {
                 // Register the digest so dedup / scrub / 0x04 skip recognize UDP-received files
@@ -534,6 +729,26 @@ namespace TrFileTransfer
             {
                 return false;
             }
+        }
+
+        /// <summary>Drops delivered-memory entries past the window; if a burst still
+        /// overflows the cap the whole map resets — the worst case is one duplicate
+        /// file, never unbounded memory.</summary>
+        private void PruneDeliveredUnlocked()
+        {
+            DateTime now = DateTime.UtcNow;
+            List<Guid> stale = null;
+            foreach (var kv in _delivered)
+            {
+                if (now - kv.Value >= DeliveredWindow)
+                {
+                    if (stale == null) stale = new List<Guid>();
+                    stale.Add(kv.Key);
+                }
+            }
+            if (stale != null)
+                foreach (Guid g in stale) _delivered.Remove(g);
+            if (_delivered.Count > MaxDeliveredMemory) _delivered.Clear();
         }
 
         /// <summary>Closes sessions idle past the window; .part files stay on disk so a
@@ -611,6 +826,12 @@ namespace TrFileTransfer
             private readonly byte[] _coveredBits;
             private long _coveredBytes;
             private readonly object _io = new object();
+            // FEC parity cache: recent group → (payload, member count). Bounded hard —
+            // a hostile chunkSize (60000) must not multiply into per-session megabytes.
+            private sealed class ParityEntry { public byte[] Data; public int Count; }
+            private readonly Dictionary<long, ParityEntry> _parity = new Dictionary<long, ParityEntry>();
+            private readonly Queue<long> _parityOrder = new Queue<long>();
+            private const int MaxParityCacheEntries = 4;
 
             public bool IsComplete { get { return TotalSize > 0 && _coveredBytes >= TotalSize; } }
 
@@ -651,6 +872,31 @@ namespace TrFileTransfer
             {
                 if (size != TotalSize || chunkSize != ChunkSize) return false;
                 return Utils.ConstantTimeEquals(hash, ExpectedHash);
+            }
+
+            /// <summary>Whether a parity payload for this exact group start is cached.</summary>
+            public bool HasParity(long groupStart)
+            {
+                lock (_io) { return _parity.ContainsKey(groupStart); }
+            }
+
+            /// <summary>Finds a cached parity whose group range contains idx (the cache
+            /// holds ≤4 self-describing entries, so a linear scan is the whole cost).</summary>
+            public bool FindCachedGroupContaining(long idx, out long groupStart)
+            {
+                lock (_io)
+                {
+                    foreach (var kv in _parity)
+                    {
+                        if (idx >= kv.Key && idx < kv.Key + kv.Value.Count)
+                        {
+                            groupStart = kv.Key;
+                            return true;
+                        }
+                    }
+                }
+                groupStart = -1;
+                return false;
             }
 
             /// <summary>Whether chunks can still land (the part file is writable).
@@ -710,6 +956,88 @@ namespace TrFileTransfer
                 }
             }
 
+            /// <summary>Caches a parity payload (FIFO-bounded) for later recovery.</summary>
+            public void StoreParity(long groupStart, int groupCount, byte[] buf, int payloadOff, int payloadLen)
+            {
+                lock (_io)
+                {
+                    if (_parity.ContainsKey(groupStart))
+                    {
+                        _parity[groupStart] = new ParityEntry { Data = Utils.CopyBytes(buf, payloadOff, payloadLen), Count = groupCount };
+                        return;
+                    }
+                    _parity[groupStart] = new ParityEntry { Data = Utils.CopyBytes(buf, payloadOff, payloadLen), Count = groupCount };
+                    _parityOrder.Enqueue(groupStart);
+                    while (_parityOrder.Count > MaxParityCacheEntries)
+                    {
+                        long oldest = _parityOrder.Dequeue();
+                        _parity.Remove(oldest);
+                    }
+                }
+            }
+
+            /// <summary>Reconstructs THE one missing member of a group from its cached
+            /// parity and the other members read back from the part file, then writes
+            /// it through the normal WriteChunk path (coverage, completion accounting).
+            /// Returns false when there is no parity, nothing missing, or 2+ holes —
+            /// in which case the cache entry stays for a later, narrower attempt.</summary>
+            public bool TryRecoverGroup(long groupStart)
+            {
+                lock (_io)
+                {
+                    ParityEntry entry;
+                    if (_fs == null || !_parity.TryGetValue(groupStart, out entry)) return false;
+                    int groupCount = entry.Count;
+                    if (groupCount < 1 || groupStart + groupCount > TotalChunks) return false;
+
+                    long missingIdx = -1;
+                    int missingCount = 0;
+                    for (long i = groupStart; i < groupStart + groupCount; i++)
+                    {
+                        int bitByte = (int)(i >> 3);
+                        int bitMask = 1 << (int)(i & 7);
+                        if ((_coveredBits[bitByte] & bitMask) == 0)
+                        {
+                            missingCount++;
+                            missingIdx = i;
+                            if (missingCount > 1) return false; // keep the entry for later
+                        }
+                    }
+                    if (missingCount == 0)
+                    {
+                        _parity.Remove(groupStart);
+                        return false;
+                    }
+
+                    long expected = TotalSize - missingIdx * ChunkSize;
+                    if (expected > ChunkSize) expected = ChunkSize;
+                    byte[] rec = new byte[expected];
+                    Buffer.BlockCopy(entry.Data, 0, rec, 0, (int)Math.Min(expected, entry.Data.Length));
+                    for (long m = groupStart; m < groupStart + groupCount; m++)
+                    {
+                        if (m == missingIdx) continue;
+                        long memberLen = TotalSize - m * ChunkSize;
+                        if (memberLen > ChunkSize) memberLen = ChunkSize;
+                        int take = (int)Math.Min(memberLen, expected);
+                        if (take <= 0) continue;
+                        byte[] member = new byte[take];
+                        _fs.Seek(m * (long)ChunkSize, SeekOrigin.Begin);
+                        int read = 0;
+                        while (read < take)
+                        {
+                            int r = _fs.Read(member, read, take - read);
+                            if (r <= 0) return false; // part file shrank underneath us
+                            read += r;
+                        }
+                        for (int b = 0; b < take; b++) rec[b] ^= member[b];
+                    }
+
+                    long recovered = WriteChunk((int)missingIdx, (int)expected, rec, 0);
+                    _parity.Remove(groupStart);
+                    return recovered >= 0;
+                }
+            }
+
             /// <summary>Closes the stream and deletes the part file (hash mismatch or
             /// shape change — nothing here is worth keeping).</summary>
             public void Discard()
@@ -740,6 +1068,20 @@ namespace TrFileTransfer
         private readonly string _fileName;
         private CancellationTokenSource _cts;
         private volatile bool _wasCancelled;
+        /// <summary>Whole-file re-send passes (clamped 1-5). A one-way link has no
+        /// feedback, so repeating the send IS the loss recovery; the receiver
+        /// suppresses a session it just delivered, so extra passes never create
+        /// duplicate files.</summary>
+        public int Passes = 1;
+        private const int InterPassDelayMs = 400;
+        /// <summary>START/END redundant copies and the spacing between them — a burst
+        /// shorter than the spacing cannot kill all copies.</summary>
+        public const int StartCopies = 3;
+        public const int FrameSpacingMs = 40;
+        /// <summary>Forward error correction: XOR parity per GroupSize-chunk group plus
+        /// interleaved sending. Safe against old receivers (they drop the unknown
+        /// frame type), so it defaults on; --nofec / Config "UdpFec"=0 turns it off.</summary>
+        public bool FecEnabled = true;
 
         public event Action<string> OnLog;
         public event Action<TransferProgress> OnProgress;
@@ -812,74 +1154,91 @@ namespace TrFileTransfer
                     .ConfigureAwait(false);
                 Guid session = UdpOneWay.DeriveSession(_fileName, _fileSize, mtimeUtc.Ticks);
                 long totalChunks = _fileSize == 0 ? 0 : (_fileSize + _chunkSize - 1) / _chunkSize;
+                int passes = Math.Max(1, Math.Min(5, Passes));
 
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 Log(L.UdpC_Sending(_fileName, Utils.FormatSize(_fileSize), _ip, _port.ToString()));
-
-                // START
+                if (FecEnabled && totalChunks > 1)
+                    Log(L.UdpC_FecOn(UdpOneWay.FecGroupSize.ToString()));
                 byte[] start = BuildStart(session, totalChunks, hash);
-                await udp.SendAsync(start, start.Length).ConfigureAwait(false);
-                if (_limiter != null) await _limiter.ThrottleAsync(start.Length, ct).ConfigureAwait(false);
-
-                // DATA
+                byte[] end = UdpOneWay.BuildHeader(UdpOneWay.FrameEnd, session);
                 byte[] frame = new byte[UdpOneWay.HeaderSize + 4 + _chunkSize];
                 byte[] head = UdpOneWay.BuildHeader(UdpOneWay.FrameData, session);
                 Buffer.BlockCopy(head, 0, frame, 0, UdpOneWay.HeaderSize);
-                long sent = 0;
+                long overall = 0;                    // bytes sent across all passes
+                long grandTotal = _fileSize * passes; // progress denominator
                 var progressWatch = System.Diagnostics.Stopwatch.StartNew();
                 DateTime lastProgress = DateTime.UtcNow.AddSeconds(-1);
-                using (var fs = File.OpenRead(_path))
+                Action<long> reportProgress = delegate(long passSent)
                 {
-                    byte[] chunk = new byte[_chunkSize];
-                    for (long i = 0; i < totalChunks; i++)
+                    DateTime now = DateTime.UtcNow;
+                    if ((now - lastProgress).TotalMilliseconds >= 100 || passSent == _fileSize)
                     {
-                        ct.ThrowIfCancellationRequested();
-                        // Fill the chunk completely: a short read would emit an
-                        // undersized frame, and the receiver permanently rejects any
-                        // chunk whose length differs from the declared shape — the
-                        // coverage would never reach complete while we report done.
-                        int n = 0;
-                        while (n < _chunkSize)
+                        lastProgress = now;
+                        long shown = overall + passSent;
+                        var h = OnProgress;
+                        if (h != null)
                         {
-                            int r = await fs.ReadAsync(chunk, n, _chunkSize - n, ct).ConfigureAwait(false);
-                            if (r <= 0) break;
-                            n += r;
-                        }
-                        if (n <= 0) break;
-                        Buffer.BlockCopy(BitConverter.GetBytes((int)i), 0, frame, UdpOneWay.HeaderSize, 4);
-                        Buffer.BlockCopy(chunk, 0, frame, UdpOneWay.HeaderSize + 4, n);
-                        int frameLen = UdpOneWay.HeaderSize + 4 + n;
-                        await udp.SendAsync(frame, frameLen).ConfigureAwait(false);
-                        if (_limiter != null) await _limiter.ThrottleAsync(frameLen, ct).ConfigureAwait(false);
-                        sent += n;
-
-                        DateTime now = DateTime.UtcNow;
-                        if ((now - lastProgress).TotalMilliseconds >= 100 || sent == _fileSize)
-                        {
-                            lastProgress = now;
-                            var h = OnProgress;
-                            if (h != null)
+                            h(new TransferProgress
                             {
-                                h(new TransferProgress
-                                {
-                                    BytesTransferred = sent,
-                                    TotalBytes = _fileSize,
-                                    SpeedBytesPerSecond = sent / Math.Max(0.001, progressWatch.Elapsed.TotalSeconds),
-                                    Elapsed = progressWatch.Elapsed,
-                                    FileName = _fileName
-                                });
-                            }
+                                BytesTransferred = shown,
+                                TotalBytes = grandTotal,
+                                SpeedBytesPerSecond = shown / Math.Max(0.001, progressWatch.Elapsed.TotalSeconds),
+                                Elapsed = progressWatch.Elapsed,
+                                FileName = _fileName
+                            });
                         }
                     }
-                }
+                };
 
-                // END
-                byte[] end = UdpOneWay.BuildHeader(UdpOneWay.FrameEnd, session);
-                await udp.SendAsync(end, end.Length).ConfigureAwait(false);
+                for (int pass = 1; pass <= passes; pass++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    if (pass > 1)
+                    {
+                        Log(L.UdpC_Pass(pass.ToString(), passes.ToString()));
+                        await Task.Delay(InterPassDelayMs, ct).ConfigureAwait(false);
+                    }
+
+                    // START ×3, spaced: a single lost START voids the whole pass (the
+                    // receiver ignores every DATA of an unregistered session), so the
+                    // one frame that must survive rides in three copies
+                    for (int s = 0; s < StartCopies; s++)
+                    {
+                        if (s > 0) await Task.Delay(FrameSpacingMs, ct).ConfigureAwait(false);
+                        await udp.SendAsync(start, start.Length).ConfigureAwait(false);
+                        if (_limiter != null) await _limiter.ThrottleAsync(start.Length, ct).ConfigureAwait(false);
+                    }
+
+                    // DATA — the hash is computed once above and reused every pass
+                    long sent = 0;
+                    using (var fs = File.OpenRead(_path))
+                    {
+                        byte[] chunk = new byte[_chunkSize];
+                        if (FecEnabled && totalChunks > 1)
+                        {
+                            sent = await SendChunksFecAsync(udp, fs, chunk, frame, session,
+                                totalChunks, reportProgress, ct).ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            sent = await SendChunksSequentialAsync(udp, fs, chunk, frame,
+                                totalChunks, reportProgress, ct).ConfigureAwait(false);
+                        }
+                    }
+
+                    // END ×3, spaced the same way
+                    for (int s = 0; s < StartCopies; s++)
+                    {
+                        if (s > 0) await Task.Delay(FrameSpacingMs, ct).ConfigureAwait(false);
+                        await udp.SendAsync(end, end.Length).ConfigureAwait(false);
+                    }
+                    overall += sent;
+                }
 
                 var complete = OnTransferComplete;
                 if (complete != null) complete();
-                Log(L.UdpC_Done(_fileName, Utils.FormatSize(sent),
+                Log(L.UdpC_Done(_fileName, Utils.FormatSize(overall),
                     sw.Elapsed.TotalSeconds.ToString("0.0")));
             }
             catch (OperationCanceledException)
@@ -899,6 +1258,124 @@ namespace TrFileTransfer
                 var stopped = OnStopped;
                 if (stopped != null) stopped();
             }
+        }
+
+        /// <summary>Legacy path: chunks in natural order, no parity frames.</summary>
+        private async Task<long> SendChunksSequentialAsync(UdpClient udp, FileStream fs, byte[] chunk,
+            byte[] frame, long totalChunks, Action<long> reportProgress, CancellationToken ct)
+        {
+            long sent = 0;
+            for (long i = 0; i < totalChunks; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                int n = await ReadChunkAsync(fs, chunk, i, ct).ConfigureAwait(false);
+                if (n <= 0) break;
+                await SendDataChunkAsync(udp, frame, i, chunk, n, ct).ConfigureAwait(false);
+                sent += n;
+                reportProgress(sent);
+            }
+            return sent;
+        }
+
+        /// <summary>FEC path: chunks interleaved (super-block column-major, same-group
+        /// members ride the block's group count apart — see
+        /// UdpOneWay.InterleavedChunkOrder) with one XOR parity frame per group. A
+        /// burst of up to that-many-minus-one consecutive losses then leaves every
+        /// group at most one member short, which the parity reconstructs on the
+        /// receiver with no retransmission. Parity memory is bounded by the
+        /// super-block layout: at most GroupSize group accumulators × ChunkSize.</summary>
+        private async Task<long> SendChunksFecAsync(UdpClient udp, FileStream fs, byte[] chunk,
+            byte[] frame, Guid session, long totalChunks, Action<long> reportProgress, CancellationToken ct)
+        {
+            int k = UdpOneWay.FecGroupSize;
+            long super = (long)k * k;
+            byte[][] acc = new byte[k][];
+            for (int r = 0; r < k; r++) acc[r] = new byte[_chunkSize];
+            int[] groupCount = new int[k];
+            byte[] parityFrame = new byte[UdpOneWay.HeaderSize + UdpOneWay.MinParityBody + _chunkSize];
+            byte[] parityHead = UdpOneWay.BuildHeader(UdpOneWay.FrameParity, session);
+            Buffer.BlockCopy(parityHead, 0, parityFrame, 0, UdpOneWay.HeaderSize);
+            long sent = 0;
+            long sbStart = -1, sbEnd = -1;
+            int size = k, groups = k;
+
+            foreach (long idx in UdpOneWay.InterleavedChunkOrder(totalChunks, k))
+            {
+                ct.ThrowIfCancellationRequested();
+                if (idx >= sbEnd)
+                {
+                    if (sbStart >= 0)
+                        await EmitParitiesAsync(udp, parityFrame, acc, groupCount, sbStart, size, groups, ct).ConfigureAwait(false);
+                    sbStart = idx / super * super;
+                    sbEnd = sbStart + super;
+                    long sbLen = Math.Min(super, totalChunks - sbStart);
+                    // The final partial block re-partitions into more, smaller groups
+                    // (see InterleavedChunkOrder) so its interleave spacing — the group
+                    // count — stays as high as the remainder allows
+                    size = sbLen == super ? k : (int)Math.Max(1, (sbLen + k - 1) / k);
+                    groups = (int)((sbLen + size - 1) / size);
+                    for (int r = 0; r < k; r++) { Array.Clear(acc[r], 0, acc[r].Length); groupCount[r] = 0; }
+                }
+                int g = (int)((idx - sbStart) / size);
+                int n = await ReadChunkAsync(fs, chunk, idx, ct).ConfigureAwait(false);
+                if (n <= 0) break;
+                await SendDataChunkAsync(udp, frame, idx, chunk, n, ct).ConfigureAwait(false);
+                sent += n;
+                reportProgress(sent);
+                for (int b = 0; b < n; b++) acc[g][b] ^= chunk[b];
+                groupCount[g]++;
+            }
+            if (sbStart >= 0)
+                await EmitParitiesAsync(udp, parityFrame, acc, groupCount, sbStart, size, groups, ct).ConfigureAwait(false);
+            return sent;
+        }
+
+        /// <summary>One XOR parity frame per non-empty group of the super-block: the
+        /// payload is the byte-wise XOR of the group's chunk payloads, zero-padded to
+        /// ChunkSize (so a short last chunk reconstructs correctly). The frame is
+        /// self-describing (groupStart + member count), so the receiver needs no
+        /// mirror of the tail's re-partition.</summary>
+        private async Task EmitParitiesAsync(UdpClient udp, byte[] parityFrame, byte[][] acc,
+            int[] groupCount, long sbStart, int size, int groups, CancellationToken ct)
+        {
+            for (int g = 0; g < groups; g++)
+            {
+                if (groupCount[g] == 0) continue;
+                long groupStart = sbStart + g * (long)size;
+                Buffer.BlockCopy(BitConverter.GetBytes((int)groupStart), 0, parityFrame, UdpOneWay.HeaderSize, 4);
+                parityFrame[UdpOneWay.HeaderSize + 4] = (byte)groupCount[g];
+                Buffer.BlockCopy(acc[g], 0, parityFrame, UdpOneWay.HeaderSize + 5, _chunkSize);
+                int frameLen = UdpOneWay.HeaderSize + 5 + _chunkSize;
+                await udp.SendAsync(parityFrame, frameLen).ConfigureAwait(false);
+                if (_limiter != null) await _limiter.ThrottleAsync(frameLen, ct).ConfigureAwait(false);
+            }
+        }
+
+        /// <summary>Positions at idx and fill-reads the complete chunk — a short read
+        /// would emit an undersized frame, and the receiver permanently rejects any
+        /// chunk whose length differs from the declared shape (the coverage would
+        /// never reach complete while we report done).</summary>
+        private async Task<int> ReadChunkAsync(FileStream fs, byte[] chunk, long idx, CancellationToken ct)
+        {
+            fs.Seek(idx * (long)_chunkSize, SeekOrigin.Begin);
+            int n = 0;
+            while (n < _chunkSize)
+            {
+                int r = await fs.ReadAsync(chunk, n, _chunkSize - n, ct).ConfigureAwait(false);
+                if (r <= 0) break;
+                n += r;
+            }
+            return n;
+        }
+
+        private async Task SendDataChunkAsync(UdpClient udp, byte[] frame, long idx, byte[] chunk, int n,
+            CancellationToken ct)
+        {
+            Buffer.BlockCopy(BitConverter.GetBytes((int)idx), 0, frame, UdpOneWay.HeaderSize, 4);
+            Buffer.BlockCopy(chunk, 0, frame, UdpOneWay.HeaderSize + 4, n);
+            int frameLen = UdpOneWay.HeaderSize + 4 + n;
+            await udp.SendAsync(frame, frameLen).ConfigureAwait(false);
+            if (_limiter != null) await _limiter.ThrottleAsync(frameLen, ct).ConfigureAwait(false);
         }
 
         private byte[] BuildStart(Guid session, long totalChunks, byte[] hash)

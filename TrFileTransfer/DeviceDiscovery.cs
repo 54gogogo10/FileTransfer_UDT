@@ -20,6 +20,27 @@ namespace TrFileTransfer
         public bool RequiresPairing;
     }
 
+    /// <summary>Display helpers over the known-device list.</summary>
+    public static class DeviceDisplay
+    {
+        /// <summary>Progress-card title for a peer: the remembered device name when
+        /// we have one (a bare IP says nothing with several concurrent senders),
+        /// else the IP itself.</summary>
+        public static string NameFor(IEnumerable<DeviceInfo> known, string ip)
+        {
+            if (string.IsNullOrEmpty(ip)) return "?";
+            if (known != null)
+            {
+                foreach (var d in known)
+                {
+                    if (d.Ip == ip && !string.IsNullOrEmpty(d.Name) && d.Name != "?")
+                        return d.Name + " (" + ip + ")";
+                }
+            }
+            return ip;
+        }
+    }
+
     /// <summary>Wire format for the UDP discovery protocol: probe 0xD1 → response 0xD2.</summary>
     public static class DiscoveryProtocol
     {

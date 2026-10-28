@@ -624,8 +624,9 @@ namespace TrFileTransfer
 
     /// <summary>
     /// IP filter list matching for the server receive gate. Entries are separated by
-    /// ';' or ','; each is an exact IPv4 address or a prefix ending in '*'
-    /// (e.g. "192.168.1.*"). "*" alone matches everything.
+    /// ';' or ','; each is an exact address, a prefix ending in '*' (e.g.
+    /// "192.168.1.*") or a CIDR network (e.g. "192.168.0.0/16", "fd00::/8").
+    /// "*" alone matches everything.
     /// </summary>
     public static class IpFilter
     {
@@ -643,12 +644,46 @@ namespace TrFileTransfer
                     string prefix = entry.Substring(0, entry.Length - 1);
                     if (ip.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return true;
                 }
+                else if (entry.IndexOf('/') >= 0)
+                {
+                    if (CidrContains(entry, ip)) return true;
+                }
                 else if (string.Equals(entry, ip, StringComparison.OrdinalIgnoreCase))
                 {
                     return true;
                 }
             }
             return false;
+        }
+
+        /// <summary>Entry as a CIDR network ("192.168.0.0/16", "fd00::/8"). Host bits
+        /// set on the network side are fine (both sides get masked). A broken entry
+        /// never matches — the same fail-closed direction as the rest of the filter.</summary>
+        private static bool CidrContains(string entry, string ip)
+        {
+            int slash = entry.IndexOf('/');
+            if (slash <= 0) return false;
+            IPAddress net, addr;
+            int bits;
+            if (!IPAddress.TryParse(entry.Substring(0, slash), out net)) return false;
+            if (!IPAddress.TryParse(ip, out addr)) return false;
+            if (!int.TryParse(entry.Substring(slash + 1), out bits)) return false;
+            if (net.AddressFamily != addr.AddressFamily) return false;
+            int maxBits = net.AddressFamily == AddressFamily.InterNetwork ? 32 : 128;
+            if (bits < 0 || bits > maxBits) return false;
+
+            byte[] n = net.GetAddressBytes();
+            byte[] a = addr.GetAddressBytes();
+            int fullBytes = bits / 8;
+            int remBits = bits % 8;
+            for (int i = 0; i < fullBytes; i++)
+                if (n[i] != a[i]) return false;
+            if (remBits > 0)
+            {
+                int mask = 0xFF << (8 - remBits);
+                if ((n[fullBytes] & mask) != (a[fullBytes] & mask)) return false;
+            }
+            return true;
         }
     }
 }

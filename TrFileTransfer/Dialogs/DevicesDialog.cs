@@ -8,17 +8,22 @@ using System.Windows.Media;
 namespace TrFileTransfer
 {
     /// <summary>Known-devices manager: lists the remembered Name|Ip|Port|protocol entries,
-    /// with use (fill the client panel), delete, and clear-all. Edits mutate the live
-    /// list in place — the owner persists it via SaveKnownDevices() when the dialog closes.</summary>
+    /// with use (fill the client panel), delete, and clear-all. The dialog DISPLAYS a
+    /// snapshot but applies deletions to the live list by identity (Ip+Port): the modal
+    /// pump lets RememberDevice append/trim the live list while the dialog is open, and
+    /// an index into a shifted shared list used to delete the wrong device.</summary>
     public class DevicesDialog : Window
     {
         private readonly List<DeviceInfo> _devices;
+        private readonly List<DeviceInfo> _liveRef;
         private readonly Action<DeviceInfo> _onUse;
         private readonly ListBox _list = DlgUi.DarkList();
 
         public DevicesDialog(List<DeviceInfo> devices, Action<DeviceInfo> onUse)
         {
-            _devices = devices;
+            // Display snapshot; deletions below reach the live list by identity
+            _devices = new List<DeviceInfo>(devices);
+            _liveRef = devices;
             _onUse = onUse;
 
             DlgUi.Init(this, L.DevicesTitle, 520, 440, 440, 320);
@@ -98,8 +103,10 @@ namespace TrFileTransfer
         {
             int idx = SelectedIndex;
             if (idx < 0) return;
-            string name = _devices[idx].Name;
+            DeviceInfo victim = _devices[idx];
+            string name = victim.Name;
             _devices.RemoveAt(idx);
+            RemoveFromLiveList(victim);
             Repopulate();
             MessageBox.Show(this, L.DevicesDeleted(name), L.DevicesTitle,
                 MessageBoxButton.OK, MessageBoxImage.Information);
@@ -111,7 +118,25 @@ namespace TrFileTransfer
             if (MessageBox.Show(this, L.DevicesClearConfirm, L.DevicesTitle,
                 MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
             _devices.Clear();
+            _liveRef.Clear();
             Repopulate();
+        }
+
+        /// <summary>The owner hands us the LIVE _knownDevices list (it persists on
+        /// close). Deletions go through by Ip+Port+Name identity, so a concurrent
+        /// RememberDevice insertion can never shift a delete onto the wrong row.</summary>
+        private void RemoveFromLiveList(DeviceInfo victim)
+        {
+            if (_liveRef == null) return;
+            for (int i = 0; i < _liveRef.Count; i++)
+            {
+                if (_liveRef[i].Ip == victim.Ip && _liveRef[i].Port == victim.Port
+                    && _liveRef[i].Name == victim.Name)
+                {
+                    _liveRef.RemoveAt(i);
+                    return;
+                }
+            }
         }
     }
 }

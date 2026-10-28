@@ -21,6 +21,10 @@ namespace TrFileTransfer
         private ComboBox _cmbAfter;
         private TextBox _txtAfterCmd;
         private bool _running;
+        /// <summary>Cancels the running batch between items (the in-flight transfer
+        /// itself finishes; nothing stops it once started). Closing the dialog mid-run
+        /// cancels the batch too, so no transfers outlive their window.</summary>
+        private System.Threading.CancellationTokenSource _batchCts;
 
         public QueueDialog(Func<QueuedTask> capture, Func<QueuedTask, Task<bool>> executor,
             IEnumerable<QueuedTask> initial = null,
@@ -29,11 +33,22 @@ namespace TrFileTransfer
             _capture = capture;
             _captureFor = captureFor;
             _executor = executor;
+            // The persisted queue comes back first (it survives restarts — the whole
+            // point), then whatever this particular open was seeded with (drag-drop)
+            foreach (var t in QueueStore.Load(QueueStore.DefaultPath))
+                _tasks.Add(t);
             if (initial != null)
             {
                 foreach (var t in initial)
                     _tasks.Add(t);
             }
+            Closing += (s, e) =>
+            {
+                // A closed dialog must not own a running batch: cancel it (the current
+                // item finishes) and persist what remains
+                if (_running && _batchCts != null) { try { _batchCts.Cancel(); } catch { } }
+                PersistQueue();
+            };
             DlgUi.Init(this, L.QueueTitle, 800, 440, 740, 340);
 
             // Drag files/folders onto the dialog (form or the list filling it) to enqueue
@@ -55,7 +70,11 @@ namespace TrFileTransfer
             _btnDelete.Click += BtnDelete_Click;
             _btnClear.Click += BtnClear_Click;
             _btnStart.Click += BtnStart_Click;
-            btnClose.Click += (s, e) => Close();
+            btnClose.Click += (s, e) =>
+            {
+                if (_running && _batchCts != null) { try { _batchCts.Cancel(); } catch { } }
+                Close();
+            };
 
             _numRetries = new NumericBox
             {
@@ -144,6 +163,14 @@ namespace TrFileTransfer
                 _list.Items.Add(FormatTask(_tasks[i]));
         }
 
+        /// <summary>Mirrors the live list to disk. Mutations are blocked while
+        /// running, so a call during a batch can only come from the run loop itself
+        /// (per-item) — a crash mid-batch keeps the remaining tasks.</summary>
+        private void PersistQueue()
+        {
+            QueueStore.Save(QueueStore.DefaultPath, _tasks);
+        }
+
         private void BtnAdd_Click(object sender, RoutedEventArgs e)
         {
             if (_running) return;
@@ -155,6 +182,7 @@ namespace TrFileTransfer
             }
             _tasks.Add(task);
             _list.Items.Add(FormatTask(task));
+            PersistQueue();
         }
 
         /// <summary>Batch-add: pick several files at once in a multi-select dialog;
@@ -192,6 +220,7 @@ namespace TrFileTransfer
                     skipped++;
                 }
             }
+            if (added > 0) PersistQueue();
             if (added == 0 && skipped > 0)
                 MessageBox.Show(this, L.DragDropSkipped(skipped), L.QueueTitle,
                     MessageBoxButton.OK, MessageBoxImage.Information);
@@ -231,6 +260,7 @@ namespace TrFileTransfer
                     skipped++;
                 }
             }
+            if (added > 0) PersistQueue();
             if (skipped > 0)
                 MessageBox.Show(this, L.DragDropSkipped(skipped), L.QueueTitle,
                     MessageBoxButton.OK, MessageBoxImage.Information);
@@ -244,6 +274,7 @@ namespace TrFileTransfer
             {
                 _tasks.RemoveAt(idx);
                 _list.Items.RemoveAt(idx);
+                PersistQueue();
             }
         }
 
@@ -252,6 +283,7 @@ namespace TrFileTransfer
             if (_running) return;
             _tasks.Clear();
             _list.Items.Clear();
+            PersistQueue();
         }
 
         private void UpdateAfterCmdState()
@@ -280,10 +312,19 @@ namespace TrFileTransfer
             Config.Set("QueueAfterCommand", command);
             int retries = _numRetries.Value;
             int failed = 0;
+            _batchCts = new System.Threading.CancellationTokenSource();
             try
             {
                 for (int i = 0; i < _tasks.Count; i++)
                 {
+                    if (_batchCts.Token.IsCancellationRequested)
+                    {
+                        // Batch cancelled (Cancel button or dialog closed): mark the
+                        // remaining items and stop — the next open resumes the list
+                        for (int j = i; j < _tasks.Count; j++)
+                            _list.Items[j] = "\u23F8 " + FormatTask(_tasks[j]); // ⏸
+                        break;
+                    }
                     var sw = System.Diagnostics.Stopwatch.StartNew();
                     bool ok = false;
                     for (int attempt = 0; ; attempt++)
@@ -300,6 +341,7 @@ namespace TrFileTransfer
                     if (!ok) failed++;
                     _list.Items[i] = (ok ? "\u2713 " : "\u2717 ") + FormatTask(_tasks[i])
                         + "  [" + sw.Elapsed.TotalSeconds.ToString("F1") + "s]"; // ✓ / ✗
+                    PersistQueue(); // a crash mid-batch keeps the remaining tasks
                 }
             }
             finally
@@ -314,7 +356,9 @@ namespace TrFileTransfer
                 UpdateAfterCmdState();
             }
 
-            if (action != "none") RunAfterAction(action, command, failed);
+            // A cancelled batch must not auto-shutdown the machine
+            if (action != "none" && !_batchCts.Token.IsCancellationRequested)
+                RunAfterAction(action, command, failed);
         }
 
         /// <summary>Executes the chosen after-queue action once the batch is done —
@@ -358,7 +402,8 @@ namespace TrFileTransfer
 
         private static string FormatTask(QueuedTask t)
         {
-            return string.Format("{0} -> {1}:{2} ({3})", t.DisplayName, t.ServerIp, t.Port, t.IsUdp ? "UDT" : "TCP");
+            string proto = t.IsRawUdp ? "UDP" : (t.IsUdp ? "UDT" : "TCP");
+            return string.Format("{0} -> {1}:{2} ({3})", t.DisplayName, t.ServerIp, t.Port, proto);
         }
     }
 }

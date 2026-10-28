@@ -128,13 +128,197 @@ namespace TrFileTransfer.Tests
             RunConstantTimeEquals(runner);
             RunGetUniqueSavePath(runner);
             RunConfig(runner);
+            RunConfigBackup(runner);
+            RunDeviceDisplay(runner);
+            RunQueueStore(runner);
+            RunUdpFecOrder(runner);
             RunL10N(runner);
+            RunKeepAwake(runner);
+            RunUdpPartStore(runner);
+            RunTextHistory(runner);
+            RunIpFilterCidr(runner);
             RunServerResumeStore(runner);
             RunFolderResumeStore(runner);
             RunUpdater(runner);
             RunWire(runner);
             RunSyncBatch(runner);
             RunPortProbe(runner);
+        }
+
+        /// <summary>KeepAwake is a counter around a per-thread Windows call; the
+        /// count itself is the testable contract (pairs nest, unpaired Ends clamp).</summary>
+        private static void RunKeepAwake(TestRunner runner)
+        {
+            runner.Run("KeepAwake_RefCountsNest", () =>
+            {
+                int baseline = KeepAwake.RefCount;
+                KeepAwake.Begin();
+                KeepAwake.Begin();
+                KeepAwake.Begin();
+                Assert.Equal(baseline + 3, KeepAwake.RefCount, "three begins nest");
+                KeepAwake.End();
+                KeepAwake.End();
+                Assert.Equal(baseline + 1, KeepAwake.RefCount, "two ends release two");
+                KeepAwake.End();
+                Assert.Equal(baseline, KeepAwake.RefCount, "last end restores the count");
+            });
+            runner.Run("KeepAwake_UnpairedEndClamps", () =>
+            {
+                int baseline = KeepAwake.RefCount; // 0 in practice; delta keeps this robust
+                KeepAwake.End();
+                KeepAwake.End();
+                Assert.Equal(baseline, KeepAwake.RefCount,
+                    "unpaired ends clamp at zero instead of going negative");
+                KeepAwake.Begin();
+                KeepAwake.End();
+                Assert.Equal(baseline, KeepAwake.RefCount, "still pairable after a clamp");
+            });
+        }
+
+        /// <summary>UdpPartStore is the single implementation behind both the UI's
+        /// .part management and (indirectly) the orphan sweep contract.</summary>
+        private static void RunUdpPartStore(TestRunner runner)
+        {
+            runner.Run("UdpPartStore_ListDeletePurge", () =>
+            {
+                string dir = Path.Combine(Path.GetTempPath(), "tr_parts_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(UdpPartStore.PartDir(dir));
+                try
+                {
+                    Assert.Equal(0, UdpPartStore.ListParts(dir).Count, "fresh dir lists nothing");
+                    string a = Path.Combine(UdpPartStore.PartDir(dir), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.part");
+                    string b = Path.Combine(UdpPartStore.PartDir(dir), "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.part");
+                    string other = Path.Combine(UdpPartStore.PartDir(dir), "notes.txt");
+                    File.WriteAllBytes(a, new byte[100]);
+                    File.WriteAllBytes(b, new byte[200]);
+                    File.WriteAllText(other, "keep me");
+
+                    var parts = UdpPartStore.ListParts(dir);
+                    Assert.Equal(2, parts.Count, "only *.part files listed");
+                    Assert.Equal(100L, parts[0].Bytes, "size recorded");
+                    Assert.Equal("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.part", Path.GetFileName(parts[0].Path),
+                        "path-sorted, first is a...");
+
+                    Assert.True(UdpPartStore.DeletePart(a), "delete one part");
+                    Assert.False(UdpPartStore.DeletePart(a), "already-missing part reports false");
+                    Assert.True(File.Exists(other), "non-part file untouched");
+                    Assert.Equal(1, UdpPartStore.ListParts(dir).Count, "one part left");
+
+                    Assert.Equal(1, UdpPartStore.DeleteAll(dir), "purge removes the rest");
+                    Assert.Equal(0, UdpPartStore.ListParts(dir).Count, "nothing left after purge");
+                }
+                finally { try { Directory.Delete(dir, true); } catch { } }
+            });
+            runner.Run("UdpPartStore_MissingDirSafe", () =>
+            {
+                Assert.Equal(0, UdpPartStore.ListParts(null).Count, "null save dir lists nothing");
+                Assert.Equal(0,
+                    UdpPartStore.ListParts(Path.Combine(Path.GetTempPath(), "tr_nope_" + Guid.NewGuid().ToString("N"))).Count,
+                    "missing dir lists nothing");
+                Assert.Equal(0,
+                    UdpPartStore.DeleteAll(Path.Combine(Path.GetTempPath(), "tr_nope2_" + Guid.NewGuid().ToString("N"))),
+                    "missing dir purges nothing");
+            });
+        }
+
+        /// <summary>Text history keeps received messages across restarts; the escape
+        /// round-trip is the contract everything else hangs on.</summary>
+        private static void RunTextHistory(TestRunner runner)
+        {
+            runner.Run("TextHistory_RoundTripAndEscape", () =>
+            {
+                string path = Path.Combine(Path.GetTempPath(), "tr_th_" + Guid.NewGuid().ToString("N") + ".log");
+                var store = new TextHistoryStore(path);
+                try
+                {
+                    Assert.Equal(0, store.Load().Count, "fresh store is empty");
+                    string tricky = "中文 line1\r\nline2 \\path\\to C:\\new\rfile";
+                    store.Add(tricky);
+                    store.Add("second");
+                    var loaded = store.Load();
+                    Assert.Equal(2, loaded.Count, "both messages persisted");
+                    Assert.Equal(tricky, loaded[0].Text, "multi-line + backslash + Chinese round-trips");
+                    Assert.Equal("second", loaded[1].Text, "plain message round-trips");
+                    Assert.True(loaded[1].When > loaded[0].When.AddSeconds(-5), "timestamps recorded");
+                }
+                finally { try { File.Delete(path); } catch { } }
+            });
+            runner.Run("TextHistory_CapsAtMaxEntries", () =>
+            {
+                string path = Path.Combine(Path.GetTempPath(), "tr_th_" + Guid.NewGuid().ToString("N") + ".log");
+                var store = new TextHistoryStore(path);
+                try
+                {
+                    int over = TextHistoryStore.MaxEntries + 50;
+                    for (int i = 0; i < over; i++)
+                        store.Add("msg" + i.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                    var loaded = store.Load();
+                    Assert.Equal(TextHistoryStore.MaxEntries, loaded.Count, "bounded to MaxEntries");
+                    Assert.Equal("msg" + (over - 1).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        loaded[loaded.Count - 1].Text, "newest kept");
+                    Assert.Equal(
+                        "msg" + (over - TextHistoryStore.MaxEntries).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                        loaded[0].Text, "oldest kept is exactly the window edge");
+                }
+                finally { try { File.Delete(path); } catch { } }
+            });
+            runner.Run("TextHistory_CorruptLinesSkipped", () =>
+            {
+                string path = Path.Combine(Path.GetTempPath(), "tr_th_" + Guid.NewGuid().ToString("N") + ".log");
+                try
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(path));
+                    File.WriteAllLines(path, new[]
+                    {
+                        "garbage without a timestamp bar",
+                        "9999-99-99 99:99:99|bad date",
+                        "2026-01-02 03:04:05|real message"
+                    });
+                    var loaded = new TextHistoryStore(path).Load();
+                    Assert.Equal(1, loaded.Count, "only the valid line survives");
+                    Assert.Equal("real message", loaded[0].Text, "valid line parses");
+                }
+                finally { try { File.Delete(path); } catch { } }
+            });
+        }
+
+        /// <summary>CIDR entries in the IP filter: prefix math for both families,
+        /// host bits tolerated, broken entries never match (fail closed).</summary>
+        private static void RunIpFilterCidr(TestRunner runner)
+        {
+            runner.Run("IpFilter_CidrV4", () =>
+            {
+                Assert.True(IpFilter.Matches("192.168.1.0/24", "192.168.1.77"), "/24 covers its network");
+                Assert.False(IpFilter.Matches("192.168.1.0/24", "192.168.2.1"), "/24 stops at the boundary");
+                Assert.True(IpFilter.Matches("10.0.0.0/8", "10.255.3.4"), "/8 covers the whole class-A");
+                Assert.True(IpFilter.Matches("0.0.0.0/0", "203.0.113.9"), "/0 covers the family");
+                Assert.True(IpFilter.Matches("192.168.1.77/24", "192.168.1.5"),
+                    "host bits on the network side are masked away");
+                Assert.False(IpFilter.Matches("192.168.1.0/24", "::1"), "v4 network never matches a v6 peer");
+            });
+            runner.Run("IpFilter_CidrV6AndMixed", () =>
+            {
+                Assert.True(IpFilter.Matches("fd00::/8", "fd12:3456::9"), "/8 v6 prefix");
+                Assert.False(IpFilter.Matches("fd00::/8", "fe80::1"), "different v6 prefix");
+                Assert.False(IpFilter.Matches("fd00::/8", "192.168.1.1"), "v6 network never matches a v4 peer");
+                Assert.True(IpFilter.Matches("::1/128", "::1"), "/128 exact");
+                Assert.False(IpFilter.Matches("::1/128", "::2"), "/128 rejects neighbors");
+                Assert.True(IpFilter.Matches("192.168.0.0/16;10.0.0.5", "10.0.0.5"),
+                    "CIDR and exact entries coexist (exact hit)");
+                Assert.True(IpFilter.Matches("192.168.0.0/16;10.0.0.5", "192.168.44.3"),
+                    "CIDR and exact entries coexist (CIDR hit)");
+                Assert.False(IpFilter.Matches("192.168.0.0/16;10.0.0.5", "172.16.0.1"),
+                    "mixed list still excludes the rest");
+            });
+            runner.Run("IpFilter_CidrBrokenEntriesNeverMatch", () =>
+            {
+                Assert.False(IpFilter.Matches("300.300.300.300/24", "192.168.1.1"), "invalid network");
+                Assert.False(IpFilter.Matches("192.168.1.0/33", "192.168.1.1"), "prefix too long for v4");
+                Assert.False(IpFilter.Matches("fd00::/129", "fd00::1"), "prefix too long for v6");
+                Assert.False(IpFilter.Matches("192.168.1.0/", "192.168.1.1"), "missing length");
+                Assert.False(IpFilter.Matches("/24", "192.168.1.1"), "missing network");
+                Assert.False(IpFilter.Matches("192.168.1.0/abc", "192.168.1.1"), "non-numeric length");
+            });
         }
 
         private static void RunFormatSize(TestRunner runner)
@@ -292,6 +476,256 @@ namespace TrFileTransfer.Tests
                 Assert.Equal(-1, Config.GetInt("__nonexistent_xyz", -1), "int fallback");
                 Assert.True(Config.GetBool("__nonexistent_xyz", true), "bool fallback true");
                 Assert.False(Config.GetBool("__nonexistent_xyz", false), "bool fallback false");
+            });
+        }
+
+        /// <summary>Save keeps one good generation in .bak and swaps atomically; Load
+        /// heals an unreadable or zero-length config from that backup. A missing
+        /// config is a deliberate fresh start and must NOT resurrect from .bak.</summary>
+        private static string NewTestConfigPath()
+        {
+            return Path.Combine(Path.GetTempPath(), "tr_cfg_" + Guid.NewGuid().ToString("N") + ".ini");
+        }
+
+        private static void CleanTestConfig(string p)
+        {
+            try { File.Delete(p); } catch { }
+            try { File.Delete(p + ".bak"); } catch { }
+            try { File.Delete(p + ".tmp"); } catch { }
+        }
+
+        private static void RunConfigBackup(TestRunner runner)
+        {
+            runner.Run("Config_BackupFallbackOnCorruption", () =>
+            {
+                string p = NewTestConfigPath();
+                try
+                {
+                    Config.UseFile(p);
+                    Config.Set("A", "1");
+                    Config.Save();
+                    Assert.True(File.Exists(p), "first save creates the config");
+                    Assert.False(File.Exists(p + ".bak"), "no backup before a second generation");
+
+                    Config.Set("B", "2");
+                    Config.Save();
+                    Assert.True(File.Exists(p + ".bak"), "second save keeps the previous generation");
+
+                    // Corrupt the live file with content that parses to nothing
+                    File.WriteAllText(p, "\0\0junk without any equals sign");
+                    Config.UseFile(p); // clears the in-memory table like a restart
+                    Config.Load();
+                    Assert.Equal("1", Config.Get("A", ""), "A recovered from .bak");
+                }
+                finally { CleanTestConfig(p); }
+            });
+
+            runner.Run("Config_BackupFallbackOnTruncation", () =>
+            {
+                string p = NewTestConfigPath();
+                try
+                {
+                    Config.UseFile(p);
+                    Config.Set("K", "v");
+                    Config.Set("K2", "v2");
+                    Config.Save();
+                    Config.Set("K3", "v3");
+                    Config.Save(); // .bak now holds K/K2
+                    File.WriteAllText(p, ""); // zero-length = crashed mid-write
+                    Config.UseFile(p);
+                    Config.Load();
+                    Assert.Equal("v", Config.Get("K", ""), "K recovered from .bak");
+                    Assert.Equal("v2", Config.Get("K2", ""), "K2 recovered from .bak");
+                }
+                finally { CleanTestConfig(p); }
+            });
+
+            runner.Run("Config_MissingFileIsFreshStart", () =>
+            {
+                string p = NewTestConfigPath();
+                try
+                {
+                    Config.UseFile(p);
+                    Config.Set("X", "gone");
+                    Config.Save();
+                    Config.Save(); // ensure .bak exists
+                    Assert.True(File.Exists(p + ".bak"), "backup present");
+                    File.Delete(p); // the user's reset gesture
+                    Config.UseFile(p);
+                    Config.Load();
+                    Assert.Equal("", Config.Get("X", ""), "deleted config stays deleted (no .bak resurrection)");
+                }
+                finally { CleanTestConfig(p); }
+            });
+
+            runner.Run("Config_BakHoldsPreviousGeneration", () =>
+            {
+                string p = NewTestConfigPath();
+                try
+                {
+                    Config.UseFile(p);
+                    Config.Set("G", "1");
+                    Config.Save();
+                    Config.Set("G", "2");
+                    Config.Save();
+                    string bak = File.ReadAllText(p + ".bak");
+                    Assert.True(bak.Contains("G=1") && !bak.Contains("G=2"),
+                        ".bak froze the previous generation");
+                    Assert.True(File.ReadAllText(p).Contains("G=2"), "live file has the newest value");
+                }
+                finally { CleanTestConfig(p); }
+            });
+        }
+
+        /// <summary>Peer card titles: remembered name wins, junk names and unknown
+        /// IPs fall back to the bare IP.</summary>
+        private static void RunDeviceDisplay(TestRunner runner)
+        {
+            runner.Run("DeviceDisplay_NameFor", () =>
+            {
+                var known = new List<DeviceInfo>
+                {
+                    new DeviceInfo { Name = "办公室台式机", Ip = "192.168.1.20", Port = 8080 },
+                    new DeviceInfo { Name = "?", Ip = "192.168.1.21", Port = 8080 },
+                    new DeviceInfo { Name = "", Ip = "192.168.1.22", Port = 8080 }
+                };
+                Assert.Equal("办公室台式机 (192.168.1.20)", DeviceDisplay.NameFor(known, "192.168.1.20"),
+                    "known device shows name + ip");
+                Assert.Equal("192.168.1.21", DeviceDisplay.NameFor(known, "192.168.1.21"),
+                    "'?' placeholder is not a name");
+                Assert.Equal("192.168.1.22", DeviceDisplay.NameFor(known, "192.168.1.22"),
+                    "empty name is not a name");
+                Assert.Equal("10.0.0.9", DeviceDisplay.NameFor(known, "10.0.0.9"), "unknown ip falls through");
+                Assert.Equal("10.0.0.9", DeviceDisplay.NameFor(null, "10.0.0.9"), "null list is safe");
+                Assert.Equal("?", DeviceDisplay.NameFor(known, null), "null ip shows ?");
+            });
+        }
+
+        /// <summary>The queue outlives restarts: every QueuedTask field round-trips,
+        /// corrupt lines are dropped, the list stays bounded.</summary>
+        private static void RunQueueStore(TestRunner runner)
+        {
+            runner.Run("QueueStore_RoundTripAllFields", () =>
+            {
+                string path = Path.Combine(Path.GetTempPath(), "tr_qs_" + Guid.NewGuid().ToString("N") + ".txt");
+                try
+                {
+                    var tasks = new List<QueuedTask>
+                    {
+                        new QueuedTask
+                        {
+                            FilePath = @"D:\资料\新建文件夹\报告 v2.pdf",
+                            IsFolder = false,
+                            ServerIp = "192.168.1.30",
+                            Port = 8080,
+                            IsUdp = false,
+                            IsRawUdp = true,
+                            SrcPort = 0,
+                            Concurrency = 1,
+                            VerifyHash = true,
+                            SpeedLimit = 512000
+                        },
+                        new QueuedTask
+                        {
+                            FilePath = @"E:\备份\照片",
+                            IsFolder = true,
+                            ServerIp = "fd00::9",
+                            Port = 9090,
+                            IsUdp = true,
+                            IsRawUdp = false,
+                            SrcPort = 12345,
+                            Concurrency = 4,
+                            VerifyHash = false,
+                            SpeedLimit = 0
+                        }
+                    };
+                    QueueStore.Save(path, tasks);
+                    var loaded = QueueStore.Load(path);
+                    Assert.Equal(2, loaded.Count, "both tasks persisted");
+                    Assert.Equal(tasks[0].FilePath, loaded[0].FilePath, "Chinese path round-trips");
+                    Assert.True(loaded[0].IsRawUdp && !loaded[0].IsUdp, "raw-udp flag round-trips");
+                    Assert.True(loaded[0].VerifyHash, "verify flag round-trips");
+                    Assert.Equal(512000, loaded[0].SpeedLimit, "speed limit round-trips");
+                    Assert.True(loaded[1].IsFolder, "folder flag round-trips");
+                    Assert.Equal("fd00::9", loaded[1].ServerIp, "v6 target round-trips");
+                    Assert.Equal(12345, loaded[1].SrcPort, "src port round-trips");
+                    Assert.Equal(4, loaded[1].Concurrency, "concurrency round-trips");
+                }
+                finally { try { File.Delete(path); } catch { } }
+            });
+            runner.Run("QueueStore_BadLinesSkippedAndBounded", () =>
+            {
+                string path = Path.Combine(Path.GetTempPath(), "tr_qs_" + Guid.NewGuid().ToString("N") + ".txt");
+                try
+                {
+                    string good = QueueStore.Serialize(new QueuedTask
+                    { FilePath = @"C:\ok.bin", ServerIp = "1.2.3.4", Port = 8080 });
+                    Directory.CreateDirectory(Path.GetDirectoryName(path));
+                    var lines = new List<string> { "garbage", "a|b|c", good };
+                    for (int i = 0; i < QueueStore.MaxTasks; i++)
+                        lines.Add(good);
+                    File.WriteAllLines(path, lines.ToArray());
+                    var loaded = QueueStore.Load(path);
+                    Assert.Equal(QueueStore.MaxTasks, loaded.Count, "bounded to MaxTasks");
+                    Assert.Equal(@"C:\ok.bin", loaded[0].FilePath, "garbage lines skipped, good ones kept");
+                }
+                finally { try { File.Delete(path); } catch { } }
+            });
+            runner.Run("QueueStore_MissingFileIsEmpty", () =>
+            {
+                Assert.Equal(0,
+                    QueueStore.Load(Path.Combine(Path.GetTempPath(), "tr_qs_nope_" + Guid.NewGuid().ToString("N"))).Count,
+                    "no file -> empty queue");
+            });
+        }
+
+        /// <summary>FEC interleaving contract: the send order is a permutation, and
+        /// same-group members ride at least GroupSize wire positions apart — the
+        /// property that caps burst damage at one member per recoverable group.</summary>
+        private static void RunUdpFecOrder(TestRunner runner)
+        {
+            runner.Run("UdpFec_InterleavedOrderProperties", () =>
+            {
+                int k = UdpOneWay.FecGroupSize;
+                foreach (long total in new long[] { 1, 7, 8, 9, 63, 64, 65, 200, 1000 })
+                {
+                    var order = new System.Collections.Generic.List<long>(
+                        UdpOneWay.InterleavedChunkOrder(total, k));
+                    Assert.Equal((int)total, order.Count, "order covers every chunk exactly once (total=" + total + ")");
+
+                    var seen = new bool[total];
+                    foreach (long idx in order)
+                    {
+                        Assert.True(idx >= 0 && idx < total, "index in range");
+                        Assert.False(seen[idx], "no duplicate index");
+                        seen[idx] = true;
+                    }
+
+                    // Same-group members must be >= R positions apart, where R is the
+                    // group count of that group's super-block (= k for every full
+                    // block; the final partial block re-partitions into smaller groups
+                    // so R = ceil(sbLen / ceil(sbLen/k))). Enumerate the same partition
+                    // the implementation uses.
+                    long super = (long)k * k;
+                    for (long sbStart = 0; sbStart < total; sbStart += super)
+                    {
+                        long sbLen = Math.Min(super, total - sbStart);
+                        long size = sbLen == super ? k : Math.Max(1, (sbLen + k - 1) / k);
+                        long groups = (sbLen + size - 1) / size;
+                        for (long g = 0; g < groups; g++)
+                        {
+                            long groupLo = sbStart + g * size;
+                            long groupHi = Math.Min(sbStart + sbLen, groupLo + size);
+                            var positions = new System.Collections.Generic.List<int>();
+                            for (int pos = 0; pos < order.Count; pos++)
+                                if (order[pos] >= groupLo && order[pos] < groupHi) positions.Add(pos);
+                            Assert.Equal((int)(groupHi - groupLo), positions.Count, "group fully present");
+                            for (int i = 1; i < positions.Count; i++)
+                                Assert.True(positions[i] - positions[i - 1] >= groups,
+                                    "group " + groupLo + " members spaced >= " + groups + " apart");
+                        }
+                    }
+                }
             });
         }
 

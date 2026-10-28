@@ -17,6 +17,13 @@ namespace TrFileTransfer
         }
 
         public TextReceivedDialog(string firstMessage, string title)
+            : this(firstMessage, title, null)
+        {
+        }
+
+        /// <param name="history">Previously received messages (oldest first), shown
+        /// above the new one; null keeps the plain single-message look (firewall hint).</param>
+        public TextReceivedDialog(string firstMessage, string title, System.Collections.Generic.IList<TextHistoryEntry> history)
         {
             DlgUi.Init(this, title, 460, 240, 380, 200);
             MinWidth = 380;
@@ -32,7 +39,19 @@ namespace TrFileTransfer
             _txt.AcceptsReturn = true;
             _txt.VerticalContentAlignment = VerticalAlignment.Top;
             _txt.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
-            _txt.Text = "[" + DateTime.Now.ToString("HH:mm:ss") + "]\r\n" + firstMessage;
+            var sb = new System.Text.StringBuilder();
+            if (history != null)
+            {
+                foreach (var entry in history)
+                {
+                    if (entry == null) continue;
+                    if (sb.Length > 0) sb.Append("\r\n\r\n");
+                    sb.Append('[').Append(entry.When.ToString("HH:mm:ss")).Append("]\r\n").Append(entry.Text);
+                }
+            }
+            if (sb.Length > 0) sb.Append("\r\n\r\n");
+            sb.Append('[').Append(DateTime.Now.ToString("HH:mm:ss")).Append("]\r\n").Append(firstMessage);
+            _txt.Text = sb.ToString();
 
             var btnCopy = DlgUi.PrimaryMin(L.CopyBtn, 100);
             var btnClose = DlgUi.SecondaryMin(L.CancelBtn, 100);
