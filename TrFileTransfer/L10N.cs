@@ -369,6 +369,16 @@ namespace TrFileTransfer
                     : "One-way UDP only: re-send N passes to ride out loss (no duplicates on the receiver)";
             }
         }
+        public static string UdpParityLabel { get { return IsChinese ? "奇偶份数" : "Parity"; } }
+        public static string UdpParityHint
+        {
+            get
+            {
+                return IsChinese
+                    ? "单向 UDP 前向纠错冗余：每 8 分片一组配 N 份 RS 奇偶，一组丢 ≤N 片单轮免重传恢复；1-8，越大越抗丢包、线开销越大（默认 2，约 25%）"
+                    : "One-way UDP FEC redundancy: N RS parity frames per 8-chunk group — up to N losses per group recover in a single pass; 1-8, higher survives more loss at more wire overhead (default 2, ~25%)";
+            }
+        }
         public static string UdpC_Cancelled(string name)
         {
             return IsChinese

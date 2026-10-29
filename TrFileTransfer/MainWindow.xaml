@@ -331,6 +331,11 @@
                             <local:NumericBox x:Name="_numUdpPasses" Width="56" Min="1" Max="5" Margin="0,4,0,0"
                                               ToolTipService.ShowOnDisabled="True"/>
                         </StackPanel>
+                        <StackPanel Orientation="Vertical">
+                            <TextBlock x:Name="_lblUdpParity" Style="{StaticResource FieldLabelSmall}"/>
+                            <local:NumericBox x:Name="_numUdpParity" Width="56" Min="1" Max="8" Margin="0,4,0,0"
+                                              ToolTipService.ShowOnDisabled="True"/>
+                        </StackPanel>
                     </StackPanel>
 
                     <!-- Tools: discovery & batch helpers; text send sits with the actions -->

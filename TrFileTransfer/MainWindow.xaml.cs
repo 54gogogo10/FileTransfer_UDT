@@ -662,6 +662,8 @@ namespace TrFileTransfer
             _lblPairingC.Text = L.PairingClientLabel;
             _lblUdpPasses.Text = L.UdpPassesLabel;
             _numUdpPasses.ToolTip = L.UdpPassesHint;
+            _lblUdpParity.Text = L.UdpParityLabel;
+            _numUdpParity.ToolTip = L.UdpParityHint;
             _lblHttpPort.Text = L.HttpPortLabel;
             if (_httpShare == null || !_httpShare.IsRunning)
                 _btnHttpShare.Content = L.HttpShareBtn;
@@ -719,6 +721,7 @@ namespace TrFileTransfer
             _numConcurrency.Value = Math.Max(1, Math.Min(8, Config.GetInt("Concurrency", 4)));
             _numSrcPort.Value = Math.Max(0, Math.Min(65535, Config.GetInt("SrcPort", 0)));
             _numUdpPasses.Value = Math.Max(1, Math.Min(5, Config.GetInt("UdpPasses", 1)));
+            _numUdpParity.Value = Math.Max(1, Math.Min(8, Config.GetInt("UdpFecParity", 2)));
             _txtPairing.Text = Config.Get("PairingCode", "");
         }
 
@@ -818,6 +821,7 @@ namespace TrFileTransfer
             Config.SetInt("Concurrency", _numConcurrency.Value);
             Config.SetInt("SrcPort", _numSrcPort.Value);
             Config.SetInt("UdpPasses", _numUdpPasses.Value);
+            Config.SetInt("UdpFecParity", _numUdpParity.Value);
             Config.Set("PairingCode", _txtPairing.Text.Trim());
             Config.Save();
         }
@@ -2200,8 +2204,7 @@ namespace TrFileTransfer
                     var udpClient = new TransferUdpClient(ip, port, path, chunkSize, srcPort, speedLimit);
                     udpClient.Passes = _numUdpPasses.Value; // loss recovery for a link with no feedback
                     udpClient.FecEnabled = Config.GetBool("UdpFec", true); // RS parity + interleaving
-                    udpClient.FecParity = Math.Max(1, Math.Min(UdpOneWay.FecGroupSize,
-                        Config.GetInt("UdpFecParity", 2))); // losses per group recoverable in one pass
+                    udpClient.FecParity = _numUdpParity.Value; // losses per group recoverable in one pass
                     _clientUdp = udpClient;
                     bool udpOk = await WireUdpClientAndSendAsync(udpClient).ConfigureAwait(true);
                     _clientUdp = null;
@@ -2691,6 +2694,7 @@ namespace TrFileTransfer
             _numConcurrency.IsEnabled = false;
             _numSrcPort.IsEnabled = false;
             _numUdpPasses.IsEnabled = false;
+            _numUdpParity.IsEnabled = false;
             _btnResumeList.IsEnabled = false;
             _chkVerifyHash.IsEnabled = false;
             _numSpeed.IsEnabled = false;
@@ -2724,6 +2728,7 @@ namespace TrFileTransfer
             _numConcurrency.IsEnabled = true;
             _numSrcPort.IsEnabled = true;
             _numUdpPasses.IsEnabled = true;
+            _numUdpParity.IsEnabled = true;
             _btnResumeList.IsEnabled = true;
             _chkVerifyHash.IsEnabled = true;
             _numSpeed.IsEnabled = true;
