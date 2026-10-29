@@ -104,6 +104,7 @@ namespace TrFileTransfer
                     var client = new TransferUdpClient(ip, port, path, UdpOneWay.DefaultChunkSize, srcPort, limit);
                     client.Passes = passes;
                     client.FecEnabled = !opt.ContainsKey("nofec");
+                    client.FecParity = (int)ParseLong(opt, "fec-parity", 1, UdpOneWay.FecGroupSize, 2);
                     client.OnLog += msg => Console.Out.WriteLine(msg);
                     client.OnError += msg => { failed = true; Console.Error.WriteLine(msg); };
                     if (code.Length > 0) Console.Out.WriteLine(L.CliUdpIgnoresCode);

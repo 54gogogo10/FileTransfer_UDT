@@ -30,14 +30,15 @@ namespace TrFileTransfer
         public const byte FrameStart = 0x01;
         public const byte FrameData = 0x02;
         public const byte FrameEnd = 0x03;
-        /// <summary>Forward-error-correction parity frame (XOR of one group's chunk
-        /// payloads, padded to ChunkSize). Old receivers hit the unknown-type
-        /// fall-through and ignore it, so enabling FEC needs no negotiation.</summary>
+        /// <summary>Forward-error-correction parity frame (Reed-Solomon erasure code,
+        /// one frame per parity row of a group; the group's chunks XOR-combine under
+        /// Cauchy coefficients). Old receivers hit the unknown-type fall-through and
+        /// ignore it, so enabling FEC needs no negotiation.</summary>
         public const byte FrameParity = 0x04;
 
         public const int HeaderSize = 20;   // magic(2) + ver(1) + type(1) + sessionId(16)
         public const int MinStartBody = 54; // size(8)+chunk(4)+total(8)+nameLen(2)+hash(32)
-        public const int MinParityBody = 5; // groupStart(4) + groupCount(1)
+        public const int MinParityBody = 6; // groupStart(4) + groupCount(1) + parityIndex(1)
         public const byte Version = 1;
         public const int MaxChunkSize = 60000;   // datagram payload cap (IP-local, avoids fragmentation bombs)
         public const int DefaultChunkSize = 1200; // fits a typical 1500-byte MTU without fragmentation
@@ -538,10 +539,11 @@ namespace TrFileTransfer
             }
         }
 
-        /// <summary>FEC parity frame: XOR of one group's chunk payloads. Cached (small,
-        /// bounded) and immediately attempted — if exactly one member of the group is
-        /// missing, the parity reconstructs it; otherwise the cache lets a LATER data
-        /// chunk trigger the recovery once the group narrows to one hole.</summary>
+        /// <summary>FEC parity frame: one Reed-Solomon parity row of a group (Cauchy
+        /// coefficients, see UdpFec). Cached (small, byte-budgeted) and immediately
+        /// attempted — if the surviving parity rows cover the group's missing members,
+        /// they reconstruct in place; otherwise the cache lets a LATER data chunk
+        /// trigger the recovery once the erasure count drops to the parity count.</summary>
         private void HandleParity(byte[] buf, Guid session, IPEndPoint from)
         {
             if (buf.Length < UdpOneWay.HeaderSize + UdpOneWay.MinParityBody) return;
@@ -554,14 +556,16 @@ namespace TrFileTransfer
             int p = UdpOneWay.HeaderSize;
             int groupStart = BitConverter.ToInt32(buf, p); p += 4;
             int groupCount = buf[p]; p += 1;
+            int parityIndex = buf[p]; p += 1;
             int payloadLen = buf.Length - p;
             if (groupStart < 0 || groupStart >= s.TotalChunks
                 || groupCount < 1 || groupCount > UdpOneWay.FecGroupSize
                 || groupStart + groupCount > s.TotalChunks
+                || parityIndex < 0 || parityIndex >= UdpOneWay.FecGroupSize
                 || payloadLen != s.ChunkSize)
                 return; // corrupt/hostile parity — ignored, coverage unaffected
 
-            s.StoreParity(groupStart, groupCount, buf, p, payloadLen);
+            s.StoreParity(groupStart, groupCount, parityIndex, buf, p, payloadLen);
             TryRecoverAndFinalize(s, groupStart, from, session);
         }
 
@@ -828,10 +832,19 @@ namespace TrFileTransfer
             private readonly object _io = new object();
             // FEC parity cache: recent group → (payload, member count). Bounded hard —
             // a hostile chunkSize (60000) must not multiply into per-session megabytes.
-            private sealed class ParityEntry { public byte[] Data; public int Count; }
-            private readonly Dictionary<long, ParityEntry> _parity = new Dictionary<long, ParityEntry>();
+            // FEC parity cache: group start → (member count, parity rows by index).
+            // Bounded hard on both entry count AND bytes — a hostile chunkSize (60000)
+            // must not multiply into per-session megabytes.
+            private sealed class ParityGroup
+            {
+                public int Count;
+                public readonly Dictionary<int, byte[]> Frames = new Dictionary<int, byte[]>();
+            }
+            private readonly Dictionary<long, ParityGroup> _parity = new Dictionary<long, ParityGroup>();
             private readonly Queue<long> _parityOrder = new Queue<long>();
             private const int MaxParityCacheEntries = 4;
+            private const int MaxParityCacheBytes = 256 * 1024;
+            private long _parityBytes;
 
             public bool IsComplete { get { return TotalSize > 0 && _coveredBytes >= TotalSize; } }
 
@@ -956,86 +969,126 @@ namespace TrFileTransfer
                 }
             }
 
-            /// <summary>Caches a parity payload (FIFO-bounded) for later recovery.</summary>
-            public void StoreParity(long groupStart, int groupCount, byte[] buf, int payloadOff, int payloadLen)
+            /// <summary>Caches one parity row for a group (FIFO- and byte-bounded).</summary>
+            public void StoreParity(long groupStart, int groupCount, int parityIndex, byte[] buf, int payloadOff, int payloadLen)
             {
                 lock (_io)
                 {
-                    if (_parity.ContainsKey(groupStart))
+                    ParityGroup pg;
+                    if (!_parity.TryGetValue(groupStart, out pg))
                     {
-                        _parity[groupStart] = new ParityEntry { Data = Utils.CopyBytes(buf, payloadOff, payloadLen), Count = groupCount };
-                        return;
+                        pg = new ParityGroup { Count = groupCount };
+                        _parity[groupStart] = pg;
+                        _parityOrder.Enqueue(groupStart);
+                        while (_parityOrder.Count > MaxParityCacheEntries) EvictOldestParity();
                     }
-                    _parity[groupStart] = new ParityEntry { Data = Utils.CopyBytes(buf, payloadOff, payloadLen), Count = groupCount };
-                    _parityOrder.Enqueue(groupStart);
-                    while (_parityOrder.Count > MaxParityCacheEntries)
-                    {
-                        long oldest = _parityOrder.Dequeue();
-                        _parity.Remove(oldest);
-                    }
+                    if (!pg.Frames.ContainsKey(parityIndex)) _parityBytes += payloadLen;
+                    pg.Frames[parityIndex] = Utils.CopyBytes(buf, payloadOff, payloadLen);
+                    while (_parityBytes > MaxParityCacheBytes && _parityOrder.Count > 1) EvictOldestParity();
                 }
             }
 
-            /// <summary>Reconstructs THE one missing member of a group from its cached
-            /// parity and the other members read back from the part file, then writes
-            /// it through the normal WriteChunk path (coverage, completion accounting).
-            /// Returns false when there is no parity, nothing missing, or 2+ holes —
-            /// in which case the cache entry stays for a later, narrower attempt.</summary>
+            private void EvictOldestParity()
+            {
+                if (_parityOrder.Count == 0) return;
+                long oldest = _parityOrder.Dequeue();
+                ParityGroup old;
+                if (_parity.TryGetValue(oldest, out old))
+                {
+                    foreach (var f in old.Frames.Values) _parityBytes -= f.Length;
+                    _parity.Remove(oldest);
+                }
+            }
+
+            /// <summary>Recovers a group's missing members from its cached parity rows
+            /// (Reed-Solomon erasure solve, surviving members read back from the part
+            /// file) and writes them through the normal WriteChunk path. Returns false
+            /// when there is no cache entry, nothing missing, or fewer surviving rows
+            /// than erasures — the entry then stays for a later attempt.</summary>
             public bool TryRecoverGroup(long groupStart)
             {
                 lock (_io)
                 {
-                    ParityEntry entry;
-                    if (_fs == null || !_parity.TryGetValue(groupStart, out entry)) return false;
-                    int groupCount = entry.Count;
+                    ParityGroup pg;
+                    if (_fs == null || !_parity.TryGetValue(groupStart, out pg)) return false;
+                    int groupCount = pg.Count;
                     if (groupCount < 1 || groupStart + groupCount > TotalChunks) return false;
 
-                    long missingIdx = -1;
-                    int missingCount = 0;
-                    for (long i = groupStart; i < groupStart + groupCount; i++)
+                    var missing = new List<int>();
+                    for (int i = 0; i < groupCount; i++)
                     {
-                        int bitByte = (int)(i >> 3);
-                        int bitMask = 1 << (int)(i & 7);
-                        if ((_coveredBits[bitByte] & bitMask) == 0)
-                        {
-                            missingCount++;
-                            missingIdx = i;
-                            if (missingCount > 1) return false; // keep the entry for later
-                        }
+                        int bitByte = (int)((groupStart + i) >> 3);
+                        int bitMask = 1 << (int)((groupStart + i) & 7);
+                        if ((_coveredBits[bitByte] & bitMask) == 0) missing.Add(i);
                     }
-                    if (missingCount == 0)
+                    if (missing.Count == 0)
                     {
-                        _parity.Remove(groupStart);
+                        RemoveParityGroup(groupStart);
                         return false;
                     }
+                    if (pg.Frames.Count < missing.Count) return false; // keep for later
 
-                    long expected = TotalSize - missingIdx * ChunkSize;
-                    if (expected > ChunkSize) expected = ChunkSize;
-                    byte[] rec = new byte[expected];
-                    Buffer.BlockCopy(entry.Data, 0, rec, 0, (int)Math.Min(expected, entry.Data.Length));
-                    for (long m = groupStart; m < groupStart + groupCount; m++)
+                    var survCols = new List<int>();
+                    var survBlocks = new List<byte[]>();
+                    for (int i = 0; i < groupCount; i++)
                     {
-                        if (m == missingIdx) continue;
-                        long memberLen = TotalSize - m * ChunkSize;
-                        if (memberLen > ChunkSize) memberLen = ChunkSize;
-                        int take = (int)Math.Min(memberLen, expected);
-                        if (take <= 0) continue;
-                        byte[] member = new byte[take];
-                        _fs.Seek(m * (long)ChunkSize, SeekOrigin.Begin);
+                        int bitByte = (int)((groupStart + i) >> 3);
+                        int bitMask = 1 << (int)((groupStart + i) & 7);
+                        if ((_coveredBits[bitByte] & bitMask) == 0) continue;
+                        long len = TotalSize - (groupStart + i) * (long)ChunkSize;
+                        if (len > ChunkSize) len = ChunkSize;
+                        var block = new byte[len];
+                        _fs.Seek((groupStart + i) * (long)ChunkSize, SeekOrigin.Begin);
                         int read = 0;
-                        while (read < take)
+                        while (read < (int)len)
                         {
-                            int r = _fs.Read(member, read, take - read);
+                            int r = _fs.Read(block, read, (int)len - read);
                             if (r <= 0) return false; // part file shrank underneath us
                             read += r;
                         }
-                        for (int b = 0; b < take; b++) rec[b] ^= member[b];
+                        survCols.Add(i);
+                        survBlocks.Add(block);
                     }
 
-                    long recovered = WriteChunk((int)missingIdx, (int)expected, rec, 0);
-                    _parity.Remove(groupStart);
-                    return recovered >= 0;
+                    var payloads = new byte[pg.Frames.Count][];
+                    var rowIdx = new int[pg.Frames.Count];
+                    int w = 0;
+                    foreach (var kv in pg.Frames) { rowIdx[w] = kv.Key; payloads[w] = kv.Value; w++; }
+
+                    byte[][] solved = UdpFec.Solve(payloads, rowIdx,
+                        survCols.ToArray(), survBlocks.ToArray(), missing.ToArray(), ChunkSize, UdpOneWay.FecGroupSize);
+                    if (solved == null) return false;
+
+                    bool any = false;
+                    for (int c = 0; c < missing.Count; c++)
+                    {
+                        long globalIdx = groupStart + missing[c];
+                        long expected = TotalSize - globalIdx * (long)ChunkSize;
+                        if (expected > ChunkSize) expected = ChunkSize;
+                        long r2 = WriteChunk((int)globalIdx, (int)expected, solved[c], 0);
+                        if (r2 >= 0) any = true;
+                    }
+                    RemoveParityGroup(groupStart);
+                    return any;
                 }
+            }
+
+            private void RemoveParityGroup(long groupStart)
+            {
+                ParityGroup old;
+                if (_parity.TryGetValue(groupStart, out old))
+                {
+                    foreach (var f in old.Frames.Values) _parityBytes -= f.Length;
+                    _parity.Remove(groupStart);
+                }
+                // rebuild the FIFO without the removed group (≤4 entries)
+                var keep = new Queue<long>();
+                while (_parityOrder.Count > 0)
+                {
+                    long k = _parityOrder.Dequeue();
+                    if (k != groupStart) keep.Enqueue(k);
+                }
+                foreach (long k in keep) _parityOrder.Enqueue(k);
             }
 
             /// <summary>Closes the stream and deletes the part file (hash mismatch or
@@ -1078,10 +1131,18 @@ namespace TrFileTransfer
         /// shorter than the spacing cannot kill all copies.</summary>
         public const int StartCopies = 3;
         public const int FrameSpacingMs = 40;
-        /// <summary>Forward error correction: XOR parity per GroupSize-chunk group plus
-        /// interleaved sending. Safe against old receivers (they drop the unknown
-        /// frame type), so it defaults on; --nofec / Config "UdpFec"=0 turns it off.</summary>
+        /// <summary>Forward error correction: Reed-Solomon erasure coding with
+        /// `FecParity` parity frames per GroupSize-chunk group (1 = single parity,
+        /// 2+ recovers multiple losses per group) plus interleaved sending. Safe
+        /// against old receivers (they drop the unknown frame type), so it defaults
+        /// on; --nofec / Config "UdpFec"=0 turns it off, "UdpFecParity" (1-8) sets
+        /// the redundancy.</summary>
         public bool FecEnabled = true;
+        /// <summary>Parity frames per FEC group (clamped 1..GroupSize at use). 2 is the
+        /// default: two arbitrary losses per 8-chunk group recover in a single pass at
+        /// 25% wire overhead — on a no-return link a re-send pass costs the whole file,
+        /// so overhead is the cheap currency here.</summary>
+        public int FecParity = 2;
 
         public event Action<string> OnLog;
         public event Action<TransferProgress> OnProgress;
@@ -1159,7 +1220,8 @@ namespace TrFileTransfer
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 Log(L.UdpC_Sending(_fileName, Utils.FormatSize(_fileSize), _ip, _port.ToString()));
                 if (FecEnabled && totalChunks > 1)
-                    Log(L.UdpC_FecOn(UdpOneWay.FecGroupSize.ToString()));
+                    Log(L.UdpC_FecOn(UdpOneWay.FecGroupSize.ToString(),
+                        Math.Max(1, Math.Min(UdpOneWay.FecGroupSize, FecParity)).ToString()));
                 byte[] start = BuildStart(session, totalChunks, hash);
                 byte[] end = UdpOneWay.BuildHeader(UdpOneWay.FrameEnd, session);
                 byte[] frame = new byte[UdpOneWay.HeaderSize + 4 + _chunkSize];
@@ -1279,25 +1341,29 @@ namespace TrFileTransfer
 
         /// <summary>FEC path: chunks interleaved (super-block column-major, same-group
         /// members ride the block's group count apart — see
-        /// UdpOneWay.InterleavedChunkOrder) with one XOR parity frame per group. A
-        /// burst of up to that-many-minus-one consecutive losses then leaves every
-        /// group at most one member short, which the parity reconstructs on the
-        /// receiver with no retransmission. Parity memory is bounded by the
-        /// super-block layout: at most GroupSize group accumulators × ChunkSize.</summary>
+        /// UdpOneWay.InterleavedChunkOrder) with `FecParity` Reed-Solomon parity
+        /// frames per group (Cauchy erasure code, see UdpFec). Up to FecParity losses
+        /// per group then recover on the receiver with no retransmission. Parity
+        /// frames are queued and spread across the NEXT super-block's columns, so a
+        /// burst cannot cover a group's data members and all its parity copies in the
+        /// same window; the tail block's parities go out just before END. Parity
+        /// memory is bounded by the super-block: GroupSize×FecParity accumulators.</summary>
         private async Task<long> SendChunksFecAsync(UdpClient udp, FileStream fs, byte[] chunk,
             byte[] frame, Guid session, long totalChunks, Action<long> reportProgress, CancellationToken ct)
         {
             int k = UdpOneWay.FecGroupSize;
+            int m = Math.Max(1, Math.Min(k, FecParity));
             long super = (long)k * k;
-            byte[][] acc = new byte[k][];
-            for (int r = 0; r < k; r++) acc[r] = new byte[_chunkSize];
+            // parity accumulators, indexed [g * m + j] (g = group in the block, j = row)
+            byte[][] acc = new byte[k * m][];
+            for (int r = 0; r < acc.Length; r++) acc[r] = new byte[_chunkSize];
             int[] groupCount = new int[k];
-            byte[] parityFrame = new byte[UdpOneWay.HeaderSize + UdpOneWay.MinParityBody + _chunkSize];
             byte[] parityHead = UdpOneWay.BuildHeader(UdpOneWay.FrameParity, session);
-            Buffer.BlockCopy(parityHead, 0, parityFrame, 0, UdpOneWay.HeaderSize);
+            var pending = new System.Collections.Generic.List<byte[]>();
             long sent = 0;
             long sbStart = -1, sbEnd = -1;
             int size = k, groups = k;
+            long lastCol = -1;
 
             foreach (long idx in UdpOneWay.InterleavedChunkOrder(totalChunks, k))
             {
@@ -1305,7 +1371,7 @@ namespace TrFileTransfer
                 if (idx >= sbEnd)
                 {
                     if (sbStart >= 0)
-                        await EmitParitiesAsync(udp, parityFrame, acc, groupCount, sbStart, size, groups, ct).ConfigureAwait(false);
+                        QueueParities(pending, acc, groupCount, parityHead, sbStart, size, groups, m, k, _chunkSize);
                     sbStart = idx / super * super;
                     sbEnd = sbStart + super;
                     long sbLen = Math.Min(super, totalChunks - sbStart);
@@ -1314,7 +1380,27 @@ namespace TrFileTransfer
                     // count — stays as high as the remainder allows
                     size = sbLen == super ? k : (int)Math.Max(1, (sbLen + k - 1) / k);
                     groups = (int)((sbLen + size - 1) / size);
-                    for (int r = 0; r < k; r++) { Array.Clear(acc[r], 0, acc[r].Length); groupCount[r] = 0; }
+                    for (int r = 0; r < acc.Length; r++) Array.Clear(acc[r], 0, acc[r].Length);
+                    for (int gi = 0; gi < k; gi++) groupCount[gi] = 0;
+                    lastCol = -1;
+                }
+                long col = (idx - sbStart) % size;
+                if (col != lastCol)
+                {
+                    lastCol = col;
+                    // Spread the previous block's queued parities across this block's
+                    // columns (ceil share per remaining column — the queue drains
+                    // exactly by the block's end)
+                    long colsLeft = size - col;
+                    int drain = pending.Count == 0 ? 0
+                        : (int)Math.Min(pending.Count, (pending.Count + colsLeft - 1) / colsLeft);
+                    for (int d = 0; d < drain; d++)
+                    {
+                        byte[] pf = pending[0];
+                        pending.RemoveAt(0);
+                        await udp.SendAsync(pf, pf.Length).ConfigureAwait(false);
+                        if (_limiter != null) await _limiter.ThrottleAsync(pf.Length, ct).ConfigureAwait(false);
+                    }
                 }
                 int g = (int)((idx - sbStart) / size);
                 int n = await ReadChunkAsync(fs, chunk, idx, ct).ConfigureAwait(false);
@@ -1322,32 +1408,46 @@ namespace TrFileTransfer
                 await SendDataChunkAsync(udp, frame, idx, chunk, n, ct).ConfigureAwait(false);
                 sent += n;
                 reportProgress(sent);
-                for (int b = 0; b < n; b++) acc[g][b] ^= chunk[b];
+                int member = (int)(idx - (sbStart + g * (long)size));
+                for (int j = 0; j < m; j++)
+                    UdpFec.Accumulate(acc[g * m + j], chunk, n, UdpFec.Coefficient(j, member, k));
                 groupCount[g]++;
             }
+            // The tail block has no transition after it — queue its parities here,
+            // then drain everything (queued at the loop's last transition + tail)
+            // before END. Forgetting this step left every file's last super-block
+            // unprotected and the tail's dropped chunks permanently missing.
             if (sbStart >= 0)
-                await EmitParitiesAsync(udp, parityFrame, acc, groupCount, sbStart, size, groups, ct).ConfigureAwait(false);
+                QueueParities(pending, acc, groupCount, parityHead, sbStart, size, groups, m, k, _chunkSize);
+            for (int d = 0; d < pending.Count; d++)
+            {
+                byte[] pf = pending[d];
+                await udp.SendAsync(pf, pf.Length).ConfigureAwait(false);
+                if (_limiter != null) await _limiter.ThrottleAsync(pf.Length, ct).ConfigureAwait(false);
+            }
             return sent;
         }
 
-        /// <summary>One XOR parity frame per non-empty group of the super-block: the
-        /// payload is the byte-wise XOR of the group's chunk payloads, zero-padded to
-        /// ChunkSize (so a short last chunk reconstructs correctly). The frame is
-        /// self-describing (groupStart + member count), so the receiver needs no
-        /// mirror of the tail's re-partition.</summary>
-        private async Task EmitParitiesAsync(UdpClient udp, byte[] parityFrame, byte[][] acc,
-            int[] groupCount, long sbStart, int size, int groups, CancellationToken ct)
+        /// <summary>Freezes a finished super-block's parity rows into self-describing
+        /// PARITY frames ([groupStart(4)][groupCount(1)][parityIndex(1)][payload]) and
+        /// queues them for spread emission over the next block's columns.</summary>
+        private static void QueueParities(System.Collections.Generic.List<byte[]> pending, byte[][] acc,
+            int[] groupCount, byte[] parityHead, long sbStart, int size, int groups, int m, int k, int chunkSize)
         {
             for (int g = 0; g < groups; g++)
             {
                 if (groupCount[g] == 0) continue;
                 long groupStart = sbStart + g * (long)size;
-                Buffer.BlockCopy(BitConverter.GetBytes((int)groupStart), 0, parityFrame, UdpOneWay.HeaderSize, 4);
-                parityFrame[UdpOneWay.HeaderSize + 4] = (byte)groupCount[g];
-                Buffer.BlockCopy(acc[g], 0, parityFrame, UdpOneWay.HeaderSize + 5, _chunkSize);
-                int frameLen = UdpOneWay.HeaderSize + 5 + _chunkSize;
-                await udp.SendAsync(parityFrame, frameLen).ConfigureAwait(false);
-                if (_limiter != null) await _limiter.ThrottleAsync(frameLen, ct).ConfigureAwait(false);
+                for (int j = 0; j < m; j++)
+                {
+                    byte[] f = new byte[UdpOneWay.HeaderSize + UdpOneWay.MinParityBody + chunkSize];
+                    Buffer.BlockCopy(parityHead, 0, f, 0, UdpOneWay.HeaderSize);
+                    Buffer.BlockCopy(BitConverter.GetBytes((int)groupStart), 0, f, UdpOneWay.HeaderSize, 4);
+                    f[UdpOneWay.HeaderSize + 4] = (byte)groupCount[g];
+                    f[UdpOneWay.HeaderSize + 5] = (byte)j;
+                    Buffer.BlockCopy(acc[g * m + j], 0, f, UdpOneWay.HeaderSize + 6, chunkSize);
+                    pending.Add(f);
+                }
             }
         }
 

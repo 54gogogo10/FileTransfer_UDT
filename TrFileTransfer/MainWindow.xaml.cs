@@ -2199,7 +2199,9 @@ namespace TrFileTransfer
                         Config.GetInt("UdpChunkSize", UdpOneWay.DefaultChunkSize)));
                     var udpClient = new TransferUdpClient(ip, port, path, chunkSize, srcPort, speedLimit);
                     udpClient.Passes = _numUdpPasses.Value; // loss recovery for a link with no feedback
-                    udpClient.FecEnabled = Config.GetBool("UdpFec", true); // XOR parity + interleaving
+                    udpClient.FecEnabled = Config.GetBool("UdpFec", true); // RS parity + interleaving
+                    udpClient.FecParity = Math.Max(1, Math.Min(UdpOneWay.FecGroupSize,
+                        Config.GetInt("UdpFecParity", 2))); // losses per group recoverable in one pass
                     _clientUdp = udpClient;
                     bool udpOk = await WireUdpClientAndSendAsync(udpClient).ConfigureAwait(true);
                     _clientUdp = null;

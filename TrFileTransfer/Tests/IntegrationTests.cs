@@ -155,6 +155,7 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_UDP_MultiPass_NoDuplicates", UdpMultiPassNoDuplicates, 1);
             runner.Run("Integration_UDP_MultiPass_LossyConverges", UdpMultiPassLossyConverges, 1);
             runner.Run("Integration_UDP_Fec_SinglePassRecovers", UdpFecSinglePassRecovers, 1);
+            runner.Run("Integration_UDP_Fec_DoubleLoss_SinglePass", UdpFecDoubleLossSinglePass, 1);
             runner.Run("Integration_UDP_OneWay_GarbageRejected", UdpOneWayGarbageRejected, 1);
             runner.Run("Integration_UDP_V4V6_SamePort", UdpV4V6SamePort, 1);
             runner.Run("Integration_TCP_MultiAddressSamePort", TcpMultiAddressSamePort, 1);
@@ -548,6 +549,11 @@ namespace TrFileTransfer.Tests
 
                 var waiter1 = WatchUdpDelivery(server);
                 var client1 = new TransferUdpClient("127.0.0.1", proxy.Port, file);
+                // FEC off: this test pins the MULTI-PASS gap-fill mechanism (disk as
+                // state across a receiver restart); with the default double parity the
+                // stride-5 losses would all recover in pass 1 and the mechanism under
+                // test would never engage
+                client1.FecEnabled = false;
                 client1.SendAsync().Wait(60000);
                 Thread.Sleep(800); // let the receiver chew what arrived
 
@@ -563,6 +569,7 @@ namespace TrFileTransfer.Tests
                 proxy.Forward = delegate(byte[] b) { return true; };
                 var waiter2 = WatchUdpDelivery(server);
                 var client2 = new TransferUdpClient("127.0.0.1", proxy.Port, file);
+                client2.FecEnabled = false;
                 client2.SendAsync().Wait(60000);
 
                 string got = WaitUdp(waiter2, 15000);
@@ -5696,6 +5703,10 @@ namespace TrFileTransfer.Tests
                 var waiter = WatchUdpDelivery(server);
                 var client = new TransferUdpClient("127.0.0.1", proxy.Port, file);
                 client.Passes = 2;
+                // FEC off: this test pins the MULTI-PASS convergence mechanism (pass 1
+                // with holes, pass 2 fills them); the default double parity would
+                // recover pass 1's stride-5 holes by itself
+                client.FecEnabled = false;
                 client.SendAsync().Wait(60000);
 
                 string got = WaitUdp(waiter, 15000);
@@ -5750,6 +5761,54 @@ namespace TrFileTransfer.Tests
 
                 string got = WaitUdp(waiter, 15000);
                 Assert.NotNull(got, "FEC recovered the isolated losses in a single pass");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(got)), "bytes match");
+                Assert.Equal(1, Directory.GetFiles(recvDir, "*.bin").Length, "exactly one file");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                if (proxy != null) proxy.Dispose();
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// FEC with TWO parity rows per group (the default): dropping TWO members of
+        /// every group (stride 4 against group size 8) still delivers in a SINGLE
+        /// pass — pre-RS (single XOR parity) only recovered one loss per group.
+        /// </summary>
+        private static void UdpFecDoubleLossSinglePass()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_fec2_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_fec2_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdpServer server = null;
+            LossyUdpProxy proxy = null;
+            try
+            {
+                var content = new byte[512 * 1024];
+                new Random(308).NextBytes(content);
+                string file = Path.Combine(sendDir, "fec2.bin");
+                File.WriteAllBytes(file, content);
+
+                server = StartUdpReceiver("127.0.0.1", port, recvDir);
+                proxy = new LossyUdpProxy(new IPEndPoint(IPAddress.Loopback, port), delegate(byte[] b)
+                {
+                    // Drop every 4th DATA frame: two members lost per 8-chunk group
+                    // (tail groups of ≤7 lose ≤2 as well). START/END/PARITY pass.
+                    return b[3] != 0x02 || BitConverter.ToInt32(b, 20) % 4 != 3;
+                });
+
+                var waiter = WatchUdpDelivery(server);
+                var client = new TransferUdpClient("127.0.0.1", proxy.Port, file);
+                client.Passes = 1; // recovery must come from the two parity rows
+                client.SendAsync().Wait(60000);
+
+                string got = WaitUdp(waiter, 15000);
+                Assert.NotNull(got, "two losses per group recovered by double parity in one pass");
                 Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(got)), "bytes match");
                 Assert.Equal(1, Directory.GetFiles(recvDir, "*.bin").Length, "exactly one file");
             }

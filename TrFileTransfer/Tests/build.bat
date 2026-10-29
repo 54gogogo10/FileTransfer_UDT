@@ -34,6 +34,7 @@ echo.
     ..\TransferServer.cs ^
     ..\TransferUdt.cs ^
     ..\TransferUdp.cs ^
+    ..\UdpFec.cs ^
     ..\TransferClient.cs ^
     ..\DeviceDiscovery.cs ^
     ..\ResumeState.cs ^

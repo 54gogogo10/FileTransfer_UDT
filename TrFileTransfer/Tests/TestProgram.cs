@@ -132,6 +132,7 @@ namespace TrFileTransfer.Tests
             RunDeviceDisplay(runner);
             RunQueueStore(runner);
             RunUdpFecOrder(runner);
+            RunUdpFecRs(runner);
             RunL10N(runner);
             RunKeepAwake(runner);
             RunUdpPartStore(runner);
@@ -676,6 +677,70 @@ namespace TrFileTransfer.Tests
                 Assert.Equal(0,
                     QueueStore.Load(Path.Combine(Path.GetTempPath(), "tr_qs_nope_" + Guid.NewGuid().ToString("N"))).Count,
                     "no file -> empty queue");
+            });
+        }
+
+        /// <summary>Reed-Solomon erasure contract: with m parity rows per group, ANY e ≤ m
+        /// data erasures recover from ANY e surviving rows (Cauchy = every square submatrix
+        /// invertible), short last chunks reconstruct zero-padded, and fewer surviving rows
+        /// than erasures report failure instead of garbage.</summary>
+        private static void RunUdpFecRs(TestRunner runner)
+        {
+            runner.Run("UdpFec_RsRoundTrip", () =>
+            {
+                int k = UdpOneWay.FecGroupSize;
+                foreach (int m in new int[] { 1, 2, 4 })
+                {
+                    var rnd = new Random(500 + m);
+                    int chunkSize = 1300;
+                    var data = new byte[k][];
+                    for (int i = 0; i < k; i++)
+                    {
+                        int len = i == k - 1 ? 700 : chunkSize; // short last chunk
+                        data[i] = new byte[len];
+                        rnd.NextBytes(data[i]);
+                    }
+                    var parity = new byte[m][];
+                    for (int j = 0; j < m; j++) parity[j] = new byte[chunkSize];
+                    for (int i = 0; i < k; i++)
+                        for (int j = 0; j < m; j++)
+                            UdpFec.Accumulate(parity[j], data[i], data[i].Length, UdpFec.Coefficient(j, i, k));
+
+                    foreach (int e in new int[] { 1, 2 })
+                    {
+                        if (e > m) continue;
+                        var missing = new System.Collections.Generic.List<int>();
+                        for (int i = 0; i < e; i++) missing.Add(i);
+                        var survCols = new System.Collections.Generic.List<int>();
+                        var survData = new System.Collections.Generic.List<byte[]>();
+                        for (int i = e; i < k; i++) { survCols.Add(i); survData.Add(data[i]); }
+                        // keep the LAST e parity rows: proves any rows work, not just row 0
+                        var rowIdx = new System.Collections.Generic.List<int>();
+                        var payloads = new System.Collections.Generic.List<byte[]>();
+                        for (int j = m - e; j < m; j++) { rowIdx.Add(j); payloads.Add(parity[j]); }
+
+                        var solved = UdpFec.Solve(payloads.ToArray(), rowIdx.ToArray(),
+                            survCols.ToArray(), survData.ToArray(), missing.ToArray(), chunkSize, k);
+                        Assert.True(solved != null, "solve succeeded (m=" + m + ", e=" + e + ")");
+                        for (int c = 0; c < e; c++)
+                        {
+                            int srcCol = missing[c];
+                            for (int b = 0; b < data[srcCol].Length; b++)
+                                Assert.True(solved[c][b] == data[srcCol][b],
+                                    "recovered byte matches (m=" + m + ", e=" + e + ", byte " + b + ")");
+                            for (int b = data[srcCol].Length; b < chunkSize; b++)
+                                Assert.True(solved[c][b] == 0, "short chunk zero-padded");
+                        }
+                    }
+
+                    // Fewer surviving rows than erasures → null, never garbage
+                    var tooFew = UdpFec.Solve(
+                        new byte[][] { parity[0] }, new int[] { 0 },
+                        new int[] { 1, 2, 3, 4, 5, 6, 7 },
+                        new byte[][] { data[1], data[2], data[3], data[4], data[5], data[6], data[7] },
+                        new int[] { 0, 7 }, chunkSize, k);
+                    Assert.True(tooFew == null, "under-provisioned erasures refuse to solve");
+                }
             });
         }
 

@@ -341,11 +341,11 @@ namespace TrFileTransfer
                 ? string.Format("—— 第 {0}/{1} 轮重发开始（补足丢包）——", pass, total)
                 : string.Format("-- pass {0}/{1}: re-sending to cover losses --", pass, total);
         }
-        public static string UdpC_FecOn(object groupSize)
+        public static string UdpC_FecOn(object groupSize, object parity)
         {
             return IsChinese
-                ? string.Format("前向纠错已启用：{0} 分片一组（XOR 奇偶 + 交错发送），突发丢包免重传恢复", groupSize)
-                : string.Format("FEC on: groups of {0} chunks (XOR parity + interleaving) — bursts recover without retransmit", groupSize);
+                ? string.Format("前向纠错已启用：{0} 分片一组 × {1} 份 RS 奇偶（交错发送），每组丢 ≤{1} 片单轮免重传恢复", groupSize, parity)
+                : string.Format("FEC on: groups of {0} chunks × {1} RS parity rows (interleaved) — up to {1} losses per group recover without retransmit", groupSize, parity);
         }
         public static string UdpS_ParityRecovered(object name, object group)
         {
@@ -877,7 +877,7 @@ namespace TrFileTransfer
                 return IsChinese
                     ? "用法:\r\n" +
                       "  TrFileTransfer send --ip <IP> --port <端口> [--tcp|--udt|--udp] --file <路径|--folder <路径>\r\n" +
-                      "        [--code <配对码>] [--limit <KB/s>] [--srcport <端口>] [--nocompress] [--noencrypt] [--passes <N>] [--nofec]\r\n" +
+                      "        [--code <配对码>] [--limit <KB/s>] [--srcport <端口>] [--nocompress] [--noencrypt] [--passes <N>] [--nofec] [--fec-parity <N>]\r\n" +
                       "  TrFileTransfer recv --port <端口> [--out <目录>] [--tcp|--udt|--udp] [--code <配对码>] [--count <N>]\r\n" +
                       "  TrFileTransfer sync --folder <目录> --ip <IP> --port <端口> [--tcp|--udt]\r\n" +
                       "        [--code <配对码>] [--limit <KB/s>] [--srcport <端口>] [--nocompress] [--noencrypt]\r\n" +
@@ -885,14 +885,14 @@ namespace TrFileTransfer
                       "\r\n" +
                       "send: 发送一个文件或文件夹后退出（退出码 0=成功）。--udp 为单向传输：仅单文件，\r\n" +
                       "      无配对码/加密/压缩；--passes <N> 自动连发 N 轮对抗丢包；默认启用前向纠错\r\n" +
-                      "      （XOR 奇偶 + 交错发送），--nofec 关闭。\r\n" +
+                      "      （RS 纠删 + 交错发送，每组 2 份奇偶），--fec-parity <1-8> 调冗余，--nofec 关闭。\r\n" +
                       "recv: 接收直到 Ctrl+C，或收到 --count 个文件后退出。\r\n" +
                       "sync: 增量同步一个文件夹（只传差异），适合任务计划程序定时备份。\r\n" +
                       "verify: 用本地校验缓存核对目录中文件是否与接收时一致（发现改动退出码为 1）。\r\n" +
                       "默认协议 TCP；--nocompress/--noencrypt 关闭压缩/加密协商。"
                     : "Usage:\r\n" +
                       "  TrFileTransfer send --ip <IP> --port <port> [--tcp|--udt|--udp] --file <path|--folder <path>\r\n" +
-                      "        [--code <pairing code>] [--limit <KB/s>] [--srcport <port>] [--nocompress] [--noencrypt] [--passes <N>] [--nofec]\r\n" +
+                      "        [--code <pairing code>] [--limit <KB/s>] [--srcport <port>] [--nocompress] [--noencrypt] [--passes <N>] [--nofec] [--fec-parity <N>]\r\n" +
                       "  TrFileTransfer recv --port <port> [--out <dir>] [--tcp|--udt|--udp] [--code <pairing code>] [--count <N>]\r\n" +
                       "  TrFileTransfer sync --folder <dir> --ip <IP> --port <port> [--tcp|--udt]\r\n" +
                       "        [--code <pairing code>] [--limit <KB/s>] [--srcport <port>] [--nocompress] [--noencrypt]\r\n" +
@@ -901,7 +901,8 @@ namespace TrFileTransfer
                       "send: sends one file or folder, then exits (exit code 0 = success). --udp is\r\n" +
                       "      one-way: single file only, no code/encryption/compression; --passes <N>\r\n" +
                       "      re-sends the whole file N times to ride out loss. Forward error\r\n" +
-                      "      correction (XOR parity + interleaving) is on by default; --nofec disables it.\r\n" +
+                      "      correction (RS erasure coding + interleaving, 2 parity rows per group)\r\n" +
+                      "      is on by default; --fec-parity <1-8> sets the redundancy, --nofec disables it.\r\n" +
                       "recv: receives until Ctrl+C, or until --count files have arrived.\r\n" +
                       "sync: incremental folder sync (differences only) — for scheduled backups.\r\n" +
                       "verify: checks the directory's files against the local digest cache\r\n" +
