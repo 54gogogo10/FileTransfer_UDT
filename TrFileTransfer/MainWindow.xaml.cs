@@ -695,6 +695,7 @@ namespace TrFileTransfer
             _rbClientTcp.IsChecked = clientProto != "UDT" && clientProto != "UDP";
             _rbClientUdt.IsChecked = clientProto == "UDT";
             _rbClientUdp.IsChecked = clientProto == "UDP";
+            UpdateUdpOnlyParams(); // explicit: the Checked handlers early-return pre-load
 
             _txtPortTcp.Text = Config.Get("ServerPortTCP", "8080");
             _txtPortUdt.Text = Config.Get("ServerPortUDT", "8080");
@@ -1466,6 +1467,7 @@ namespace TrFileTransfer
         /// hand-typed port matching no tab is left alone.</summary>
         private void RdoClientProto_Checked(object sender, RoutedEventArgs e)
         {
+            UpdateUdpOnlyParams();
             var rb = sender as RadioButton;
             if (rb == null || rb.IsChecked != true || !IsLoaded) return;
             ServerTab selected = rb == _rbClientTcp ? _tabTcp : (rb == _rbClientUdt ? _tabUdt : _tabUdp);
@@ -1484,6 +1486,18 @@ namespace TrFileTransfer
                     return;
                 }
             }
+        }
+
+        /// <summary>重发轮数/奇偶份数 only exist for the one-way UDP send: TCP and UDT
+        /// have a real connection (loss is the transport's problem), so the two fields
+        /// collapse away entirely while either of those protocols is selected.</summary>
+        private void UpdateUdpOnlyParams()
+        {
+            if (_grpUdpPasses == null) return; // XAML not fully parsed yet
+            bool udp = _rbClientUdp.IsChecked == true;
+            Visibility v = udp ? Visibility.Visible : Visibility.Collapsed;
+            _grpUdpPasses.Visibility = v;
+            _grpUdpParity.Visibility = v;
         }
 
         private static int ParsePortText(string s)

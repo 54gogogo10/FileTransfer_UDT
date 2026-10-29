@@ -326,12 +326,14 @@
                             <TextBox x:Name="_txtPairing" Width="106" MaxLength="12" Style="{StaticResource TxtInput}"
                                      Margin="0,4,0,0"/>
                         </StackPanel>
-                        <StackPanel Orientation="Vertical">
+                        <!-- UDP-only params: collapsed unless the UDP protocol is selected
+                             (passes/parity mean nothing to TCP/UDT) -->
+                        <StackPanel x:Name="_grpUdpPasses" Orientation="Vertical">
                             <TextBlock x:Name="_lblUdpPasses" Style="{StaticResource FieldLabelSmall}"/>
                             <local:NumericBox x:Name="_numUdpPasses" Width="56" Min="1" Max="5" Margin="0,4,0,0"
                                               ToolTipService.ShowOnDisabled="True"/>
                         </StackPanel>
-                        <StackPanel Orientation="Vertical">
+                        <StackPanel x:Name="_grpUdpParity" Orientation="Vertical">
                             <TextBlock x:Name="_lblUdpParity" Style="{StaticResource FieldLabelSmall}"/>
                             <local:NumericBox x:Name="_numUdpParity" Width="56" Min="1" Max="8" Margin="0,4,0,0"
                                               ToolTipService.ShowOnDisabled="True"/>
