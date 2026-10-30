@@ -58,7 +58,6 @@
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="Auto"/>
-                        <RowDefinition Height="Auto"/>
                     </Grid.RowDefinitions>
 
                     <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
@@ -79,6 +78,7 @@
                                 <Grid.RowDefinitions>
                                     <RowDefinition Height="Auto"/>
                                     <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
                                 </Grid.RowDefinitions>
                                 <Grid Grid.Row="0" Margin="0,0,0,7">
                                     <Grid.ColumnDefinitions>
@@ -93,7 +93,21 @@
                                     <TextBox x:Name="_txtPortTcp" Grid.Column="3" Style="{StaticResource TxtInput}"
                                              VerticalAlignment="Center"/>
                                 </Grid>
-                                <DockPanel Grid.Row="1" LastChildFill="False">
+                                <!-- Per-protocol save dir: each tab owns its folder, frozen
+                                     only while THIS tab serves -->
+                                <Grid Grid.Row="1" Margin="0,0,0,7">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="_lblSaveDirTcp" Style="{StaticResource FieldLabel}" Margin="0,0,6,0"/>
+                                    <TextBox x:Name="_txtSaveDirTcp" Grid.Column="1" Style="{StaticResource TxtInput}"
+                                             VerticalAlignment="Center"/>
+                                    <Button x:Name="_btnBrowseDirTcp" Grid.Column="2" Style="{StaticResource BtnSecondary}"
+                                            MinWidth="64" Margin="8,0,0,0" Click="BtnBrowseDir_Click"/>
+                                </Grid>
+                                <DockPanel Grid.Row="2" LastChildFill="False">
                                     <StackPanel Orientation="Horizontal" DockPanel.Dock="Right">
                                         <Button x:Name="_btnStartTcp" Style="{StaticResource BtnPrimary}" MinWidth="72"
                                                 Click="BtnStartTcp_Click"/>
@@ -106,6 +120,7 @@
                         <TabItem x:Name="_tabUdtItem" Style="{StaticResource TabModernItem}" Header="UDT">
                             <Grid>
                                 <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
                                     <RowDefinition Height="Auto"/>
                                     <RowDefinition Height="Auto"/>
                                 </Grid.RowDefinitions>
@@ -122,7 +137,19 @@
                                     <TextBox x:Name="_txtPortUdt" Grid.Column="3" Style="{StaticResource TxtInput}"
                                              VerticalAlignment="Center"/>
                                 </Grid>
-                                <DockPanel Grid.Row="1" LastChildFill="False">
+                                <Grid Grid.Row="1" Margin="0,0,0,7">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="_lblSaveDirUdt" Style="{StaticResource FieldLabel}" Margin="0,0,6,0"/>
+                                    <TextBox x:Name="_txtSaveDirUdt" Grid.Column="1" Style="{StaticResource TxtInput}"
+                                             VerticalAlignment="Center"/>
+                                    <Button x:Name="_btnBrowseDirUdt" Grid.Column="2" Style="{StaticResource BtnSecondary}"
+                                            MinWidth="64" Margin="8,0,0,0" Click="BtnBrowseDir_Click"/>
+                                </Grid>
+                                <DockPanel Grid.Row="2" LastChildFill="False">
                                     <StackPanel Orientation="Horizontal" DockPanel.Dock="Right">
                                         <Button x:Name="_btnStartUdt" Style="{StaticResource BtnPrimary}" MinWidth="72"
                                                 Click="BtnStartUdt_Click"/>
@@ -135,6 +162,7 @@
                         <TabItem x:Name="_tabUdpItem" Style="{StaticResource TabModernItem}" Header="UDP">
                             <Grid>
                                 <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
                                     <RowDefinition Height="Auto"/>
                                     <RowDefinition Height="Auto"/>
                                 </Grid.RowDefinitions>
@@ -151,7 +179,19 @@
                                     <TextBox x:Name="_txtPortUdp" Grid.Column="3" Style="{StaticResource TxtInput}"
                                              VerticalAlignment="Center"/>
                                 </Grid>
-                                <DockPanel Grid.Row="1" LastChildFill="False">
+                                <Grid Grid.Row="1" Margin="0,0,0,7">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock x:Name="_lblSaveDirUdp" Style="{StaticResource FieldLabel}" Margin="0,0,6,0"/>
+                                    <TextBox x:Name="_txtSaveDirUdp" Grid.Column="1" Style="{StaticResource TxtInput}"
+                                             VerticalAlignment="Center"/>
+                                    <Button x:Name="_btnBrowseDirUdp" Grid.Column="2" Style="{StaticResource BtnSecondary}"
+                                            MinWidth="64" Margin="8,0,0,0" Click="BtnBrowseDir_Click"/>
+                                </Grid>
+                                <DockPanel Grid.Row="2" LastChildFill="False">
                                     <StackPanel Orientation="Horizontal" DockPanel.Dock="Right">
                                         <Button x:Name="_btnStartUdp" Style="{StaticResource BtnPrimary}" MinWidth="72"
                                                 Click="BtnStartUdp_Click"/>
@@ -163,22 +203,8 @@
                         </TabItem>
                     </TabControl>
 
-                    <!-- Save dir -->
+                    <!-- Actions: open/recent (start/stop and save dir live inside each protocol tab) -->
                     <Grid Grid.Row="2" Margin="0,0,0,8">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="Auto"/>
-                        </Grid.ColumnDefinitions>
-                        <TextBlock x:Name="_lblSaveDir" Style="{StaticResource FieldLabel}" Margin="0,0,6,0"/>
-                        <TextBox x:Name="_txtSaveDir" Grid.Column="1" Style="{StaticResource TxtInput}"
-                                 VerticalAlignment="Center"/>
-                        <Button x:Name="_btnBrowseDir" Grid.Column="2" Style="{StaticResource BtnSecondary}"
-                                MinWidth="64" Margin="8,0,0,0" Click="BtnBrowseDir_Click"/>
-                    </Grid>
-
-                    <!-- Actions: open/recent (start/stop live inside each family tab) -->
-                    <Grid Grid.Row="3" Margin="0,0,0,8">
                         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                             <Button x:Name="_btnOpenDir" Style="{StaticResource BtnSecondary}" MinWidth="76"
                                     Click="BtnOpenDir_Click"/>
@@ -188,7 +214,7 @@
                     </Grid>
 
                     <!-- Services: HTTP share | pairing -->
-                    <StackPanel Grid.Row="4" Orientation="Horizontal">
+                    <StackPanel Grid.Row="3" Orientation="Horizontal">
                         <TextBlock x:Name="_lblHttpPort" Style="{StaticResource FieldLabel}" Margin="0,0,6,0"/>
                         <local:NumericBox x:Name="_numHttpPort" Width="84" Min="1" Max="65535" VerticalAlignment="Center"/>
                         <Button x:Name="_btnHttpShare" Style="{StaticResource BtnSecondary}" MinWidth="76"
@@ -205,7 +231,7 @@
                     </StackPanel>
 
                     <!-- Receive options: security gates + stats + history + devices + verify + sessions -->
-                    <StackPanel Grid.Row="5" Orientation="Horizontal" Margin="0,0,0,0">
+                    <StackPanel Grid.Row="4" Orientation="Horizontal" Margin="0,0,0,0">
                         <Button x:Name="_btnRecvOptions" Style="{StaticResource BtnSecondary}" MinWidth="88"
                                 Click="BtnRecvOptions_Click"/>
                         <Button x:Name="_btnStats" Style="{StaticResource BtnSecondary}" MinWidth="68"
@@ -321,10 +347,22 @@
                         </StackPanel>
                         <Rectangle Width="1" Height="30" RadiusX="0.5" RadiusY="0.5"
                                    Fill="{DynamicResource Brush.CardBorder}" VerticalAlignment="Center" Margin="12,0"/>
-                        <StackPanel Orientation="Vertical">
+                        <StackPanel Orientation="Vertical" Margin="0,0,10,0">
                             <TextBlock x:Name="_lblPairingC" Style="{StaticResource FieldLabelSmall}"/>
                             <TextBox x:Name="_txtPairing" Width="106" MaxLength="12" Style="{StaticResource TxtInput}"
                                      Margin="0,4,0,0"/>
+                        </StackPanel>
+                        <!-- UDP-only params: collapsed unless the UDP protocol is selected
+                             (passes/parity mean nothing to TCP/UDT) -->
+                        <StackPanel x:Name="_grpUdpPasses" Orientation="Vertical">
+                            <TextBlock x:Name="_lblUdpPasses" Style="{StaticResource FieldLabelSmall}"/>
+                            <local:NumericBox x:Name="_numUdpPasses" Width="56" Min="1" Max="5" Margin="0,4,0,0"
+                                              ToolTipService.ShowOnDisabled="True"/>
+                        </StackPanel>
+                        <StackPanel x:Name="_grpUdpParity" Orientation="Vertical">
+                            <TextBlock x:Name="_lblUdpParity" Style="{StaticResource FieldLabelSmall}"/>
+                            <local:NumericBox x:Name="_numUdpParity" Width="56" Min="1" Max="8" Margin="0,4,0,0"
+                                              ToolTipService.ShowOnDisabled="True"/>
                         </StackPanel>
                     </StackPanel>
 

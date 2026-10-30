@@ -52,6 +52,7 @@ namespace TrFileTransfer
             };
             _panel = new StackPanel();
             listScroll.Content = _panel;
+            _popupContent = listScroll;
 
             _popup = new Popup
             {
@@ -59,15 +60,7 @@ namespace TrFileTransfer
                 PlacementTarget = _summary,
                 Placement = PlacementMode.Bottom,
                 AllowsTransparency = true,
-                Child = new Border
-                {
-                    Background = (Brush)TryFindResource("Brush.ItemCard"),
-                    BorderBrush = (Brush)TryFindResource("Brush.CardBorder"),
-                    BorderThickness = new Thickness(1),
-                    CornerRadius = new CornerRadius(6),
-                    Padding = new Thickness(8, 6, 8, 6),
-                    Child = listScroll
-                }
+                Child = CreatePopupBorder()
             };
 
             var grid = new Grid();
@@ -87,6 +80,25 @@ namespace TrFileTransfer
             UpdateSummary();
         }
 
+        /// <summary>The popup outlives theme switches, and ThemeManager REPLACES brush
+        /// instances in the token dictionary — a brush captured here would freeze the
+        /// old palette forever. Resource references re-resolve on every switch.</summary>
+        private System.Windows.Controls.Border CreatePopupBorder()
+        {
+            var border = new System.Windows.Controls.Border
+            {
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(6),
+                Padding = new Thickness(8, 6, 8, 6),
+                Child = _popupContent
+            };
+            border.SetResourceReference(Border.BackgroundProperty, "Brush.ItemCard");
+            border.SetResourceReference(Border.BorderBrushProperty, "Brush.CardBorder");
+            return border;
+        }
+
+        private readonly System.Windows.Controls.ScrollViewer _popupContent;
+
         /// <summary>Replaces the item list (addresses + wildcard entries); selection is
         /// by IPAddress value, so a refresh keeps what is still present.</summary>
         public void SetItems(IEnumerable<KeyValuePair<IPAddress, string>> items)
@@ -97,12 +109,10 @@ namespace TrFileTransfer
             foreach (var kv in items)
             {
                 IPAddress addr = kv.Key;
-                bool wildcard = Utils.IsWildcardAddress(addr);
                 var box = new CheckBox
                 {
                     Style = (Style)TryFindResource("ChkBox"),
                     Content = kv.Value,
-                    Tag = wildcard ? "wildcard" : null,
                     Margin = new Thickness(0, 0, 0, 4),
                     MinWidth = 170,
                     HorizontalAlignment = HorizontalAlignment.Left

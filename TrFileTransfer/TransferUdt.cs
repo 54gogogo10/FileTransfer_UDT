@@ -418,7 +418,22 @@ namespace TrFileTransfer
             // Receive-option policy (byte-for-byte verification, digest lifetime) applies from
             // here on — the options dialog promises these take effect on the next server start.
             FileHashCache.ForServer.ApplyConfig();
-            UdtDll.EnsureExtracted();
+            // DLL extraction (AV locks can survive the internal retries) follows the
+            // same failure convention as a failed bind: log + OnError + OnStopped,
+            // never an exception escaping Start() into the global crash handler.
+            try
+            {
+                UdtDll.EnsureExtracted();
+            }
+            catch (Exception ex)
+            {
+                Log(L.S_BindFailed(_bindAddress, _port.ToString(), ex.Message));
+                var errHandler = OnError;
+                if (errHandler != null) errHandler(ex.Message);
+                var stoppedHandler = OnStopped;
+                if (stoppedHandler != null) stoppedHandler();
+                return;
+            }
 
             // The save directory may legitimately not exist yet (date-archive mode
             // appends a yyyy-MM-dd child); single-file receivers write straight
@@ -599,17 +614,28 @@ namespace TrFileTransfer
             var connectedHandler = OnClientConnected;
             if (connectedHandler != null) connectedHandler(clientEp);
 
-            Action<TransferProgress> clientProgress = p =>
-            {
-                var ch = OnClientProgress; if (ch != null) ch(clientEp, p);
-            };
-            OnProgress += clientProgress;
-
             var ws = new UdtWireStream(clientSocket, true);
             try
             {
                 string clientIp = clientEp != null ? clientEp.Address.ToString() : null;
-                WireOutcome outcome = await ServerWire.HandleClientAsync(ws, _wire, ct, clientIp).ConfigureAwait(false);
+                // Progress scoped to THIS connection via the session hook — the shared
+                // delegate fanned every connection's progress to every handler and
+                // cross-filled concurrent clients' cards. OnProgress still fires for
+                // anyone subscribed to the transport-level event.
+                WireOutcome outcome = await ServerWire.HandleClientAsync(ws, _wire, ct, clientIp, delegate(ServerWireContext session)
+                {
+                    session.Cb.Progress = delegate(TransferProgress p)
+                    {
+                        var ph = OnClientProgress; if (ph != null) ph(clientEp, p);
+                        var h = OnProgress; if (h != null) h(p);
+                    };
+                }).ConfigureAwait(false);
+
+                // Statistics for every successful transfer, unconditionally (mirrors the
+                // TCP server): 0x03's own-verdict branch has no ACK of its own, and
+                // stats used to be raised only in the ACK-carrying branches — so the
+                // common UDT single-file receive never reached stats.log.
+                RaiseSessionStats(outcome);
 
                 if (outcome.IsChunked)
                 {
@@ -620,7 +646,6 @@ namespace TrFileTransfer
                         // assembled-file completion fires separately.
                         var ack2 = new byte[1] { 0x01 };
                         await Task.Run(() => UdtNative.udt_send(clientSocket, ack2, 1, 0), ct).ConfigureAwait(false);
-                        RaiseSessionStats(outcome);
                     }
                     else
                     {
@@ -636,7 +661,6 @@ namespace TrFileTransfer
                     // Flows with their own terminal response (0x03's final 0x10 status)
                     // get NO transport ACK: the client is already synchronized on that
                     // response, and a redundant ACK here would race the client's close.
-                    RaiseSessionStats(outcome);
                     var ack = new byte[1] { 0x01 };
                     await Task.Run(() => UdtNative.udt_send(clientSocket, ack, 1, 0), ct).ConfigureAwait(false);
                 }
@@ -663,7 +687,6 @@ namespace TrFileTransfer
             }
             finally
             {
-                OnProgress -= clientProgress;
                 lock (_clientSockets) { _clientSockets.Remove(clientSocket); }
                 ws.Dispose(); // closes the native socket, unblocking pending I/O
                 System.Threading.Interlocked.Decrement(ref _activeClients);
@@ -863,11 +886,13 @@ namespace TrFileTransfer
             _isRunning = true;
             _wasCancelled = false;
 
-            var startedHandler = OnStarted;
-            if (startedHandler != null) startedHandler();
-
             try
             {
+                // Inside the try: a throwing handler must not leave IsRunning stuck
+                // with OnStopped never firing (the finally also unwinds UdtStartup).
+                var startedHandler = OnStarted;
+                if (startedHandler != null) startedHandler();
+
                 UdtDll.EnsureExtracted();
                 if (!UdtNative.UdtStartup())
                     throw new Exception("UDT library init failed");
@@ -901,7 +926,25 @@ namespace TrFileTransfer
                 _wasCancelled = true;
                 Log(L.C_TransferCancelled);
             }
-            catch (ObjectDisposedException) { }
+            catch (ObjectDisposedException)
+            {
+                // A cancel-induced ODE (socket closed under pending I/O) is a
+                // deliberate cancel; anything else is a real lifecycle failure and
+                // must not read as success — swallow it and the caller records a
+                // transfer that never happened.
+                if (_cts != null && _cts.IsCancellationRequested)
+                {
+                    _wasCancelled = true;
+                    Log(L.C_TransferCancelled);
+                }
+                else
+                {
+                    Log(L.C_Error("object disposed"));
+                    var handler = OnError;
+                    if (handler != null) handler("object disposed");
+                    throw;
+                }
+            }
             catch (Exception ex)
             {
                 Log(L.C_Error(ex.Message));
@@ -1108,10 +1151,10 @@ namespace TrFileTransfer
             _cts = new CancellationTokenSource();
             _isRunning = true;
             _wasCancelled = false;
-            var startedHandler = OnStarted;
-            if (startedHandler != null) startedHandler();
             try
             {
+                var startedHandler = OnStarted;
+                if (startedHandler != null) startedHandler();
                 UdtDll.EnsureExtracted();
                 if (!UdtNative.UdtStartup())
                     throw new Exception("UDT library init failed");

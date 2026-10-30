@@ -40,18 +40,29 @@ namespace TrFileTransfer
         {
             try
             {
-                var loaded = new Dictionary<string, string>();
-                if (File.Exists(_path))
+                Dictionary<string, string> loaded = null;
+                try
                 {
-                    foreach (var line in File.ReadAllLines(_path))
-                    {
-                        int idx = line.IndexOf('=');
-                        // Reject a missing '=' or an empty key, but keep empty values:
-                        // "key=" must round-trip (it is how "cleared" is stored).
-                        if (idx <= 0) continue;
-                        loaded[line.Substring(0, idx)] = line.Substring(idx + 1);
-                    }
+                    loaded = ReadFile(_path);
                 }
+                catch
+                {
+                    loaded = null;
+                }
+                // Self-heal: an existing-but-unreadable/truncated config falls back to
+                // the previous generation (.bak). A MISSING config stays a fresh start
+                // on purpose — deleting config.ini is how a user resets everything.
+                if (File.Exists(_path) && (loaded == null || loaded.Count == 0)
+                    && File.Exists(_path + ".bak"))
+                {
+                    try
+                    {
+                        var fromBak = ReadFile(_path + ".bak");
+                        if (fromBak.Count > 0) loaded = fromBak;
+                    }
+                    catch { }
+                }
+                if (loaded == null) loaded = new Dictionary<string, string>();
                 // Swap under the lock so readers never observe a half-filled table
                 lock (_lock)
                 {
@@ -60,6 +71,21 @@ namespace TrFileTransfer
                 }
             }
             catch { }
+        }
+
+        private static Dictionary<string, string> ReadFile(string path)
+        {
+            var loaded = new Dictionary<string, string>();
+            if (!File.Exists(path)) return loaded;
+            foreach (var line in File.ReadAllLines(path))
+            {
+                int idx = line.IndexOf('=');
+                // Reject a missing '=' or an empty key, but keep empty values:
+                // "key=" must round-trip (it is how "cleared" is stored).
+                if (idx <= 0) continue;
+                loaded[line.Substring(0, idx)] = line.Substring(idx + 1);
+            }
+            return loaded;
         }
 
         public static void Save()
@@ -75,7 +101,24 @@ namespace TrFileTransfer
                     foreach (var kv in _values)
                         lines[i++] = kv.Key + "=" + kv.Value;
                 }
-                File.WriteAllLines(_path, lines);
+                // Write-then-swap so a crash mid-save can never truncate the live
+                // file; the previous good generation stays one step back in .bak.
+                string tmp = _path + ".tmp";
+                File.WriteAllLines(tmp, lines);
+                try
+                {
+                    if (File.Exists(_path)) File.Copy(_path, _path + ".bak", true);
+                }
+                catch { }
+                if (File.Exists(_path))
+                {
+                    try { File.Replace(tmp, _path, null); }
+                    catch { File.Delete(_path); File.Move(tmp, _path); }
+                }
+                else
+                {
+                    File.Move(tmp, _path);
+                }
             }
             catch { }
         }

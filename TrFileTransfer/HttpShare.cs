@@ -312,6 +312,12 @@ namespace TrFileTransfer
 
                     if (method == "POST")
                     {
+                        string delArg;
+                        if (args.TryGetValue("del", out delArg))
+                        {
+                            await HandleDeleteAsync(ns, headers, delArg, args, peer, ct).ConfigureAwait(false);
+                            return;
+                        }
                         await HandleUploadAsync(ns, reader, headers, query, peer, ct).ConfigureAwait(false);
                         return;
                     }
@@ -329,6 +335,14 @@ namespace TrFileTransfer
                     }
                     else
                     {
+                        string delConfirmArg;
+                        if (args.TryGetValue("delconfirm", out delConfirmArg))
+                        {
+                            string pBack;
+                            args.TryGetValue("p", out pBack);
+                            await ServeDeleteConfirmAsync(ns, delConfirmArg, pBack, ct).ConfigureAwait(false);
+                            return;
+                        }
                         string pArg;
                         args.TryGetValue("p", out pArg);
                         await ServeListingAsync(ns, pArg, query, ct).ConfigureAwait(false);
@@ -580,6 +594,151 @@ namespace TrFileTransfer
                 "\r\nSet-Cookie: t=" + token + "; Path=/; HttpOnly; SameSite=Strict" +
                 "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             await ns.WriteAsync(resp, 0, resp.Length, ct).ConfigureAwait(false);
+        }
+
+        // ---- Delete (form POST ?del=<rel>) ----
+
+        /// <summary>Deletes ONE file from the share — never a directory, so a single
+        /// tap cannot erase a tree. Auth is the token gate plus a same-origin check:
+        /// without it any visited website could auto-submit this form against a
+        /// tokenless LAN share (browsers POST cross-origin happily, no cookie needed).</summary>
+        private async Task HandleDeleteAsync(NetworkStream ns, Dictionary<string, string> headers,
+            string rawRel, Dictionary<string, string> args, string peer, CancellationToken ct)
+        {
+            if (!SameOriginOrNoOrigin(headers))
+            {
+                await WriteSimpleAsync(ns, 403, "Forbidden", ct).ConfigureAwait(false);
+                return;
+            }
+
+            string full = ResolveSafe(rawRel);
+            if (full == null)
+            {
+                await WriteSimpleAsync(ns, 404, "Not Found", ct).ConfigureAwait(false);
+                return;
+            }
+            // C# 5: no await inside catch — flags decided in catch, acted on after
+            bool missing = false, locked = false;
+            FileAttributes attr;
+            try { attr = File.GetAttributes(full); }
+            catch { missing = true; attr = FileAttributes.Normal; }
+            if (missing)
+            {
+                await WriteSimpleAsync(ns, 404, "Not Found", ct).ConfigureAwait(false);
+                return;
+            }
+            if ((attr & FileAttributes.Directory) != 0)
+            {
+                await WriteSimpleAsync(ns, 400, "Directories Not Deletable", ct).ConfigureAwait(false);
+                return;
+            }
+            try
+            {
+                File.Delete(full);
+            }
+            catch
+            {
+                locked = true;
+            }
+            if (locked)
+            {
+                await WriteSimpleAsync(ns, 500, "Delete Failed (file locked?)", ct).ConfigureAwait(false);
+                return;
+            }
+            var handler = OnLog;
+            if (handler != null)
+                handler("[HTTP] " + peer + " deleted: " + Path.GetFileName(full));
+            string back;
+            args.TryGetValue("p", out back);
+            string loc = "/?p=" + Uri.EscapeDataString(back ?? "");
+            await WriteRedirectAsync(ns, loc, _token, ct).ConfigureAwait(false);
+        }
+
+        /// <summary>Browsers stamp form POSTs with an Origin header (older ones still
+        /// send Referer on cross-site form posts) — a cross-site forged POST shows
+        /// the attacker's origin against our Host. Scripted clients that send
+        /// neither pass untouched (curl must keep working).</summary>
+        private static bool SameOriginOrNoOrigin(Dictionary<string, string> headers)
+        {
+            string ourHost;
+            headers.TryGetValue("Host", out ourHost);
+            ourHost = StripDefaultPort((ourHost ?? "").Trim());
+            string origin;
+            if (headers.TryGetValue("Origin", out origin) && !string.IsNullOrEmpty(origin))
+                return UrlHostEquals(origin, ourHost);
+            string referer;
+            if (headers.TryGetValue("Referer", out referer) && !string.IsNullOrEmpty(referer))
+                return UrlHostEquals(referer, ourHost);
+            return true;
+        }
+
+        /// <summary>Extracts authority (host[:port]) from an absolute URL and compares
+        /// it to the request's Host after default-port normalization.</summary>
+        private static bool UrlHostEquals(string url, string ourHost)
+        {
+            int scheme = url.IndexOf("://", StringComparison.Ordinal);
+            string authority = scheme >= 0 ? url.Substring(scheme + 3) : url;
+            int slash = authority.IndexOf('/');
+            if (slash >= 0) authority = authority.Substring(0, slash);
+            return string.Equals(StripDefaultPort(authority), ourHost, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string StripDefaultPort(string hostAndPort)
+        {
+            int colon = hostAndPort.LastIndexOf(':');
+            if (colon < 0) return hostAndPort;
+            string port = hostAndPort.Substring(colon + 1);
+            if (port == "80" || port == "443") return hostAndPort.Substring(0, colon);
+            return hostAndPort;
+        }
+
+        /// <summary>No-JS two-step confirm (the CSP allows no inline script): ✕ links
+        /// here, the page carries the one real POST button.</summary>
+        private async Task ServeDeleteConfirmAsync(NetworkStream ns, string rawRel, string backDir,
+            CancellationToken ct)
+        {
+            string full = ResolveSafe(rawRel);
+            bool fileOk = false;
+            long size = 0;
+            if (full != null)
+            {
+                try
+                {
+                    var fi = new FileInfo(full);
+                    fileOk = fi.Exists;
+                    if (fileOk) size = fi.Length;
+                }
+                catch { }
+            }
+            if (!fileOk)
+            {
+                await WriteSimpleAsync(ns, 404, "Not Found", ct).ConfigureAwait(false);
+                return;
+            }
+
+            string name = Path.GetFileName(full);
+            string back = backDir ?? "";
+            var sb = new StringBuilder();
+            sb.Append("<!doctype html><html><head><meta charset=\"utf-8\">");
+            sb.Append("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">");
+            sb.Append("<title>").Append(HtmlEscape(L.HttpShareDeleteTitle)).Append("</title><style>");
+            sb.Append("body{font-family:system-ui,sans-serif;margin:0;background:#f3f4f6}");
+            sb.Append("div{max-width:480px;margin:48px auto;background:#fff;padding:24px;border-radius:10px;text-align:center}");
+            sb.Append("form{display:inline-block;margin:0 8px}");
+            sb.Append("input{padding:10px 22px;border:0;border-radius:8px;font-size:1rem;cursor:pointer}");
+            sb.Append(".yes{background:#c62828;color:#fff}.no{background:#e5e7eb;color:#333}");
+            sb.Append("</style></head><body><div>");
+            sb.Append("<p>").Append(HtmlEscape(L.HttpShareDeleteConfirm(name, Utils.FormatSize(size)))).Append("</p>");
+            sb.Append("<form method=\"post\" action=\"/?p=").Append(Uri.EscapeDataString(back))
+              .Append("&del=").Append(Uri.EscapeDataString(rawRel)).Append("\">")
+              .Append("<input class=\"yes\" type=\"submit\" value=\"").Append(HtmlEscape(L.HttpShareDeleteBtn)).Append("\">")
+              .Append("</form>");
+            sb.Append("<form method=\"get\" action=\"/\"><input type=\"hidden\" name=\"p\" value=\"")
+              .Append(HtmlEscape(back)).Append("\"><input class=\"no\" type=\"submit\" value=\"")
+              .Append(HtmlEscape(L.HttpShareCancelBtn)).Append("\"></form>");
+            sb.Append("</div></body></html>");
+            await WriteBytesAsync(ns, "200 OK", "text/html; charset=utf-8",
+                Encoding.UTF8.GetBytes(sb.ToString()), ct).ConfigureAwait(false);
         }
 
         // ---- Upload (multipart/form-data POST) ----
@@ -840,7 +999,17 @@ namespace TrFileTransfer
                 string size = isDir ? "&lt;dir&gt;" : Utils.FormatSize(((FileInfo)e).Length);
                 sb.Append("<li><a href=\"").Append(HtmlEscape(href)).Append("\">")
                   .Append(isDir ? "&#128193; " : "&#128196; ").Append(HtmlEscape(e.Name))
-                  .Append(isDir ? "/" : "").Append("</a><span>").Append(size).Append("</span></li>");
+                  .Append(isDir ? "/" : "").Append("</a><span style=\"display:flex;gap:10px;align-items:center\">")
+                  .Append("<span>").Append(size).Append("</span>");
+                if (!isDir)
+                {
+                    // ✕ steps to a no-JS confirm page (CSP allows no inline script);
+                    // the actual delete is the POST behind it
+                    sb.Append("<a style=\"color:#c62828;font-weight:bold;text-decoration:none\" href=\"?delconfirm=")
+                      .Append(Uri.EscapeDataString(rel)).Append("&amp;p=").Append(Uri.EscapeDataString(rawRel))
+                      .Append("\">&#10005;</a>");
+                }
+                sb.Append("</span></li>");
             }
             if (entries.Count == 0)
                 sb.Append("<li><span>").Append(L.HttpShareEmpty).Append("</span></li>");
@@ -875,6 +1044,8 @@ namespace TrFileTransfer
                 if (pairs[i].Length == 0) continue;
                 if (pairs[i].StartsWith("p=", StringComparison.Ordinal) ||
                     pairs[i].StartsWith("f=", StringComparison.Ordinal) ||
+                    pairs[i].StartsWith("del=", StringComparison.Ordinal) ||
+                    pairs[i].StartsWith("delconfirm=", StringComparison.Ordinal) ||
                     pairs[i] == "t" ||
                     pairs[i].StartsWith("t=", StringComparison.Ordinal)) continue;
                 kept.Append("&").Append(pairs[i]);

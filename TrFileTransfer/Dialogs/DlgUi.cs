@@ -25,10 +25,13 @@ namespace TrFileTransfer
             w.Height = Math.Min(height, waH - 24);
             w.MinWidth = Math.Min(minW, w.Width);
             w.MinHeight = Math.Min(minH, w.Height);
-            w.Background = Res<Brush>("Brush.Window");
+            // Resource references, not captured brushes: ThemeManager REPLACES the
+            // token-dictionary instances on a switch, so a captured brush would keep
+            // the previous palette forever on dialogs opened across a switch
+            w.SetResourceReference(Window.BackgroundProperty, "Brush.Window");
             // Inheritable default so bare TextBlocks (no explicit style/foreground)
             // don't fall back to black system text on the dark window background.
-            w.Foreground = Res<Brush>("Brush.TextPrimary");
+            w.SetResourceReference(Window.ForegroundProperty, "Brush.TextPrimary");
             w.FontFamily = Res<FontFamily>("Font.Main");
             w.FontSize = 12;
             w.WindowStartupLocation = WindowStartupLocation.CenterOwner;

@@ -111,7 +111,9 @@ namespace TrFileTransfer
             {
                 var errHandler = OnError;
                 if (errHandler != null) errHandler("File is empty");
-                return;
+                // Rethrow so the caller reports a failure — a plain return made
+                // StartTransfer record the empty file as a successful send.
+                throw new IOException("File is empty");
             }
 
             int chunks = Math.Min(_concurrency,
@@ -169,7 +171,7 @@ namespace TrFileTransfer
             {
                 var errHandler = OnError;
                 if (errHandler != null) errHandler("File is empty");
-                return;
+                throw new IOException("File is empty"); // same rule as SendAsync
             }
 
             long[][] covered = null;
@@ -182,15 +184,21 @@ namespace TrFileTransfer
                 Log("Coverage query failed (" + ex.Message + ") — re-sending everything");
             }
 
-            // Build the gaps: complement of the covered ranges within [0, totalSize)
+            // Build the gaps: complement of the covered ranges within [0, totalSize).
+            // Server-reported ranges are clamped to that interval first — a hostile or
+            // corrupt answer with a negative end used to drive the resume cursor
+            // negative and wedge every subsequent chunk seek.
             var holes = new List<long[]>();
             long cursor = 0;
             if (covered != null)
             {
                 foreach (var r in covered)
                 {
-                    if (r[0] > cursor) holes.Add(new long[] { cursor, Math.Min(r[0], totalSize) });
-                    if (r[1] > cursor) cursor = r[1];
+                    long start = Math.Max(0, Math.Min(r[0], totalSize));
+                    long end = Math.Max(0, Math.Min(r[1], totalSize));
+                    if (end <= start) continue;
+                    if (start > cursor) holes.Add(new long[] { cursor, start });
+                    if (end > cursor) cursor = end;
                     if (cursor >= totalSize) break;
                 }
             }
@@ -308,7 +316,10 @@ namespace TrFileTransfer
                 string file = files[i];
                 long fileSize = 0;
                 try { fileSize = new FileInfo(file).Length; } catch { }
-                int localPort = FindLocalPort(i);
+                // Same ephemeral-port rule as SendAsync/ResumeAsync: FindLocalPort
+                // probes ports adjacent to the server port, and a UDT chunk socket
+                // (SO_REUSEADDR) silently shadows whatever already holds one.
+                int localPort = _srcPort > 0 ? FindLocalPort(i) : 0;
                 var task = Task.Run(async () =>
                 {
                     await semaphore.WaitAsync();
@@ -343,6 +354,7 @@ namespace TrFileTransfer
                 if (_cancelled) return;
                 var errHandler = OnError;
                 if (errHandler != null) errHandler("Concurrent folder transfer failed: " + ex.Message);
+                throw; // a failed send must not read as success to the caller
             }
         }
 
@@ -488,8 +500,10 @@ namespace TrFileTransfer
             {
                 progressHandler(new TransferProgress
                 {
-                    BytesTransferred = _transferredBytes,
-                    TotalBytes = _totalBytes,
+                    // Interlocked.Read: workers CAS these 64-bit counters and a 32-bit
+                    // runtime can tear a plain read into a garbage progress value
+                    BytesTransferred = System.Threading.Interlocked.Read(ref _transferredBytes),
+                    TotalBytes = System.Threading.Interlocked.Read(ref _totalBytes),
                     SpeedBytesPerSecond = 0,
                     Elapsed = TimeSpan.Zero,
                     FileName = displayName

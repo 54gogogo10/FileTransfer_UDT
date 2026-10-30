@@ -112,6 +112,7 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_FanOut_TwoTargets", FanOutTwoTargets);
             runner.Run("Integration_HTTP_Upload", HttpShareUpload);
             runner.Run("Integration_HTTP_UploadTokenAndTraversalName", HttpShareUploadTokenAndTraversalName);
+            runner.Run("Integration_HTTP_Delete", HttpShareDelete, 1);
             runner.Run("Integration_HTTP_AuthLockout", HttpShareAuthLockout);
             runner.Run("Integration_ResumeFullHash_BeforeConnect", () => ResumeFullHashBeforeConnect(false));
             runner.Run("Integration_UDT_ResumeFullHash_BeforeConnect", () => ResumeFullHashBeforeConnect(true), 1);
@@ -126,6 +127,8 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_TCP_FolderSync_ManyFilesNested", FolderSyncManyNested, 1);
             runner.Run("Integration_CLI_Sync", CliSync, 1);
             runner.Run("Integration_CLI_Verify", CliVerify, 1);
+            runner.Run("Integration_CLI_UDP_Recv", CliUdpRecv, 1);
+            runner.Run("Integration_CLI_UDP_Send", CliUdpSend, 1);
             runner.Run("Integration_TCP_CancelDuringFolderHash", CancelDuringFolderHash, 1);
             runner.Run("Integration_TCP_FolderSync_PerFileSkip", () => FolderSyncPerFileSkip(false), 1);
             runner.Run("Integration_UDT_FolderSync_PerFileSkip", () => FolderSyncPerFileSkip(true), 1);
@@ -147,9 +150,17 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_UDP_OneWay_SingleFile", UdpOneWaySingleFile, 1);
             runner.Run("Integration_UDP_OneWay_EmptyFile", UdpOneWayEmptyFile, 1);
             runner.Run("Integration_UDP_OneWay_LossyResume", UdpOneWayLossyResume, 1);
+            runner.Run("Integration_UDP_OneWay_ProgressThrottled", UdpOneWayProgressThrottled, 1);
+            runner.Run("Integration_UDP_OneWay_DuplicateSkip", UdpOneWayDuplicateSkip, 1);
+            runner.Run("Integration_UDP_MultiPass_NoDuplicates", UdpMultiPassNoDuplicates, 1);
+            runner.Run("Integration_UDP_MultiPass_LossyConverges", UdpMultiPassLossyConverges, 1);
+            runner.Run("Integration_UDP_Fec_SinglePassRecovers", UdpFecSinglePassRecovers, 1);
+            runner.Run("Integration_UDP_Fec_DoubleLoss_SinglePass", UdpFecDoubleLossSinglePass, 1);
             runner.Run("Integration_UDP_OneWay_GarbageRejected", UdpOneWayGarbageRejected, 1);
             runner.Run("Integration_UDP_V4V6_SamePort", UdpV4V6SamePort, 1);
             runner.Run("Integration_TCP_MultiAddressSamePort", TcpMultiAddressSamePort, 1);
+            runner.Run("Integration_TCP_ProgressIsolation", TcpProgressIsolation, 1);
+            runner.Run("Integration_UDT_Resumable_Stats", UdtResumableStats, 1);
         }
 
         /// <summary>
@@ -160,6 +171,135 @@ namespace TrFileTransfer.Tests
         /// though Windows would technically allow the bind — the app-side rule is pinned
         /// by Unit_BindConflictRules.)
         /// </summary>
+        /// <summary>
+        /// Per-connection progress must stay per-connection: the session-scoped
+        /// callbacks stamp each client's own endpoint, so with two concurrent senders
+        /// every progress event for endpoint A carries A's declared total — never B's.
+        /// (The shared-delegate wiring fanned every connection's progress out to every
+        /// subscribed handler, cross-filling concurrent clients' progress cards.)
+        /// </summary>
+        private static void TcpProgressIsolation()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_pi_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_pi_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferServer server = null;
+            try
+            {
+                long sizeA = 512 * 1024, sizeB = 128 * 1024;
+                string fileA = Path.Combine(sendDir, "big_a.bin");
+                string fileB = Path.Combine(sendDir, "small_b.bin");
+                var contentA = new byte[sizeA];
+                var contentB = new byte[sizeB];
+                new Random(401).NextBytes(contentA);
+                new Random(402).NextBytes(contentB);
+                File.WriteAllBytes(fileA, contentA);
+                File.WriteAllBytes(fileB, contentB);
+
+                server = new TransferServer("127.0.0.1", port, recvDir);
+                var started = new ManualResetEvent(false);
+                server.OnStarted += () => started.Set();
+                // ep key -> every TotalBytes value that endpoint's handler received
+                var seen = new System.Collections.Generic.Dictionary<string, System.Collections.Generic.List<long>>();
+                server.OnClientProgress += delegate(IPEndPoint ep, TransferProgress p)
+                {
+                    lock (seen)
+                    {
+                        string key = ep.Address + ":" + ep.Port;
+                        System.Collections.Generic.List<long> list;
+                        if (!seen.TryGetValue(key, out list)) { list = new System.Collections.Generic.List<long>(); seen[key] = list; }
+                        list.Add(p.TotalBytes);
+                    }
+                };
+                server.Start();
+                if (!started.WaitOne(5000)) throw new Exception("server did not start");
+
+                var runA = Task.Run(delegate
+                {
+                    var c = new TransferClient("127.0.0.1", port, fileA, 0, 4194304, 0);
+                    c.SendAsync().Wait(30000);
+                });
+                var runB = Task.Run(delegate
+                {
+                    var c = new TransferClient("127.0.0.1", port, fileB, 0, 4194304, 0);
+                    c.SendAsync().Wait(30000);
+                });
+                Task.WaitAll(new[] { runA, runB }, 40000);
+
+                lock (seen)
+                {
+                    Assert.True(seen.Count >= 2, "both endpoints reported progress, got " + seen.Count);
+                    foreach (var kv in seen)
+                    {
+                        bool pure = true;
+                        long expected = kv.Value[0];
+                        if (expected != sizeA && expected != sizeB) pure = false;
+                        foreach (long v in kv.Value)
+                            if (v != expected) pure = false;
+                        Assert.True(pure,
+                            "endpoint " + kv.Key + " received mixed totals (" + kv.Value.Count + " events)");
+                    }
+                }
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// The UDT server records session statistics for 0x03 (the default single-file
+        /// path once AutoRetry is on): its verdict is the in-protocol 0x10 status, and
+        /// the stats used to be raised only in the ACK-carrying branches, so the
+        /// receive never reached stats.log.
+        /// </summary>
+        private static void UdtResumableStats()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_urs_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_urs_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdtServer server = null;
+            try
+            {
+                long size = 256 * 1024;
+                string file = Path.Combine(sendDir, "resumable.bin");
+                var content = new byte[size];
+                new Random(403).NextBytes(content);
+                File.WriteAllBytes(file, content);
+
+                server = new TransferUdtServer("127.0.0.1", port, recvDir);
+                var started = new ManualResetEvent(false);
+                var stats = new ManualResetEvent(false);
+                long statsBytes = -1;
+                server.OnStarted += () => started.Set();
+                server.OnSessionStats += delegate(WireSessionStats s)
+                {
+                    statsBytes = s.Bytes;
+                    stats.Set();
+                };
+                server.Start();
+                if (!started.WaitOne(5000)) throw new Exception("UDT server did not start");
+
+                var client = new TransferUdtClient("127.0.0.1", port, file, 0, 4194304, 0);
+                client.SendResumableAsync(Guid.NewGuid(), false).Wait(60000);
+
+                Assert.True(stats.WaitOne(15000), "OnSessionStats fired for the UDT 0x03 receive");
+                Assert.Equal(size, statsBytes, "recorded bytes match the file size");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
         private static void TcpMultiAddressSamePort()
         {
             IPAddress lan = null;
@@ -409,6 +549,11 @@ namespace TrFileTransfer.Tests
 
                 var waiter1 = WatchUdpDelivery(server);
                 var client1 = new TransferUdpClient("127.0.0.1", proxy.Port, file);
+                // FEC off: this test pins the MULTI-PASS gap-fill mechanism (disk as
+                // state across a receiver restart); with the default double parity the
+                // stride-5 losses would all recover in pass 1 and the mechanism under
+                // test would never engage
+                client1.FecEnabled = false;
                 client1.SendAsync().Wait(60000);
                 Thread.Sleep(800); // let the receiver chew what arrived
 
@@ -424,6 +569,7 @@ namespace TrFileTransfer.Tests
                 proxy.Forward = delegate(byte[] b) { return true; };
                 var waiter2 = WatchUdpDelivery(server);
                 var client2 = new TransferUdpClient("127.0.0.1", proxy.Port, file);
+                client2.FecEnabled = false;
                 client2.SendAsync().Wait(60000);
 
                 string got = WaitUdp(waiter2, 15000);
@@ -435,6 +581,113 @@ namespace TrFileTransfer.Tests
             {
                 if (server != null) { try { server.Stop(); } catch { } }
                 if (proxy != null) proxy.Dispose();
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// The receiver throttles OnClientProgress to the sender's 100ms cadence:
+        /// at ~1.2 KB per datagram, a per-chunk event feed would flood the UI
+        /// dispatcher (1 GiB ≈ 900K dispatches). On loopback nothing drops, so an
+        /// unthrottled feed fires exactly once per chunk; a throttled one stays far
+        /// below even on a slow runner (loopback needs microseconds per chunk, so
+        /// crossing chunks/4 would require a >4ms-per-datagram pace).
+        /// </summary>
+        private static void UdpOneWayProgressThrottled()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_upt_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_upt_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdpServer server = null;
+            try
+            {
+                var content = new byte[512 * 1024];
+                new Random(303).NextBytes(content);
+                string file = Path.Combine(sendDir, "throttle.bin");
+                File.WriteAllBytes(file, content);
+
+                server = StartUdpReceiver("127.0.0.1", port, recvDir);
+                var waiter = WatchUdpDelivery(server);
+                int events = 0;
+                server.OnClientProgress += delegate { Interlocked.Increment(ref events); };
+
+                var client = new TransferUdpClient("127.0.0.1", port, file);
+                client.SendAsync().Wait(30000);
+                string got = WaitUdp(waiter, 15000);
+                Assert.NotNull(got, "throttled-progress file delivered");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(got)),
+                    "throttled-progress bytes match");
+
+                long totalChunks = (content.Length + UdpOneWay.DefaultChunkSize - 1)
+                    / UdpOneWay.DefaultChunkSize;
+                Assert.True(events < totalChunks / 4,
+                    "progress events throttled: " + events + " events for " + totalChunks + " chunks");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// DuplicateFiles=skip applies to one-way UDP the way it does to TCP/UDT
+        /// 0x00: a re-send of a byte-identical file must NOT create a "_1" sibling —
+        /// the fresh copy is dropped and the on-disk original survives. The skip
+        /// path still reports the survivor through OnFileReceived. The receiver is
+        /// restarted between the sends: the delivered-session suppression is
+        /// memory-only, so this also pins that disk+cache dedup still fires (and
+        /// suppresses nothing) after a receiver restart.
+        /// </summary>
+        private static void UdpOneWayDuplicateSkip()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_ud_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_ud_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdpServer server = null;
+            try
+            {
+                var content = new byte[300 * 1024];
+                new Random(304).NextBytes(content);
+                string file = Path.Combine(sendDir, "dup.bin");
+                File.WriteAllBytes(file, content);
+
+                server = StartUdpReceiver("127.0.0.1", port, recvDir);
+                server.SkipDuplicateFiles = true;
+
+                var waiter1 = WatchUdpDelivery(server);
+                var client1 = new TransferUdpClient("127.0.0.1", port, file);
+                client1.SendAsync().Wait(30000);
+                string first = WaitUdp(waiter1, 15000);
+                Assert.NotNull(first, "first one-way delivery landed");
+
+                // Receiver restart: the suppression map dies with the process; the
+                // saved file and its digest (hash cache) stay — the skip path's stage
+                server.Stop();
+                server = StartUdpReceiver("127.0.0.1", port, recvDir);
+                server.SkipDuplicateFiles = true;
+
+                var waiter2 = WatchUdpDelivery(server);
+                var client2 = new TransferUdpClient("127.0.0.1", port, file);
+                client2.SendAsync().Wait(30000);
+                string second = WaitUdp(waiter2, 15000);
+                Assert.NotNull(second, "duplicate pass completed (skip path reports the survivor)");
+
+                Assert.True(Directory.GetFiles(recvDir, "*.bin").Length == 1,
+                    "duplicate skipped: no _1 sibling, exactly one file");
+                Assert.Equal(first, second, "skip reports the survivor, not a renamed copy");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(second)),
+                    "surviving file content unchanged");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
                 try { Directory.Delete(sendDir, true); } catch { }
                 try { Directory.Delete(recvDir, true); } catch { }
             }
@@ -4429,6 +4682,90 @@ namespace TrFileTransfer.Tests
             }
         }
 
+        // ---- HTTP share delete (form POST ?del=) ----
+
+        /// <summary>Empty-body POST with an optional Origin header (models the
+        /// browser form and the cross-site forgery alike).</summary>
+        private static System.Tuple<int, string> HttpPostStatus(string url, string origin)
+        {
+            var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
+            req.Method = "POST";
+            req.Timeout = 30000;
+            req.ReadWriteTimeout = 30000;
+            req.Proxy = null;
+            req.ContentLength = 0;
+            req.AllowAutoRedirect = false;
+            if (origin != null) req.Headers.Add("Origin", origin);
+            try
+            {
+                using (var resp = (System.Net.HttpWebResponse)req.GetResponse())
+                    return System.Tuple.Create((int)resp.StatusCode, resp.Headers["Location"]);
+            }
+            catch (System.Net.WebException ex)
+            {
+                var resp = ex.Response as System.Net.HttpWebResponse;
+                if (resp == null) throw;
+                using (resp)
+                    return System.Tuple.Create((int)resp.StatusCode, resp.Headers["Location"]);
+            }
+        }
+
+        private static void HttpShareDelete()
+        {
+            int port = FindFreePort();
+            string root = Path.Combine(TempBase(), "tr_http_del_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            Directory.CreateDirectory(Path.Combine(root, "sub"));
+            var server = new HttpShareServer();
+            try
+            {
+                File.WriteAllBytes(Path.Combine(root, "victim.bin"), new byte[] { 1, 2, 3 });
+                File.WriteAllBytes(Path.Combine(root, "sub", "nested.bin"), new byte[] { 4 });
+                string baseUrl = "http://127.0.0.1:" + port + "/";
+                server.Start(root, port, "135790");
+
+                // Confirm page (behind the session cookie) names the exact file
+                var jar = new System.Net.CookieContainer();
+                HttpGet(baseUrl + "?t=135790", jar);
+                var confirm = HttpGet(baseUrl + "?delconfirm=" + Uri.EscapeDataString("victim.bin"), jar);
+                string confirmHtml = System.Text.Encoding.UTF8.GetString(confirm.Item2);
+                Assert.True(confirmHtml.Contains("victim.bin"), "confirm page names the file");
+                Assert.True(confirmHtml.Contains("del="), "confirm page carries the POST target");
+
+                // Delete without a session -> token form, file intact
+                var noTok = HttpPostStatus(baseUrl + "?del=" + Uri.EscapeDataString("victim.bin"), null);
+                Assert.Equal(200, noTok.Item1, "token gate answers the delete POST with the form");
+                Assert.True(File.Exists(Path.Combine(root, "victim.bin")), "no session, no delete");
+
+                // Authenticated delete (scripted client: no Origin header) -> 303 + gone
+                var ok = HttpPostStatus(baseUrl + "?t=135790&del=" + Uri.EscapeDataString("victim.bin"), null);
+                Assert.Equal(303, ok.Item1, "delete redirects back to the listing");
+                Assert.False(File.Exists(Path.Combine(root, "victim.bin")), "file deleted");
+
+                // Directories are refused — one tap must never erase a tree
+                var dir = HttpPostStatus(baseUrl + "?t=135790&del=" + Uri.EscapeDataString("sub"), null);
+                Assert.Equal(400, dir.Item1, "directory delete refused");
+                Assert.True(Directory.Exists(Path.Combine(root, "sub")), "directory untouched");
+
+                // Traversal out of the root is a 404
+                var trav = HttpPostStatus(baseUrl + "?t=135790&del=" +
+                    Uri.EscapeDataString("..\\..\\windows\\win.ini"), null);
+                Assert.Equal(404, trav.Item1, "traversal delete refused");
+
+                // Cross-site forged POST: Origin names another host -> 403, file survives
+                File.WriteAllBytes(Path.Combine(root, "csrf.bin"), new byte[] { 9 });
+                var csrf = HttpPostStatus(baseUrl + "?t=135790&del=" + Uri.EscapeDataString("csrf.bin"),
+                    "http://evil.example");
+                Assert.Equal(403, csrf.Item1, "cross-origin delete refused");
+                Assert.True(File.Exists(Path.Combine(root, "csrf.bin")), "file survived the forged POST");
+            }
+            finally
+            {
+                server.Stop();
+                try { Directory.Delete(root, true); } catch { }
+            }
+        }
+
         private static void HttpShareUpload()
         {
             int port = FindFreePort();
@@ -5228,6 +5565,300 @@ namespace TrFileTransfer.Tests
         /// derives the same stable session — so the first run transfers everything and the
         /// second run of the same command must be a no-op (the scheduled-backup contract).
         /// </summary>
+        /// <summary>CLI "recv --udp --count 1" receives a one-way UDP send in a
+        /// headless process: the verb blocks until the file lands, then exits 0.</summary>
+        private static void CliUdpRecv()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_cli_us_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_cli_ur_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            try
+            {
+                var content = new byte[64 * 1024];
+                new Random(141).NextBytes(content);
+                string file = Path.Combine(sendDir, "cli.bin");
+                File.WriteAllBytes(file, content);
+
+                var run = System.Threading.Tasks.Task.Factory.StartNew(delegate
+                {
+                    return Cli.Run(new[] { "recv", "--port", port.ToString(), "--udp",
+                        "--out", recvDir, "--count", "1" });
+                });
+
+                // Wait for the receiver's bind: an unbound loopback port answers a
+                // connected UDP client with WSAECONNRESET on the NEXT send. Raw
+                // Socket.Send on a connected UDP socket — UdpClient.Send would reject
+                // a connection made through UdpClient.Client.Connect.
+                bool bound = false;
+                using (var probe = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
+                {
+                    probe.Connect(IPAddress.Loopback, port);
+                    byte[] pingByte = new byte[1];
+                    for (int i = 0; i < 100 && !bound; i++)
+                    {
+                        try
+                        {
+                            probe.Send(pingByte);
+                            Thread.Sleep(60);
+                            probe.Send(pingByte);
+                            bound = true;
+                        }
+                        catch (SocketException) { Thread.Sleep(100); }
+                    }
+                }
+                Assert.True(bound, "CLI UDP receiver bound its port");
+
+                var client = new TransferUdpClient("127.0.0.1", port, file);
+                client.SendAsync().Wait(30000);
+
+                Assert.True(run.Wait(60000), "Cli.Run recv returned after --count files");
+                Assert.Equal(0, run.Result, "recv exit code 0");
+                string got = Path.Combine(recvDir, "cli.bin");
+                Assert.True(File.Exists(got), "file landed via CLI UDP recv");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(got)), "bytes match");
+            }
+            finally
+            {
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// Multi-pass one-way sends must stay idempotent: the receiver suppresses a
+        /// session it just delivered, so Passes=3 in rename mode still lands exactly
+        /// ONE file (no _1 siblings).
+        /// </summary>
+        private static void UdpMultiPassNoDuplicates()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_mp_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_mp_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdpServer server = null;
+            try
+            {
+                var content = new byte[256 * 1024];
+                new Random(305).NextBytes(content);
+                string file = Path.Combine(sendDir, "multi.bin");
+                File.WriteAllBytes(file, content);
+
+                server = StartUdpReceiver("127.0.0.1", port, recvDir);
+                var waiter = WatchUdpDelivery(server);
+                var client = new TransferUdpClient("127.0.0.1", port, file);
+                client.Passes = 3;
+                client.SendAsync().Wait(60000);
+                string got = WaitUdp(waiter, 15000);
+                Assert.NotNull(got, "pass 1 delivered the file");
+
+                Thread.Sleep(2500); // let the extra passes arrive and be suppressed
+                Assert.Equal(1, Directory.GetFiles(recvDir, "*.bin").Length,
+                    "extra passes leave exactly one file (no _1 duplicates)");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(got)), "bytes match");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// Loss recovery with no feedback channel: pass 1 loses every 5th DATA frame
+        /// (coverage incomplete), pass 2 re-sends clean and the receiver fills its
+        /// gaps — one SendAsync, no manual re-run.
+        /// </summary>
+        private static void UdpMultiPassLossyConverges()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_mpl_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_mpl_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdpServer server = null;
+            LossyUdpProxy proxy = null;
+            try
+            {
+                var content = new byte[512 * 1024];
+                new Random(306).NextBytes(content);
+                string file = Path.Combine(sendDir, "lossy2.bin");
+                File.WriteAllBytes(file, content);
+                long totalChunks = (content.Length + UdpOneWay.DefaultChunkSize - 1) / UdpOneWay.DefaultChunkSize;
+                long dataSeen = 0;
+
+                server = StartUdpReceiver("127.0.0.1", port, recvDir);
+                proxy = new LossyUdpProxy(new IPEndPoint(IPAddress.Loopback, port), delegate(byte[] b)
+                {
+                    if (b[3] != 0x02) return true; // START/END always pass
+                    dataSeen++;
+                    if (dataSeen <= totalChunks)   // pass 1: deterministic holes
+                        return BitConverter.ToInt32(b, 20) % 5 != 3;
+                    return true;                   // pass 2: clean
+                });
+
+                var waiter = WatchUdpDelivery(server);
+                var client = new TransferUdpClient("127.0.0.1", proxy.Port, file);
+                client.Passes = 2;
+                // FEC off: this test pins the MULTI-PASS convergence mechanism (pass 1
+                // with holes, pass 2 fills them); the default double parity would
+                // recover pass 1's stride-5 holes by itself
+                client.FecEnabled = false;
+                client.SendAsync().Wait(60000);
+
+                string got = WaitUdp(waiter, 15000);
+                Assert.NotNull(got, "pass 2 filled pass 1's holes automatically");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(got)), "bytes match");
+                Assert.Equal(1, Directory.GetFiles(recvDir, "*.bin").Length, "exactly one file");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                if (proxy != null) proxy.Dispose();
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// FEC + interleaving: isolated losses (every 8th DATA frame dropped — stride
+        /// aligned with the FEC group size, so exactly ONE member per group) are
+        /// reconstructed from the XOR parity frames on the receiver, so a SINGLE pass
+        /// delivers a file that pre-FEC needed a second pass. Passes=1 pins that the
+        /// recovery came from parity, not retransmission.
+        /// </summary>
+        private static void UdpFecSinglePassRecovers()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_fec_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_fec_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdpServer server = null;
+            LossyUdpProxy proxy = null;
+            try
+            {
+                var content = new byte[512 * 1024];
+                new Random(307).NextBytes(content);
+                string file = Path.Combine(sendDir, "fec.bin");
+                File.WriteAllBytes(file, content);
+
+                server = StartUdpReceiver("127.0.0.1", port, recvDir);
+                proxy = new LossyUdpProxy(new IPEndPoint(IPAddress.Loopback, port), delegate(byte[] b)
+                {
+                    // Drop every 8th DATA frame; START/END/PARITY always pass.
+                    // Stride == group size (8): exactly one drop per FEC group.
+                    return b[3] != 0x02 || BitConverter.ToInt32(b, 20) % 8 != 7;
+                });
+
+                var waiter = WatchUdpDelivery(server);
+                var client = new TransferUdpClient("127.0.0.1", proxy.Port, file);
+                client.Passes = 1; // recovery must come from parity, not a second pass
+                client.SendAsync().Wait(60000);
+
+                string got = WaitUdp(waiter, 15000);
+                Assert.NotNull(got, "FEC recovered the isolated losses in a single pass");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(got)), "bytes match");
+                Assert.Equal(1, Directory.GetFiles(recvDir, "*.bin").Length, "exactly one file");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                if (proxy != null) proxy.Dispose();
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// FEC with TWO parity rows per group (the default): dropping TWO members of
+        /// every group (stride 4 against group size 8) still delivers in a SINGLE
+        /// pass — pre-RS (single XOR parity) only recovered one loss per group.
+        /// </summary>
+        private static void UdpFecDoubleLossSinglePass()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_fec2_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_fec2_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdpServer server = null;
+            LossyUdpProxy proxy = null;
+            try
+            {
+                var content = new byte[512 * 1024];
+                new Random(308).NextBytes(content);
+                string file = Path.Combine(sendDir, "fec2.bin");
+                File.WriteAllBytes(file, content);
+
+                server = StartUdpReceiver("127.0.0.1", port, recvDir);
+                proxy = new LossyUdpProxy(new IPEndPoint(IPAddress.Loopback, port), delegate(byte[] b)
+                {
+                    // Drop every 4th DATA frame: two members lost per 8-chunk group
+                    // (tail groups of ≤7 lose ≤2 as well). START/END/PARITY pass.
+                    return b[3] != 0x02 || BitConverter.ToInt32(b, 20) % 4 != 3;
+                });
+
+                var waiter = WatchUdpDelivery(server);
+                var client = new TransferUdpClient("127.0.0.1", proxy.Port, file);
+                client.Passes = 1; // recovery must come from the two parity rows
+                client.SendAsync().Wait(60000);
+
+                string got = WaitUdp(waiter, 15000);
+                Assert.NotNull(got, "two losses per group recovered by double parity in one pass");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(got)), "bytes match");
+                Assert.Equal(1, Directory.GetFiles(recvDir, "*.bin").Length, "exactly one file");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                if (proxy != null) proxy.Dispose();
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>CLI "send --udp --passes 2": exit 0, file delivered, and the
+        /// second pass creates no duplicate.</summary>
+        private static void CliUdpSend()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_clis_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_clis_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdpServer server = null;
+            try
+            {
+                var content = new byte[128 * 1024];
+                new Random(142).NextBytes(content);
+                string file = Path.Combine(sendDir, "cli.bin");
+                File.WriteAllBytes(file, content);
+
+                server = StartUdpReceiver("127.0.0.1", port, recvDir);
+                var waiter = WatchUdpDelivery(server);
+
+                int rc = Cli.Run(new[] { "send", "--udp", "--ip", "127.0.0.1",
+                    "--port", port.ToString(), "--file", file, "--passes", "2" });
+                Assert.Equal(0, rc, "send --udp exit 0");
+
+                string got = WaitUdp(waiter, 15000);
+                Assert.NotNull(got, "delivered via the CLI one-way send");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(got)), "bytes match");
+                Thread.Sleep(1500); // second pass lands (suppressed)
+                Assert.Equal(1, Directory.GetFiles(recvDir, "*.bin").Length, "no duplicate from pass 2");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
         private static void CliSync()
         {
             int port = FindFreePort();

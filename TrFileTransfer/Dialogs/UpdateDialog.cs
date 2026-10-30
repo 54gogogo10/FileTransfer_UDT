@@ -234,6 +234,10 @@ namespace TrFileTransfer
                 }, 30000).ConfigureAwait(true);
 
                 _lblStatus.Text = L.UpdDownloadDone;
+                // Closed mid-download: the verified staged file stays for the next
+                // check; a MessageBox targeting a closed window would throw and the
+                // prompt would be lost either way
+                if (!IsLoaded) return;
                 if (MessageBox.Show(this, L.UpdRestartPrompt, L.UpdTitle,
                     MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
                 {

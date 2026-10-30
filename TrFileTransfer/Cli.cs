@@ -77,6 +77,9 @@ namespace TrFileTransfer
                 throw new CliUsageException((isFolder ? L.DirNotExist : L.FileNotFound) + " " + path);
 
             bool isUdt = opt.ContainsKey("udt");
+            bool isUdp = opt.ContainsKey("udp");
+            if (isUdp && isFolder)
+                throw new CliUsageException(L.UdpSingleFileOnly);
             long limitKb = ParseLong(opt, "limit", 0, 1024L * 1024 * 1024, 0);
             // --limit is KB/s; SpeedLimiter counts bytes/s. Clamp so a huge KB value
             // cannot wrap the int (which would silently mean "unlimited").
@@ -86,12 +89,30 @@ namespace TrFileTransfer
             int srcPort = (int)ParseLong(opt, "srcport", 0, 65535, 0);
             string code = GetValue(opt, "code");
 
-            Console.Out.WriteLine("{0} -> {1}:{2} ({3})", path, ip, port, isUdt ? "UDT" : "TCP");
+            Console.Out.WriteLine("{0} -> {1}:{2} ({3})", path, ip, port,
+                isUdp ? "UDP" : (isUdt ? "UDT" : "TCP"));
             var watch = Stopwatch.StartNew();
             long bytes;
             try
             {
-                if (isUdt)
+                if (isUdp)
+                {
+                    // One-way: fires and forgets; --passes re-sends the whole file to
+                    // cover losses (the receiver ignores a session it just delivered)
+                    int passes = (int)ParseLong(opt, "passes", 1, 5, 1);
+                    bool failed = false;
+                    var client = new TransferUdpClient(ip, port, path, UdpOneWay.DefaultChunkSize, srcPort, limit);
+                    client.Passes = passes;
+                    client.FecEnabled = !opt.ContainsKey("nofec");
+                    client.FecParity = (int)ParseLong(opt, "fec-parity", 1, UdpOneWay.FecGroupSize, 2);
+                    client.OnLog += msg => Console.Out.WriteLine(msg);
+                    client.OnError += msg => { failed = true; Console.Error.WriteLine(msg); };
+                    if (code.Length > 0) Console.Out.WriteLine(L.CliUdpIgnoresCode);
+                    bytes = Measure(path);
+                    RunToCompletion(client.SendAsync());
+                    if (failed) return 1;
+                }
+                else if (isUdt)
                 {
                     var client = ClientFactory.CreateUdt(ip, port, path, srcPort, limit, code);
                     if (opt.ContainsKey("noencrypt")) client.EncryptionEnabled = false;
@@ -156,8 +177,13 @@ namespace TrFileTransfer
             if (!Directory.Exists(dir))
                 throw new CliUsageException(L.DirNotExist + " " + dir);
             bool isUdt = opt.ContainsKey("udt");
+            bool isUdp = opt.ContainsKey("udp");
             string code = GetValue(opt, "code");
             long countTarget = ParseLong(opt, "count", 0, long.MaxValue, 0);
+            if (isUdp && isUdt)
+                throw new CliUsageException(L.CliUnknownCmd("--udt")); // one transport at a time
+            if (isUdp && code.Length > 0)
+                Console.Out.WriteLine(L.CliUdpIgnoresCode);
 
             var stop = new ManualResetEvent(false);
             long received = 0;
@@ -187,7 +213,24 @@ namespace TrFileTransfer
                 if (!stop.WaitOne(0)) { asyncStopFailed = true; stop.Set(); }
             };
 
-            if (isUdt)
+            if (isUdp)
+            {
+                // One-way UDP: no pairing code, no receive confirmation — nothing can
+                // cross a link with no return path (the --code note was printed above).
+                var server = new TransferUdpServer("0.0.0.0", port, dir);
+                server.OnLog += log;
+                server.OnError += err;
+                server.OnFileReceived += fileRecv;
+                server.OnStopped += onStopped;
+                server.Start();
+                if (!server.IsRunning) { Console.Error.WriteLine(L.CliRecvStartFailed(port)); return 1; }
+                Console.Out.WriteLine(L.CliRecvWaiting("UDP", port, dir));
+                stop.WaitOne();
+                bool failed = asyncStopFailed;
+                server.Stop();
+                if (failed) return 1;
+            }
+            else if (isUdt)
             {
                 var server = new TransferUdtServer("0.0.0.0", port, dir);
                 server.PairingCode = code;

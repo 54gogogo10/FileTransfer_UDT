@@ -24,6 +24,9 @@ echo.
     /optimize+ ^
     ..\Config.cs ^
     ..\Shared.cs ^
+    ..\KeepAwake.cs ^
+    ..\QueuedTask.cs ^
+    ..\QueueStore.cs ^
     ..\L10N.cs ^
     ..\WireProtocol.cs ^
     ..\WireCrypto.cs ^
@@ -31,6 +34,7 @@ echo.
     ..\TransferServer.cs ^
     ..\TransferUdt.cs ^
     ..\TransferUdp.cs ^
+    ..\UdpFec.cs ^
     ..\TransferClient.cs ^
     ..\DeviceDiscovery.cs ^
     ..\ResumeState.cs ^
@@ -41,6 +45,7 @@ echo.
     ..\WireCompress.cs ^
     ..\QrCode.cs ^
     ..\StatsStore.cs ^
+    ..\TextHistoryStore.cs ^
     ..\Cli.cs ^
     ..\LibraryVerifier.cs ^
     TestProgram.cs ^
