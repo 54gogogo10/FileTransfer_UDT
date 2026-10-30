@@ -277,6 +277,7 @@ UDT STREAM 模式通过 `udt_setsockopt` 设置 `UDT_RCVTIMEO` 和 `UDT_SNDTIMEO
 ## 文档
 
 - `CLAUDE.md` — 只做指向本文件的转发（Claude Code 自动读取它）。**开发者指引统一维护在这里**，勿在两处复制内容——历史上两份文档曾各自漂移，CLAUDE.md 曾停留在早已废弃的 WinForms 架构上。
+- `docs/PRODUCT-SPEC.md` — 产品规格书（行为与要求的权威描述：定位/场景/功能规格/协议摘要/安全/容量上限/路线图）。改行为先查它，改行为后必须同步它。
 - `WIRE-PROTOCOL.md` — 线协议规范（各类型详细字节布局）。改动 0x00–0x03 协议时先读它，并同步更新本文件的"TCP 线协议"章节。
 - `docs/superpowers/plans/` 与 `docs/superpowers/specs/` — 主要功能的实施计划与设计文档（并发传输、断点续传、2026-08 增强批次）。改动对应功能前建议先读对应设计文档。按日期归档的历史记录，不随现状更新。
 
