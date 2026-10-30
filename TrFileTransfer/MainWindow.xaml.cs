@@ -68,6 +68,8 @@ namespace TrFileTransfer
             public TabItem Tab;
             public BindMultiSelect Bind;
             public TextBox Port;
+            public TextBox SaveDir;   // per-tab save directory ("SaveDir" + Name config key)
+            public Button BrowseDir;
             public Button Start;
             public Button Stop;
             /// <summary>One running listener and the address it serves.</summary>
@@ -132,6 +134,9 @@ namespace TrFileTransfer
         private bool _monitorIsTcp;
         private string _monitorPairing;
         private readonly List<string> _monitorQueue = new List<string>();
+        /// <summary>Per-file throttle state for the "not fully copied" log — the probe
+        /// defers the same file every pass, the log may not follow.</summary>
+        private readonly Dictionary<string, DateTime> _monitorNotReadyLogged = new Dictionary<string, DateTime>();
         private readonly object _monitorLock = new object();
 
         // Fan-out (one file/folder -> many devices in parallel)
@@ -298,7 +303,11 @@ namespace TrFileTransfer
             _txtServerIp.LostFocus += (s, e) => ValidateIpStrict(_txtServerIp);
             _txtPairing.PreviewTextInput += BlockNonDigits;
             _txtPairing.TextChanged += (s, e) => ValidateDigitsOnly(_txtPairing);
-            _txtSaveDir.TextChanged += (s, e) => ValidatePathChars(_txtSaveDir);
+            foreach (var t in _serverTabs)
+            {
+                TextBox dirBox = t.SaveDir; // local: the lambda below outlives the loop variable
+                dirBox.TextChanged += (s, e) => ValidatePathChars(dirBox);
+            }
             _txtFile.TextChanged += (s, e) => ValidatePathChars(_txtFile);
         }
 
@@ -399,16 +408,19 @@ namespace TrFileTransfer
             _tabTcp = new ServerTab
             {
                 Proto = ServerProto.Tcp, Tab = _tabTcpItem, Bind = _bindTcp, Port = _txtPortTcp,
+                SaveDir = _txtSaveDirTcp, BrowseDir = _btnBrowseDirTcp,
                 Start = _btnStartTcp, Stop = _btnStopTcp
             };
             _tabUdt = new ServerTab
             {
                 Proto = ServerProto.Udt, Tab = _tabUdtItem, Bind = _bindUdt, Port = _txtPortUdt,
+                SaveDir = _txtSaveDirUdt, BrowseDir = _btnBrowseDirUdt,
                 Start = _btnStartUdt, Stop = _btnStopUdt
             };
             _tabUdp = new ServerTab
             {
                 Proto = ServerProto.Udp, Tab = _tabUdpItem, Bind = _bindUdp, Port = _txtPortUdp,
+                SaveDir = _txtSaveDirUdp, BrowseDir = _btnBrowseDirUdp,
                 Start = _btnStartUdp, Stop = _btnStopUdp
             };
             _serverTabs.Add(_tabTcp);
@@ -427,6 +439,13 @@ namespace TrFileTransfer
         private bool AnyServerRunning()
         {
             return _serverTabs.Any(t => t.Running);
+        }
+
+        /// <summary>The protocol tab the user is looking at — open-folder / HTTP share
+        /// act on the save directory in view; TCP is the fallback before tabs exist.</summary>
+        private ServerTab SelectedServerTab()
+        {
+            return _serverTabs.FirstOrDefault(t => t.Tab.IsSelected) ?? _tabTcp;
         }
 
         private void SetTabHeader(ServerTab t)
@@ -612,8 +631,12 @@ namespace TrFileTransfer
             _lblPortTcp.Text = L.Port;
             _lblPortUdt.Text = L.Port;
             _lblPortUdp.Text = L.Port;
-            _lblSaveDir.Text = L.SaveTo;
-            _btnBrowseDir.Content = L.Browse;
+            _lblSaveDirTcp.Text = L.SaveTo;
+            _lblSaveDirUdt.Text = L.SaveTo;
+            _lblSaveDirUdp.Text = L.SaveTo;
+            _btnBrowseDirTcp.Content = L.Browse;
+            _btnBrowseDirUdt.Content = L.Browse;
+            _btnBrowseDirUdp.Content = L.Browse;
             _btnStartTcp.Content = L.StartServer;
             _btnStopTcp.Content = L.StopServer;
             _btnStartUdt.Content = L.StartServer;
@@ -691,6 +714,7 @@ namespace TrFileTransfer
 
             // Server — one tab per protocol, seeded once from the older layouts
             SeedProtocolConfig();
+            SeedSaveDirConfig();
             string clientProto = Config.Get("ClientProtocol", "TCP");
             _rbClientTcp.IsChecked = clientProto != "UDT" && clientProto != "UDP";
             _rbClientUdt.IsChecked = clientProto == "UDT";
@@ -700,7 +724,9 @@ namespace TrFileTransfer
             _txtPortTcp.Text = Config.Get("ServerPortTCP", "8080");
             _txtPortUdt.Text = Config.Get("ServerPortUDT", "8080");
             _txtPortUdp.Text = Config.Get("ServerPortUDP", "8080");
-            _txtSaveDir.Text = Config.Get("SaveDir", Environment.GetFolderPath(Environment.SpecialFolder.Desktop));
+            foreach (var t in _serverTabs)
+                t.SaveDir.Text = Config.Get("SaveDir" + t.Name,
+                    Environment.GetFolderPath(Environment.SpecialFolder.Desktop));
             foreach (var t in _serverTabs)
             {
                 t.Bind.SetSelected(ParseBindList(Config.Get("ServerBind" + t.Name, null)));
@@ -795,6 +821,21 @@ namespace TrFileTransfer
             return v6 ? "::" : "0.0.0.0";
         }
 
+        /// <summary>Migration of the single shared save directory (≤2.14 "SaveDir") into
+        /// the per-protocol keys. Every protocol starts on the old directory — behavior
+        /// after an upgrade is unchanged — and diverges from there once the user edits a
+        /// tab. Runs once per key.</summary>
+        private static void SeedSaveDirConfig()
+        {
+            string[] protos = { "TCP", "UDT", "UDP" };
+            foreach (string proto in protos)
+            {
+                if (Config.Get("SaveDir" + proto, null) != null) continue;
+                Config.Set("SaveDir" + proto,
+                    Config.Get("SaveDir", Environment.GetFolderPath(Environment.SpecialFolder.Desktop)));
+            }
+        }
+
         private void SaveConfig()
         {
             Config.Set("Language", _cmbLang.SelectedIndex == 1 ? "中文" : "English");
@@ -803,6 +844,7 @@ namespace TrFileTransfer
                 Config.Set("ServerPort" + t.Name, t.Port.Text.Trim());
                 Config.Set("ServerBind" + t.Name,
                     string.Join(";", t.Bind.GetSelectedAddresses().Select(a => a.ToString()).ToArray()));
+                Config.Set("SaveDir" + t.Name, t.SaveDir.Text.Trim());
             }
             // Legacy mirrors keep a downgrade installable without surprises
             Config.Set("ServerPort", _txtPortTcp.Text.Trim());
@@ -811,7 +853,7 @@ namespace TrFileTransfer
             Config.Set("ClientProtocol",
                 _rbClientUdp.IsChecked == true ? "UDP"
                 : (_rbClientUdt.IsChecked == true ? "UDT" : "TCP"));
-            Config.Set("SaveDir", _txtSaveDir.Text.Trim());
+            Config.Set("SaveDir", _tabTcp.SaveDir.Text.Trim()); // legacy mirror — keeps a downgrade on a sane directory
             Config.Set("ClientIP", _txtServerIp.Text.Trim());
             Config.Set("ClientPort", _txtPortC.Text.Trim());
             Config.Set("LastPath", _txtFile.Text.Trim());
@@ -946,11 +988,14 @@ namespace TrFileTransfer
 
         private void BtnBrowseDir_Click(object sender, RoutedEventArgs e)
         {
+            // Three tabs share this handler; resolve which tab's browse button was clicked
+            var tab = _serverTabs.FirstOrDefault(t => t.BrowseDir == sender);
+            if (tab == null) return;
             using (var dlg = new WinForms.FolderBrowserDialog())
             {
                 dlg.Description = L.BrowseDirDesc;
                 if (dlg.ShowDialog() == WinForms.DialogResult.OK)
-                    _txtSaveDir.Text = dlg.SelectedPath;
+                    tab.SaveDir.Text = dlg.SelectedPath;
             }
         }
 
@@ -1004,7 +1049,7 @@ namespace TrFileTransfer
                 return;
             }
 
-            string dir = _txtSaveDir.Text.Trim();
+            string dir = SelectedServerTab().SaveDir.Text.Trim();
             if (!Directory.Exists(dir))
             {
                 MessageBox.Show(this, L.HttpShareDirMissing, L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
@@ -1061,7 +1106,7 @@ namespace TrFileTransfer
 
         private void BtnOpenDir_Click(object sender, RoutedEventArgs e)
         {
-            string dir = _txtSaveDir.Text.Trim();
+            string dir = SelectedServerTab().SaveDir.Text.Trim();
             if (Directory.Exists(dir))
             {
                 try { System.Diagnostics.Process.Start("explorer.exe", dir); } catch { }
@@ -1521,7 +1566,7 @@ namespace TrFileTransfer
                 MessageBox.Show(this, L.InvalidPort, L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
                 return;
             }
-            string saveDir = _txtSaveDir.Text.Trim();
+            string saveDir = tab.SaveDir.Text.Trim();
             if (!Directory.Exists(saveDir))
             {
                 MessageBox.Show(this, L.DirNotExist, L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
@@ -1802,6 +1847,8 @@ namespace TrFileTransfer
         {
             t.Bind.IsEnabled = false;
             t.Port.IsEnabled = false;
+            t.SaveDir.IsEnabled = false;   // this tab's folder is now owned by its listeners
+            t.BrowseDir.IsEnabled = false;
             t.Start.IsEnabled = false;
         }
 
@@ -1809,6 +1856,8 @@ namespace TrFileTransfer
         {
             t.Bind.IsEnabled = true;
             t.Port.IsEnabled = true;
+            t.SaveDir.IsEnabled = true;
+            t.BrowseDir.IsEnabled = true;
             t.Start.IsEnabled = true;
             t.Stop.IsEnabled = false;
         }
@@ -1842,14 +1891,13 @@ namespace TrFileTransfer
         }
 
         /// <summary>Shared (card-level) server inputs follow "any endpoint running":
-        /// save dir / pairing freeze while any tab serves, and the pairing session
-        /// code is dropped once everything stops.</summary>
+        /// the pairing checkbox freezes while any tab serves (its code is session-wide),
+        /// and the pairing session code is dropped once everything stops. Each tab's
+        /// save directory is NOT shared — it freezes only while that tab itself serves.</summary>
         private void UpdateSharedServerState()
         {
             bool any = AnyServerRunning();
             _lblStatusS.Text = any ? L.Listening : L.ServerStopped;
-            _txtSaveDir.IsEnabled = !any;
-            _btnBrowseDir.IsEnabled = !any;
             _chkPairing.IsEnabled = !any;
             if (!any) _activePairingCode = null;
             UpdateLanguageLock();
@@ -2042,13 +2090,24 @@ namespace TrFileTransfer
 
         private void BtnVerifyLib_Click(object sender, RoutedEventArgs e)
         {
-            var dlg = new LibraryVerifyDialog(_txtSaveDir.Text.Trim()) { Owner = this };
+            // With per-protocol directories the library spans up to three roots —
+            // verify all of them (deduped, existing only) in one pass
+            var dirs = _serverTabs.Select(t => t.SaveDir.Text.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Where(Directory.Exists)
+                .ToList();
+            if (dirs.Count == 0)
+            {
+                MessageBox.Show(this, L.DirNotExist, L.DlgError, MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+            var dlg = new LibraryVerifyDialog(dirs) { Owner = this };
             dlg.ShowDialog();
         }
 
         private void BtnSyncSessions_Click(object sender, RoutedEventArgs e)
         {
-            // Prefer a running server's (possibly archived) directory; fall back to the box
+            // Prefer a running server's (possibly archived) directory; fall back to the selected tab's box
             string dir = null;
             foreach (var t in _serverTabs)
             {
@@ -2056,8 +2115,10 @@ namespace TrFileTransfer
                 if (tcp != null) { dir = tcp.SaveDirectory; break; }
                 var udt = t.Listeners.Select(l => l.Server).OfType<TransferUdtServer>().FirstOrDefault();
                 if (udt != null) { dir = udt.SaveDirectory; break; }
+                var udp = t.Listeners.Select(l => l.Server).OfType<TransferUdpServer>().FirstOrDefault();
+                if (udp != null) { dir = udp.SaveDirectory; break; }
             }
-            if (string.IsNullOrEmpty(dir)) dir = _txtSaveDir.Text.Trim();
+            if (string.IsNullOrEmpty(dir)) dir = SelectedServerTab().SaveDir.Text.Trim();
             var dlg = new SyncSessionsDialog(GetArchiveDir(dir)) { Owner = this };
             dlg.ShowDialog();
         }
@@ -3168,7 +3229,7 @@ namespace TrFileTransfer
             _monitorSpeedBytesPerSec = _numSpeed.Value * 1024;
             _monitorIsTcp = _rbClientTcp.IsChecked == true;
             _monitorPairing = _txtPairing.Text.Trim();
-            lock (_monitorLock) { _monitorQueue.Clear(); } // stale entries from a previous session
+            lock (_monitorLock) { _monitorQueue.Clear(); _monitorNotReadyLogged.Clear(); } // stale entries from a previous session
 
             DisableClientInputs();
             _lblStatusC.Text = L.MonitorWaiting;
@@ -3193,7 +3254,7 @@ namespace TrFileTransfer
                 try { cts.Cancel(); } catch { }
                 try { cts.Dispose(); } catch { }
             }
-            lock (_monitorLock) { _monitorQueue.Clear(); }
+            lock (_monitorLock) { _monitorQueue.Clear(); _monitorNotReadyLogged.Clear(); }
             _btnCancel.IsEnabled = false;
             _lblStatusC.Text = L.MonitorStopped;
             AddLog(L.MonitorLogStopped);
@@ -3233,14 +3294,32 @@ namespace TrFileTransfer
                         }
                     }
 
-                    if (filePath != null)
-                    {
-                        await ProcessMonitoredFile(filePath, ip, port, sentDir, ct);
-                    }
-                    else
+                    if (filePath == null)
                     {
                         await Task.Delay(500, ct);
+                        continue;
                     }
+
+                    // Gone between enqueue and now (deleted mid-copy, or a duplicate of
+                    // one already moved to the sent folder) — drop it instead of letting
+                    // it rotate through the queue forever
+                    if (!File.Exists(filePath)) continue;
+
+                    if (!await ProbeFileReady(filePath, ct))
+                    {
+                        // Copy still in progress: the file yields ONE slot — the next
+                        // file takes the head now, this one is retried on the next pass
+                        // (no head-of-line blocking, no banishment to the tail)
+                        lock (_monitorLock)
+                        {
+                            _monitorQueue.Insert(_monitorQueue.Count > 0 ? 1 : 0, filePath);
+                        }
+                        LogNotReadyThrottled(filePath);
+                        continue;
+                    }
+                    lock (_monitorLock) { _monitorNotReadyLogged.Remove(filePath); }
+
+                    await ProcessMonitoredFile(filePath, ip, port, sentDir, ct);
                 }
             }
         }
@@ -3248,17 +3327,6 @@ namespace TrFileTransfer
         private async Task ProcessMonitoredFile(string filePath, string ip, int port, string sentDir, CancellationToken ct)
         {
             string fileName = Path.GetFileName(filePath);
-
-            if (!await WaitForFileReady(filePath, ct))
-            {
-                RunOnUi(() => AddLog(L.MonitorFileNotReady(fileName)));
-                // Requeue only what still exists — a vanished file (deleted, or a
-                // duplicate of one already moved to the sent folder) would otherwise
-                // bounce through the queue forever in a tight loop
-                if (File.Exists(filePath))
-                    lock (_monitorLock) { _monitorQueue.Add(filePath); }
-                return;
-            }
 
             bool success = false;
             try
@@ -3313,60 +3381,53 @@ namespace TrFileTransfer
             }
         }
 
-        private async Task<bool> WaitForFileReady(string filePath, CancellationToken ct)
+        /// <summary>One readiness probe (~0.5 s, never blocks on the file). A copy still
+        /// in progress keeps its writer handle open, so an exclusive open (FileShare.None)
+        /// fails with a sharing violation — that alone catches normal copies, including
+        /// the 0-byte-placeholder-then-fill pattern the old size-only check waved
+        /// through. Writers that reopen the file per chunk are caught by additionally
+        /// requiring the size to hold still across a short window. "Not ready" is the
+        /// loop's cue to defer the file one slot in the queue, not to wait here.</summary>
+        private static async Task<bool> ProbeFileReady(string filePath, CancellationToken ct)
         {
-            int stableCount = 0;
-            long lastSize = -1;
-            int totalWaited = 0;
-            const int PollIntervalMs = 500;
-            const int StableThreshold = 2;
-            const int RequeueAfterMs = 120000;
-            const int LogIntervalMs = 30000;
-            int lastLogAt = 0;
-            var fileInfo = new FileInfo(filePath);
-
-            while (!ct.IsCancellationRequested)
+            long sizeBefore;
+            try
             {
-                long currentSize;
-                try
-                {
-                    fileInfo.Refresh();
-                    if (!fileInfo.Exists)
-                        return false;
-                    currentSize = fileInfo.Length;
-                }
-                catch
-                {
-                    return false;
-                }
-
-                if (currentSize == lastSize)
-                {
-                    stableCount++;
-                    if (stableCount >= StableThreshold)
-                        return true;
-                }
-                else
-                {
-                    stableCount = 0;
-                    lastSize = currentSize;
-                }
-
-                if (totalWaited >= RequeueAfterMs)
-                    return false;
-
-                if (totalWaited - lastLogAt >= LogIntervalMs)
-                {
-                    lastLogAt = totalWaited;
-                    string fileName = Path.GetFileName(filePath);
-                    RunOnUi(() => AddLog(L.MonitorFileWaiting(fileName, totalWaited / 1000)));
-                }
-
-                await Task.Delay(PollIntervalMs, ct);
-                totalWaited += PollIntervalMs;
+                using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.None, 1))
+                    sizeBefore = fs.Length;
             }
+            catch (IOException) { return false; }            // sharing violation — someone still holds it
+            catch (UnauthorizedAccessException) { return false; }
 
-            return false;
+            try
+            {
+                await Task.Delay(500, ct);
+                return new FileInfo(filePath).Length == sizeBefore;
+            }
+            catch
+            {
+                return false;                                 // vanished mid-probe, or monitoring stopped
+            }
+        }
+
+        /// <summary>Deferral log, throttled per file: the first deferral speaks up at
+        /// once, a still-stuck file repeats every minute — a permanently locked file
+        /// rotating through the queue must not flood the log.</summary>
+        private void LogNotReadyThrottled(string filePath)
+        {
+            bool say;
+            lock (_monitorLock)
+            {
+                DateTime last;
+                if (!_monitorNotReadyLogged.TryGetValue(filePath, out last))
+                    say = true;
+                else
+                    say = (DateTime.UtcNow - last).TotalSeconds >= 60;
+                if (say) _monitorNotReadyLogged[filePath] = DateTime.UtcNow;
+            }
+            if (!say) return;
+            string fileName = Path.GetFileName(filePath);
+            RunOnUi(() => AddLog(L.MonitorFileNotReady(fileName)));
         }
 
         // ==================== File browse ====================

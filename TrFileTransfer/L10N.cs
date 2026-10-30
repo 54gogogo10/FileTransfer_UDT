@@ -415,12 +415,6 @@ namespace TrFileTransfer
         public static string StopMonitor { get { return IsChinese ? "停止监控" : "Stop Monitor"; } }
         public static string MonitorWaiting { get { return IsChinese ? "等待新文件..." : "Waiting for new files..."; } }
         public static string MonitorStopped { get { return IsChinese ? "监控已停止。" : "Monitor stopped."; } }
-        public static string MonitorFileWaiting(object fileName, int secs)
-        {
-            return IsChinese
-                ? string.Format("等待文件写入完成: {0} ({1}秒)", fileName, secs)
-                : string.Format("Waiting for file: {0} ({1}s)", fileName, secs);
-        }
         public static string MonitorFileSent(object fileName)
         {
             return IsChinese
@@ -436,8 +430,8 @@ namespace TrFileTransfer
         public static string MonitorFileNotReady(object fileName)
         {
             return IsChinese
-                ? string.Format("文件未就绪，移至队列末尾: {0}", fileName)
-                : string.Format("File not ready, moved to back of queue: {0}", fileName);
+                ? string.Format("文件尚未拷贝完成，已在发送队列中后移一位: {0}", fileName)
+                : string.Format("File not fully copied yet, deferred one slot in the send queue: {0}", fileName);
         }
         public static string MonitorDirNotExist { get { return IsChinese ? "监控目录不存在。" : "Monitor directory does not exist."; } }
         public static string DragDropOnlyFirst(object fileName, int total)

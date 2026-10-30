@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -8,14 +9,15 @@ using System.Windows.Media;
 
 namespace TrFileTransfer
 {
-    /// <summary>Integrity self-check ("scrub") over the receive directory: re-hashes every
-    /// file and compares against the digests the app recorded when it received them, listing
-    /// anything that no longer matches (edited or corrupted after arrival). Runs on a worker
-    /// thread with a progress bar; a second click stops the scan. Entries from the digest
-    /// cache follow its normal rules — TTL-expired or never-seen files show as "no record".</summary>
+    /// <summary>Integrity self-check ("scrub") over the receive directory/directories:
+    /// re-hashes every file and compares against the digests the app recorded when it
+    /// received them, listing anything that no longer matches (edited or corrupted after
+    /// arrival). Several roots (one per protocol tab) are scanned sequentially in one
+    /// pass and the reports are merged. Runs on a worker thread with a progress bar; a
+    /// second click stops the scan. Entries from the digest cache follow its normal
+    /// rules — TTL-expired or never-seen files show as "no record".</summary>
     public class LibraryVerifyDialog : Window
     {
-        private readonly string _dir;
         private readonly TextBox _txtDir = DlgUi.Input();
         private readonly ProgressBar _bar = new ProgressBar { Style = DlgUi.Res<Style>("BarModern"), Minimum = 0, Maximum = 1 };
         private readonly TextBlock _status = DlgUi.Label("");
@@ -24,9 +26,8 @@ namespace TrFileTransfer
         private CancellationTokenSource _cts;
         private bool _running;
 
-        public LibraryVerifyDialog(string dir)
+        public LibraryVerifyDialog(IList<string> dirs)
         {
-            _dir = dir;
             DlgUi.Init(this, L.LibVerifyTitle, 560, 480, 460, 380);
 
             var grid = new Grid { Margin = new Thickness(16) };
@@ -35,7 +36,7 @@ namespace TrFileTransfer
 
             var dirRow = new StackPanel { Orientation = Orientation.Horizontal };
             dirRow.Children.Add(DlgUi.Label(L.LibVerifyDirLabel));
-            _txtDir.Text = dir;
+            _txtDir.Text = string.Join("; ", dirs);
             _txtDir.MinWidth = 380;
             _txtDir.Margin = new Thickness(8, 0, 0, 0);
             dirRow.Children.Add(_txtDir);
@@ -85,10 +86,17 @@ namespace TrFileTransfer
                 return;
             }
 
-            string dir = _txtDir.Text.Trim();
-            if (!System.IO.Directory.Exists(dir))
+            // The box holds one or more roots separated by ';' (same convention as the
+            // bind-address config) — the user may edit it down to a single directory
+            List<string> roots = _txtDir.Text.Split(';')
+                .Select(d => d.Trim())
+                .Where(d => d.Length > 0)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Where(System.IO.Directory.Exists)
+                .ToList();
+            if (roots.Count == 0)
             {
-                _status.Text = L.DirNotExist + " " + dir;
+                _status.Text = L.DirNotExist;
                 return;
             }
 
@@ -101,17 +109,29 @@ namespace TrFileTransfer
             var token = _cts.Token;
             Task.Run(delegate
             {
-                cb.Progress = delegate(TransferProgress p)
-                {
-                    Dispatcher.BeginInvoke(new Action(delegate
-                    {
-                        _bar.Value = p.TotalBytes > 0 ? (double)p.BytesTransferred / p.TotalBytes : 0;
-                        _status.Text = p.FileName;
-                    }));
-                };
                 try
                 {
-                    return LibraryVerifier.Verify(dir, FileHashCache.ForServer, cb, token);
+                    // Sequential scan over every root; reports merged into one
+                    var combined = new VerifyReport();
+                    for (int i = 0; i < roots.Count; i++)
+                    {
+                        string root = roots[i];
+                        string prefix = roots.Count > 1 ? "[" + (i + 1) + "/" + roots.Count + "] " : "";
+                        cb.Progress = delegate(TransferProgress p)
+                        {
+                            Dispatcher.BeginInvoke(new Action(delegate
+                            {
+                                _bar.Value = p.TotalBytes > 0 ? (double)p.BytesTransferred / p.TotalBytes : 0;
+                                _status.Text = prefix + p.FileName;
+                            }));
+                        };
+                        VerifyReport part = LibraryVerifier.Verify(root, FileHashCache.ForServer, cb, token);
+                        combined.Verified.AddRange(part.Verified);
+                        combined.Changed.AddRange(part.Changed);
+                        combined.Unverified.AddRange(part.Unverified);
+                        combined.Skipped.AddRange(part.Skipped);
+                    }
+                    return combined;
                 }
                 catch (OperationCanceledException)
                 {
