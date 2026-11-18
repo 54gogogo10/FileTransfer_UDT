@@ -33,3 +33,5 @@ TrFileTransfer.Tests.exe
 | [README.md](README.md) | 面向用户：功能介绍、快速开始、CLI 用法 |
 | `docs/superpowers/` | 按日期归档的历史设计文档与实施计划（仅作背景参考） |
 | `docs/security-audit-2026-09.md` | 安全审计报告（2.12/2.15 修复批次的依据） |
+| `docs/security-audit-2026-11.md` | 2026-11 全量审查 + 两轮修复 + UDP v2 互通批次（27 个文件、17 项新回归用例、仍存风险清单） |
+| `docs/interop-csharp-rust-2026-11-18.md` | 真机互通测试：C# 2.16 ↔ Rust trft 0.2.0 / 0.3.0（TCP/UDT 双向、单向 UDP v2 双向 + FEC 丢包恢复、ACK 竞态） |

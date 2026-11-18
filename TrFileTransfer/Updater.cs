@@ -111,16 +111,30 @@ namespace TrFileTransfer
             if (string.IsNullOrEmpty(json)) return null;
             string tag = ExtractJsonString(json, "tag_name");
             string exeUrl = null;
+            string preferredUrl = null;
             int idx = 0;
-            while (exeUrl == null)
+            while (true)
             {
                 idx = json.IndexOf("\"browser_download_url\"", idx, StringComparison.Ordinal);
                 if (idx < 0) break;
                 string candidate = ExtractJsonStringAt(json, idx);
                 if (candidate != null && candidate.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-                    exeUrl = candidate;
+                {
+                    if (exeUrl == null) exeUrl = candidate;
+                    // Prefer the canonical asset: a release that also carries an
+                    // installer or a debug build must not make the updater pick the
+                    // wrong binary (and then request the wrong .sha256 sidecar).
+                    int slash = candidate.LastIndexOf('/');
+                    string fileName = slash >= 0 ? candidate.Substring(slash + 1) : candidate;
+                    if (string.Equals(fileName, "TrFileTransfer.exe", StringComparison.OrdinalIgnoreCase))
+                    {
+                        preferredUrl = candidate;
+                        break;
+                    }
+                }
                 idx++;
             }
+            if (preferredUrl != null) exeUrl = preferredUrl;
             if (tag == null || exeUrl == null) return null;
             // GitHub asset URLs are https; reject a downgraded one defensively
             if (!IsSecureUpdateUrl(exeUrl)) return null;
@@ -353,39 +367,68 @@ namespace TrFileTransfer
         /// <summary>Hard cap for anything buffered in memory (manifests, GitHub API
         /// documents) — a hostile update URL must not be able to OOM the process.</summary>
         private const long MaxMetaBytes = 8L * 1024 * 1024;
+        /// <summary>Hard cap for the downloaded binary itself (an exe is a few MB; this
+        /// only exists so a hostile source cannot fill the disk).</summary>
+        private const long MaxAssetBytes = 512L * 1024 * 1024;
+        private const int MaxRedirects = 5;
 
         private static void HttpGetToStream(string url, int timeoutMs, Action<long, long> progress, Stream dest)
         {
-            var req = (HttpWebRequest)WebRequest.Create(url);
-            req.Method = "GET";
-            req.Timeout = timeoutMs;
-            req.ReadWriteTimeout = timeoutMs;
-            // api.github.com rejects requests without a User-Agent
-            req.UserAgent = "TrFileTransfer-Updater/" + CurrentVersion;
-            // LAN tool — bypass system/IE proxy settings, which can break direct intranet URLs
-            req.Proxy = null;
-            using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+            string current = url;
+            for (int hop = 0; hop <= MaxRedirects; hop++)
             {
-                if (resp.StatusCode != HttpStatusCode.OK)
-                    throw new WebException("HTTP " + (int)resp.StatusCode + " for " + url);
-                long total = resp.ContentLength;
-                using (Stream src = resp.GetResponseStream())
+                var req = (HttpWebRequest)WebRequest.Create(current);
+                req.Method = "GET";
+                req.Timeout = timeoutMs;
+                req.ReadWriteTimeout = timeoutMs;
+                // api.github.com rejects requests without a User-Agent
+                req.UserAgent = "TrFileTransfer-Updater/" + CurrentVersion;
+                // LAN tool — bypass system/IE proxy settings, which can break direct intranet URLs
+                req.Proxy = null;
+                // Follow redirects MANUALLY: only the initial URL was scheme-checked,
+                // and the default behaviour happily follows a 302 to plain http, where
+                // an on-path attacker controls both the binary and its sidecar hash.
+                req.AllowAutoRedirect = false;
+                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
                 {
-                    byte[] buf = new byte[81920];
-                    long read = 0;
-                    int n;
-                    while ((n = src.Read(buf, 0, buf.Length)) > 0)
+                    int code = (int)resp.StatusCode;
+                    if (code >= 300 && code < 400)
                     {
-                        dest.Write(buf, 0, n);
-                        read += n;
-                        // Only metadata callers pass a null progress callback; the exe
-                        // download (streamed to disk, hash-verified) is unbounded
-                        if (progress == null && read > MaxMetaBytes)
-                            throw new InvalidDataException("update document exceeds " + MaxMetaBytes + " bytes: " + url);
-                        if (progress != null) progress(read, total);
+                        string location = resp.Headers["Location"];
+                        if (string.IsNullOrEmpty(location))
+                            throw new WebException("redirect without Location for " + current);
+                        string next = new Uri(new Uri(current, UriKind.Absolute), location).AbsoluteUri;
+                        if (!UpdateManifest.IsSecureUpdateUrl(next))
+                            throw new InvalidDataException("insecure redirect target: " + next);
+                        current = next;
+                        continue;
                     }
+                    if (resp.StatusCode != HttpStatusCode.OK)
+                        throw new WebException("HTTP " + code + " for " + current);
+                    long total = resp.ContentLength;
+                    using (Stream src = resp.GetResponseStream())
+                    {
+                        byte[] buf = new byte[81920];
+                        long read = 0;
+                        int n;
+                        while ((n = src.Read(buf, 0, buf.Length)) > 0)
+                        {
+                            dest.Write(buf, 0, n);
+                            read += n;
+                            // Only metadata callers pass a null progress callback; the exe
+                            // download is streamed to disk and hash-verified, but still
+                            // capped so a hostile source cannot fill the disk.
+                            if (progress == null && read > MaxMetaBytes)
+                                throw new InvalidDataException("update document exceeds " + MaxMetaBytes + " bytes: " + current);
+                            if (read > MaxAssetBytes)
+                                throw new InvalidDataException("update asset exceeds " + MaxAssetBytes + " bytes: " + current);
+                            if (progress != null) progress(read, total);
+                        }
+                    }
+                    return;
                 }
             }
+            throw new InvalidDataException("too many redirects for " + url);
         }
 
         /// <summary>
@@ -415,12 +458,19 @@ namespace TrFileTransfer
             string backup = targetPath + ".old";
             if (File.Exists(backup)) File.Delete(backup);
             File.Move(targetPath, backup);
+            // Stage the copy under a sibling name and rename it into place: the target
+            // path therefore never holds a half-copied binary (a crash mid-copy used to
+            // leave exactly that, with the only intact copy renamed to .old).
+            string incoming = targetPath + ".new";
             try
             {
-                File.Copy(stagedPath, targetPath, true);
+                try { if (File.Exists(incoming)) File.Delete(incoming); } catch { }
+                File.Copy(stagedPath, incoming, true);
+                File.Move(incoming, targetPath);
             }
             catch
             {
+                try { if (File.Exists(incoming)) File.Delete(incoming); } catch { }
                 // Roll back so the app keeps running on the old binary
                 try
                 {
@@ -438,7 +488,16 @@ namespace TrFileTransfer
             try
             {
                 string backup = exePath + ".old";
-                if (File.Exists(backup)) File.Delete(backup);
+                if (!File.Exists(backup)) return;
+                if (!File.Exists(exePath))
+                {
+                    // The previous swap died between "rename the old exe away" and
+                    // "move the new one in". The backup is the only runnable copy, so
+                    // restore it instead of deleting it (the old code deleted the app).
+                    try { File.Copy(backup, exePath, false); } catch { }
+                    return;
+                }
+                File.Delete(backup);
             }
             catch { }
         }

@@ -364,6 +364,11 @@
                             <local:NumericBox x:Name="_numUdpParity" Width="56" Min="1" Max="8" Margin="0,4,0,0"
                                               ToolTipService.ShowOnDisabled="True"/>
                         </StackPanel>
+                        <!-- Interop switch: Rust trft v2 frames (opt-in; old C# peers
+                             only understand the TU/1 format) -->
+                        <StackPanel x:Name="_grpUdpRust" Orientation="Vertical" Margin="10,0,0,0">
+                            <CheckBox x:Name="_chkUdpRust" VerticalAlignment="Center" Margin="0,6,0,0"/>
+                        </StackPanel>
                     </StackPanel>
 
                     <!-- Tools: discovery & batch helpers; text send sits with the actions -->

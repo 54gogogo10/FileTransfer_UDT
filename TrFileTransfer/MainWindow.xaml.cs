@@ -53,6 +53,11 @@ namespace TrFileTransfer
         // State
         private readonly List<string> _recentFiles = new List<string>();
         private readonly List<DeviceInfo> _knownDevices = new List<DeviceInfo>();
+        /// <summary>Immutable snapshot of _knownDevices for server threads. The list
+        /// itself is mutated on the UI thread (device dialog, remembered peers); reading
+        /// Count/index from a connection thread raced with those edits and could throw
+        /// ArgumentOutOfRangeException, dropping the connection.</summary>
+        private volatile DeviceInfo[] _deviceSnapshot = new DeviceInfo[0];
         private Guid? _pendingResumeSession;
         /// <summary>Server protocols the tabs represent (also the persisted key suffix).</summary>
         private enum ServerProto { Tcp, Udt, Udp }
@@ -687,6 +692,8 @@ namespace TrFileTransfer
             _numUdpPasses.ToolTip = L.UdpPassesHint;
             _lblUdpParity.Text = L.UdpParityLabel;
             _numUdpParity.ToolTip = L.UdpParityHint;
+            _chkUdpRust.Content = L.UdpRustCompat;
+            _chkUdpRust.ToolTip = L.UdpRustCompatHint;
             _lblHttpPort.Text = L.HttpPortLabel;
             if (_httpShare == null || !_httpShare.IsRunning)
                 _btnHttpShare.Content = L.HttpShareBtn;
@@ -749,7 +756,9 @@ namespace TrFileTransfer
             _numSrcPort.Value = Math.Max(0, Math.Min(65535, Config.GetInt("SrcPort", 0)));
             _numUdpPasses.Value = Math.Max(1, Math.Min(5, Config.GetInt("UdpPasses", 1)));
             _numUdpParity.Value = Math.Max(1, Math.Min(8, Config.GetInt("UdpFecParity", 2)));
-            _txtPairing.Text = Config.Get("PairingCode", "");
+            _chkUdpRust.IsChecked = Config.GetBool("UdpRustCompat", false);
+            // Stored DPAPI-protected on save; legacy plaintext still loads.
+            _txtPairing.Text = SecretProtector.Unprotect(Config.Get("PairingCode", ""));
         }
 
         /// <summary>Parses a persisted bind list ("0.0.0.0;::1;…"). Null/empty/garbage
@@ -865,7 +874,8 @@ namespace TrFileTransfer
             Config.SetInt("SrcPort", _numSrcPort.Value);
             Config.SetInt("UdpPasses", _numUdpPasses.Value);
             Config.SetInt("UdpFecParity", _numUdpParity.Value);
-            Config.Set("PairingCode", _txtPairing.Text.Trim());
+            Config.SetBool("UdpRustCompat", _chkUdpRust.IsChecked == true);
+            Config.Set("PairingCode", SecretProtector.Protect(_txtPairing.Text.Trim()));
             Config.Save();
         }
 
@@ -1325,6 +1335,11 @@ namespace TrFileTransfer
 
         // ==================== Known devices (device memory) ====================
 
+        private void RefreshDeviceSnapshot()
+        {
+            _deviceSnapshot = _knownDevices.ToArray();
+        }
+
         private void LoadKnownDevices()
         {
             _knownDevices.Clear();
@@ -1347,6 +1362,7 @@ namespace TrFileTransfer
                     });
                 }
             }
+            RefreshDeviceSnapshot();
         }
 
         private void SaveKnownDevices()
@@ -1379,6 +1395,7 @@ namespace TrFileTransfer
                     else d.SupportsTcp = true;
                     if (d.Name == "?" || string.IsNullOrEmpty(d.Name)) d.Name = ip;
                     _knownDevices[i] = d;
+                    RefreshDeviceSnapshot();
                     SaveKnownDevices();
                     return;
                 }
@@ -1392,6 +1409,7 @@ namespace TrFileTransfer
                 SupportsUdt = isUdp
             });
             if (_knownDevices.Count > 10) _knownDevices.RemoveAt(0);
+            RefreshDeviceSnapshot();
             SaveKnownDevices();
         }
 
@@ -1543,6 +1561,7 @@ namespace TrFileTransfer
             Visibility v = udp ? Visibility.Visible : Visibility.Collapsed;
             _grpUdpPasses.Visibility = v;
             _grpUdpParity.Visibility = v;
+            _grpUdpRust.Visibility = v;
         }
 
         private static int ParsePortText(string s)
@@ -1982,11 +2001,12 @@ namespace TrFileTransfer
         /// have it (sanitized by the wire layer), otherwise the raw IP.</summary>
         private string ResolveDeviceNameForIp(string ip)
         {
-            for (int i = 0; i < _knownDevices.Count; i++)
+            DeviceInfo[] devices = _deviceSnapshot;
+            for (int i = 0; i < devices.Length; i++)
             {
-                if (_knownDevices[i].Ip == ip && !string.IsNullOrEmpty(_knownDevices[i].Name)
-                    && _knownDevices[i].Name != "?")
-                    return _knownDevices[i].Name;
+                if (devices[i].Ip == ip && !string.IsNullOrEmpty(devices[i].Name)
+                    && devices[i].Name != "?")
+                    return devices[i].Name;
             }
             return ip;
         }
@@ -2000,9 +2020,10 @@ namespace TrFileTransfer
             if (mode == "off") return Task.FromResult(true);
             if (mode == "unknown" && ip.Length > 0)
             {
-                for (int i = 0; i < _knownDevices.Count; i++)
+                DeviceInfo[] devices = _deviceSnapshot;
+                for (int i = 0; i < devices.Length; i++)
                 {
-                    if (_knownDevices[i].Ip == ip) return Task.FromResult(true);
+                    if (devices[i].Ip == ip) return Task.FromResult(true);
                 }
             }
 
@@ -2017,11 +2038,13 @@ namespace TrFileTransfer
             }
 
             var tcs = new TaskCompletionSource<bool>();
+            var holder = new ConfirmDialogHolder();
             RunOnUi(delegate
             {
                 try
                 {
                     var dlg = new ConfirmReceiveDialog(ip, name, size, files, isFolder) { Owner = this };
+                    holder.Dialog = dlg;
                     dlg.Closed += (s, e) => tcs.TrySetResult(dlg.Accepted);
                     dlg.Show();
                 }
@@ -2030,8 +2053,15 @@ namespace TrFileTransfer
                     tcs.TrySetResult(false);
                 }
             });
-            // Auto-deny timeout — runs regardless of dialog outcome
-            Task.Delay(TimeSpan.FromSeconds(30)).ContinueWith(t => tcs.TrySetResult(false));
+            // Auto-deny timeout — and CLOSE the prompt: leaving it on screen made every
+            // unanswered request strand a window (a peer could spray these).
+            Task.Delay(TimeSpan.FromSeconds(30)).ContinueWith(delegate
+            {
+                if (!tcs.TrySetResult(false)) return;
+                ConfirmReceiveDialog dlg = holder.Dialog;
+                if (dlg == null) return;
+                RunOnUi(delegate { try { dlg.Close(); } catch { } });
+            });
 
             return tcs.Task.ContinueWith(t =>
             {
@@ -2041,6 +2071,13 @@ namespace TrFileTransfer
                 }
                 return t.Result;
             });
+        }
+
+        /// <summary>Cross-thread box for the confirmation prompt (the timeout runs on
+        /// the thread pool while the dialog lives on the UI thread).</summary>
+        private sealed class ConfirmDialogHolder
+        {
+            public ConfirmReceiveDialog Dialog;
         }
 
         private void RecordReceived(WireSessionStats stats)
@@ -2134,6 +2171,7 @@ namespace TrFileTransfer
             // The dialog edits _knownDevices in place; persist whatever remains
             var dlg = new DevicesDialog(_knownDevices, UseDiscoveredDevice) { Owner = this };
             dlg.ShowDialog();
+            RefreshDeviceSnapshot();
             SaveKnownDevices();
         }
 
@@ -2280,6 +2318,8 @@ namespace TrFileTransfer
                     udpClient.Passes = _numUdpPasses.Value; // loss recovery for a link with no feedback
                     udpClient.FecEnabled = Config.GetBool("UdpFec", true); // RS parity + interleaving
                     udpClient.FecParity = _numUdpParity.Value; // losses per group recoverable in one pass
+                    udpClient.RustCompat = _chkUdpRust.IsChecked == true; // trft v2 wire format
+
                     _clientUdp = udpClient;
                     bool udpOk = await WireUdpClientAndSendAsync(udpClient).ConfigureAwait(true);
                     _clientUdp = null;
@@ -3161,6 +3201,9 @@ namespace TrFileTransfer
         }
 
         private static DateTime _lastLogSweep = DateTime.MinValue;
+        /// <summary>Keep one day's log bounded; a chatty peer (or log injection attempts)
+        /// must not be able to fill the disk one line at a time.</summary>
+        private const long MaxLogBytes = 8L * 1024 * 1024;
 
         /// <summary>Appends a log line to the daily log file under %AppData%\TrFileTransfer\logs.</summary>
         private static void AppendLogFile(string msg)
@@ -3172,6 +3215,7 @@ namespace TrFileTransfer
                     "TrFileTransfer", "logs");
                 Directory.CreateDirectory(dir);
                 string path = Path.Combine(dir, DateTime.Now.ToString("yyyy-MM-dd") + ".txt");
+                RotateLogIfNeeded(path);
                 File.AppendAllText(path, "[" + DateTime.Now.ToString("HH:mm:ss") + "] " + msg + Environment.NewLine);
                 if (DateTime.Now.Date != _lastLogSweep)
                 {
@@ -3182,13 +3226,28 @@ namespace TrFileTransfer
             catch { }
         }
 
+        /// <summary>Moves the current log aside once it passes the cap (the previous
+        /// generation is replaced; failure just keeps appending to the same file).</summary>
+        private static void RotateLogIfNeeded(string path)
+        {
+            try
+            {
+                var fi = new FileInfo(path);
+                if (!fi.Exists || fi.Length < MaxLogBytes) return;
+                string old = path + ".1";
+                try { if (File.Exists(old)) File.Delete(old); } catch { }
+                try { File.Move(path, old); } catch { }
+            }
+            catch { }
+        }
+
         /// <summary>Deletes daily log files older than 30 days (runs at most once per day).</summary>
         private static void SweepOldLogs(string dir)
         {
             try
             {
                 DateTime cutoff = DateTime.Now.Date.AddDays(-30);
-                string[] files = Directory.GetFiles(dir, "*.txt");
+                string[] files = Directory.GetFiles(dir, "*.txt*");
                 for (int i = 0; i < files.Length; i++)
                 {
                     try

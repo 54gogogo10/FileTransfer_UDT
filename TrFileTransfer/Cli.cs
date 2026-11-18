@@ -93,6 +93,7 @@ namespace TrFileTransfer
                 isUdp ? "UDP" : (isUdt ? "UDT" : "TCP"));
             var watch = Stopwatch.StartNew();
             long bytes;
+            bool errorReported = false;
             try
             {
                 if (isUdp)
@@ -105,8 +106,10 @@ namespace TrFileTransfer
                     client.Passes = passes;
                     client.FecEnabled = !opt.ContainsKey("nofec");
                     client.FecParity = (int)ParseLong(opt, "fec-parity", 1, UdpOneWay.FecGroupSize, 2);
+                    // Rust trft v2 frame format (opt-in: old C# receivers only know TU/1)
+                    client.RustCompat = opt.ContainsKey("udp-v2") || opt.ContainsKey("udp-rust");
                     client.OnLog += msg => Console.Out.WriteLine(msg);
-                    client.OnError += msg => { failed = true; Console.Error.WriteLine(msg); };
+                    client.OnError += msg => { failed = true; errorReported = true; Console.Error.WriteLine(msg); };
                     if (code.Length > 0) Console.Out.WriteLine(L.CliUdpIgnoresCode);
                     bytes = Measure(path);
                     RunToCompletion(client.SendAsync());
@@ -118,7 +121,7 @@ namespace TrFileTransfer
                     if (opt.ContainsKey("noencrypt")) client.EncryptionEnabled = false;
                     if (opt.ContainsKey("nocompress")) client.CompressionEnabled = false;
                     client.OnLog += msg => Console.Out.WriteLine(msg);
-                    client.OnError += msg => Console.Error.WriteLine(msg);
+                    client.OnError += msg => { errorReported = true; Console.Error.WriteLine(msg); };
                     bytes = Measure(path);
                     RunToCompletion(isFolder ? client.SendFolderAsync(path) : client.SendAsync());
                 }
@@ -128,14 +131,17 @@ namespace TrFileTransfer
                     if (opt.ContainsKey("noencrypt")) client.EncryptionEnabled = false;
                     if (opt.ContainsKey("nocompress")) client.CompressionEnabled = false;
                     client.OnLog += msg => Console.Out.WriteLine(msg);
-                    client.OnError += msg => Console.Error.WriteLine(msg);
+                    client.OnError += msg => { errorReported = true; Console.Error.WriteLine(msg); };
                     bytes = Measure(path);
                     RunToCompletion(isFolder ? client.SendFolderAsync(path) : client.SendAsync());
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                // OnError already printed the reason on the console
+                // OnError normally printed the reason; if the failure happened before
+                // that event was wired (socket creation, bad option) say something —
+                // the exit code must not be the only signal.
+                if (!errorReported) Console.Error.WriteLine(ex.Message);
                 return 1;
             }
             watch.Stop();
@@ -189,11 +195,15 @@ namespace TrFileTransfer
             long received = 0;
             Action<string> log = msg => Console.Out.WriteLine(msg);
             Action<string> err = msg => Console.Error.WriteLine(msg);
+            bool countReached = false;
             Action<string, long> fileRecv = (p, sz) =>
             {
                 Console.Out.WriteLine(L.CliReceivedFile(p, Utils.FormatSize(sz)));
                 if (countTarget > 0 && Interlocked.Increment(ref received) >= countTarget)
+                {
+                    countReached = true;
                     stop.Set();
+                }
             };
 
             Console.CancelKeyPress += (s, e) =>
@@ -227,6 +237,7 @@ namespace TrFileTransfer
                 Console.Out.WriteLine(L.CliRecvWaiting("UDP", port, dir));
                 stop.WaitOne();
                 bool failed = asyncStopFailed;
+                LingerAfterCount(countReached);
                 server.Stop();
                 if (failed) return 1;
             }
@@ -243,6 +254,7 @@ namespace TrFileTransfer
                 Console.Out.WriteLine(L.CliRecvWaiting("UDT", port, dir));
                 stop.WaitOne();
                 bool failed = asyncStopFailed;
+                LingerAfterCount(countReached);
                 server.Stop();
                 if (failed) return 1;
             }
@@ -259,6 +271,7 @@ namespace TrFileTransfer
                 Console.Out.WriteLine(L.CliRecvWaiting("TCP", port, dir));
                 stop.WaitOne();
                 bool failed = asyncStopFailed;
+                LingerAfterCount(countReached);
                 server.Stop();
                 if (failed) return 1;
             }
@@ -266,6 +279,17 @@ namespace TrFileTransfer
             if (countTarget > 0)
                 Console.Out.WriteLine(L.CliRecvCountDone(Interlocked.Read(ref received)));
             return 0;
+        }
+
+        /// <summary>The last ACK / verdict byte is written immediately before shutdown.
+        /// Closing the socket in the same instant races the peer's read: against Rust v2
+        /// this showed up as "early eof" / "no acknowledgement" on the SENDER while the
+        /// file was complete and its hash matched. A short linger after a --count exit
+        /// lets the transport flush without changing any protocol byte.</summary>
+        private static void LingerAfterCount(bool countReached)
+        {
+            if (!countReached) return;
+            try { Thread.Sleep(400); } catch { }
         }
 
         // ---- sync: one-shot incremental folder sync (0x04, keepState) ----
@@ -292,6 +316,7 @@ namespace TrFileTransfer
             Console.Out.WriteLine(L.CliSyncStart(path, ip, port, isUdt ? "UDT" : "TCP"));
             var watch = Stopwatch.StartNew();
             long bytes = Measure(path);
+            bool errorReported = false;
             try
             {
                 if (isUdt)
@@ -300,7 +325,7 @@ namespace TrFileTransfer
                     if (opt.ContainsKey("noencrypt")) client.EncryptionEnabled = false;
                     if (opt.ContainsKey("nocompress")) client.CompressionEnabled = false;
                     client.OnLog += msg => Console.Out.WriteLine(msg);
-                    client.OnError += msg => Console.Error.WriteLine(msg);
+                    client.OnError += msg => { errorReported = true; Console.Error.WriteLine(msg); };
                     RunToCompletion(client.SendFolderResumableAsync(sessionId, keepState: true));
                 }
                 else
@@ -309,13 +334,16 @@ namespace TrFileTransfer
                     if (opt.ContainsKey("noencrypt")) client.EncryptionEnabled = false;
                     if (opt.ContainsKey("nocompress")) client.CompressionEnabled = false;
                     client.OnLog += msg => Console.Out.WriteLine(msg);
-                    client.OnError += msg => Console.Error.WriteLine(msg);
+                    client.OnError += msg => { errorReported = true; Console.Error.WriteLine(msg); };
                     RunToCompletion(client.SendFolderResumableAsync(sessionId, keepState: true));
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                // OnError already printed the reason on the console
+                // OnError normally printed the reason; if the failure happened before
+                // that event was wired (socket creation, bad option) say something —
+                // the exit code must not be the only signal.
+                if (!errorReported) Console.Error.WriteLine(ex.Message);
                 return 1;
             }
             watch.Stop();

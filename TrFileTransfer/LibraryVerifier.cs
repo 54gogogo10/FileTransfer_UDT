@@ -45,10 +45,11 @@ namespace TrFileTransfer
             if (cache == null) throw new ArgumentNullException("cache");
             if (!Directory.Exists(rootDir)) return report;
 
-            string[] files;
-            try { files = Directory.GetFiles(rootDir, "*", SearchOption.AllDirectories); }
-            catch (IOException) { return report; }
-            catch (UnauthorizedAccessException) { return report; }
+            // Per-directory walk with per-directory error handling: AllDirectories
+            // aborts the WHOLE scan on the first unreadable subdirectory (the UI then
+            // shows "0 files" instead of "scan failed"), and it happily follows a
+            // junction out of the tree. Reparse points are skipped and cycles are cut.
+            string[] files = EnumerateFilesSafe(rootDir).ToArray();
 
             long totalBytes = 0;
             var sizes = new long[files.Length];
@@ -84,6 +85,46 @@ namespace TrFileTransfer
                 }
             }
             return report;
+        }
+
+        /// <summary>Recursive file walk that skips junctions/symlinks (a shared folder
+        /// must not pull in unrelated trees) and tolerates unreadable subdirectories.</summary>
+        private static List<string> EnumerateFilesSafe(string rootDir)
+        {
+            var files = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var stack = new Stack<string>();
+            string rootFull;
+            try { rootFull = Path.GetFullPath(rootDir); } catch { return files; }
+            seen.Add(rootFull);
+            stack.Push(rootFull);
+            while (stack.Count > 0)
+            {
+                string dir = stack.Pop();
+                try
+                {
+                    string[] entries = Directory.GetFiles(dir);
+                    for (int i = 0; i < entries.Length; i++) files.Add(entries[i]);
+                }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+                string[] subDirs;
+                try { subDirs = Directory.GetDirectories(dir); }
+                catch (IOException) { continue; }
+                catch (UnauthorizedAccessException) { continue; }
+                for (int i = 0; i < subDirs.Length; i++)
+                {
+                    string sub = subDirs[i];
+                    try
+                    {
+                        if ((File.GetAttributes(sub) & FileAttributes.ReparsePoint) != 0) continue;
+                        if (!seen.Add(Path.GetFullPath(sub))) continue; // cycle guard
+                    }
+                    catch { continue; }
+                    stack.Push(sub);
+                }
+            }
+            return files;
         }
 
         private static void ClassifyOne(FileHashCache cache, string path, CancellationToken ct, VerifyReport report)

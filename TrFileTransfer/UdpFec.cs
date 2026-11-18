@@ -82,6 +82,181 @@ namespace TrFileTransfer
         /// fewer parity rows than erasures survive (keep the cache, wait for more)
         /// — a singular matrix cannot happen for a Cauchy code but is handled the
         /// same safe way.</summary>
+        // ------------------------------------------------------------------
+        // Systematic Vandermonde codec — wire-compatible with the Rust v2
+        // implementation (reed-solomon-erasure 6.0, galois_8): the generator
+        // matrix is V·inv(V_top) with V[r][c] = r^c over GF(256) / 0x11D.
+        // The one-way UDP v2 protocol (Rust trft) uses this, not the Cauchy
+        // code above, so parity bytes only interoperate with these routines.
+        // ------------------------------------------------------------------
+
+        private static readonly System.Collections.Generic.Dictionary<int, byte[][]> VmCache
+            = new System.Collections.Generic.Dictionary<int, byte[][]>();
+        private static readonly object VmCacheLock = new object();
+
+        /// <summary>Systematic generator matrix (data+parity rows × data columns):
+        /// the first dataShards rows are the identity, the rest are parity rows.</summary>
+        public static byte[][] VandermondeMatrix(int dataShards, int parityShards)
+        {
+            if (dataShards < 1 || parityShards < 1 || dataShards + parityShards > 255)
+                throw new ArgumentException("invalid Vandermonde shape");
+            lock (VmCacheLock)
+            {
+                byte[][] cached;
+                if (VmCache.TryGetValue(parityShards, out cached) && cached.Length == dataShards + parityShards)
+                    return cached;
+            }
+            int total = dataShards + parityShards;
+            var v = new byte[total][];
+            for (int row = 0; row < total; row++)
+            {
+                v[row] = new byte[dataShards];
+                for (int col = 0; col < dataShards; col++)
+                    v[row][col] = Pow((byte)row, col);
+            }
+            var top = new byte[dataShards][];
+            for (int i = 0; i < dataShards; i++) top[i] = (byte[])v[i].Clone();
+            var inv = Invert(top, dataShards);
+            var g = new byte[total][];
+            for (int i = 0; i < total; i++) g[i] = MultiplyRow(v[i], inv, dataShards);
+            lock (VmCacheLock) { VmCache[parityShards] = g; }
+            return g;
+        }
+
+        /// <summary>Parity shards for one FEC group. Every data shard is exactly
+        /// <paramref name="length"/> bytes (the caller zero-pads the last chunk).</summary>
+        public static byte[][] VandermondeEncode(byte[][] dataShards, int parityShards, int length)
+        {
+            int k = dataShards.Length;
+            var g = VandermondeMatrix(k, parityShards);
+            var parity = new byte[parityShards][];
+            for (int p = 0; p < parityShards; p++)
+            {
+                var acc = new byte[length];
+                for (int i = 0; i < k; i++)
+                    Accumulate(acc, dataShards[i], length, g[k + p][i]);
+                parity[p] = acc;
+            }
+            return parity;
+        }
+
+        /// <summary>Recovers missing data shards of one group from any k available
+        /// shards (data or parity), using the same systematic Vandermonde code.
+        /// <paramref name="shardIndices"/> are the FEC positions of the available
+        /// shards; a data position past the file's chunk count is passed as an
+        /// all-zero shard (the sender pads it the same way). Returns one block per
+        /// requested missing data position, or null when fewer than k shards are
+        /// available / the matrix is singular.</summary>
+        public static byte[][] VandermondeReconstruct(int[] shardIndices, byte[][] shardBlocks,
+            int[] missingDataIndices, int length, int dataShards, int parityShards)
+        {
+            if (missingDataIndices == null || missingDataIndices.Length == 0) return new byte[0][];
+            if (shardIndices == null || shardBlocks == null || shardIndices.Length < dataShards)
+                return null;
+            var g = VandermondeMatrix(dataShards, parityShards);
+            var sub = new byte[dataShards][];
+            for (int r = 0; r < dataShards; r++)
+            {
+                int idx = shardIndices[r];
+                if (idx < 0 || idx >= dataShards + parityShards) return null;
+                sub[r] = g[idx];
+            }
+            var inv = Invert(sub, dataShards);
+            if (inv == null) return null;
+            var data = new byte[dataShards][];
+            for (int d = 0; d < dataShards; d++)
+            {
+                var acc = new byte[length];
+                for (int s = 0; s < dataShards; s++)
+                    Accumulate(acc, shardBlocks[s], length, inv[d][s]);
+                data[d] = acc;
+            }
+            var result = new byte[missingDataIndices.Length][];
+            for (int i = 0; i < missingDataIndices.Length; i++)
+            {
+                int m = missingDataIndices[i];
+                if (m < 0 || m >= dataShards) return null;
+                result[i] = data[m];
+            }
+            return result;
+        }
+
+        private static byte Pow(byte a, int n)
+        {
+            if (n == 0) return 1;
+            if (a == 0) return 0;
+            int l = (Log[a] * n) % 255;
+            return Exp[l];
+        }
+
+        private static byte Div(byte a, byte b)
+        {
+            if (a == 0) return 0;
+            if (b == 0) throw new ArgumentException("division by zero");
+            int l = Log[a] - Log[b];
+            if (l < 0) l += 255;
+            return Exp[l];
+        }
+
+        private static byte[] MultiplyRow(byte[] row, byte[][] matrix, int n)
+        {
+            var result = new byte[n];
+            for (int c = 0; c < n; c++)
+            {
+                byte acc = 0;
+                for (int j = 0; j < n; j++)
+                    if (row[j] != 0 && matrix[j][c] != 0) acc ^= Mul(row[j], matrix[j][c]);
+                result[c] = acc;
+            }
+            return result;
+        }
+
+        /// <summary>Gauss-Jordan inverse over GF(256); null when singular.</summary>
+        private static byte[][] Invert(byte[][] matrix, int n)
+        {
+            var a = new byte[n][];
+            var inv = new byte[n][];
+            for (int i = 0; i < n; i++)
+            {
+                a[i] = (byte[])matrix[i].Clone();
+                inv[i] = new byte[n];
+                inv[i][i] = 1;
+            }
+            for (int col = 0; col < n; col++)
+            {
+                int pivot = -1;
+                for (int r = col; r < n; r++)
+                    if (a[r][col] != 0) { pivot = r; break; }
+                if (pivot < 0) return null;
+                if (pivot != col)
+                {
+                    var t = a[pivot]; a[pivot] = a[col]; a[col] = t;
+                    var ti = inv[pivot]; inv[pivot] = inv[col]; inv[col] = ti;
+                }
+                byte pv = a[col][col];
+                if (pv != 1)
+                {
+                    byte ip = Div(1, pv);
+                    for (int c = 0; c < n; c++)
+                    {
+                        a[col][c] = Mul(a[col][c], ip);
+                        inv[col][c] = Mul(inv[col][c], ip);
+                    }
+                }
+                for (int r = 0; r < n; r++)
+                {
+                    if (r == col || a[r][col] == 0) continue;
+                    byte f = a[r][col];
+                    for (int c = 0; c < n; c++)
+                    {
+                        a[r][c] ^= Mul(a[col][c], f);
+                        inv[r][c] ^= Mul(inv[col][c], f);
+                    }
+                }
+            }
+            return inv;
+        }
+
         public static byte[][] Solve(byte[][] parityPayloads, int[] parityRowIdx,
             int[] survivingCols, byte[][] survivingBlocks, int[] missingCols, int chunkSize, int groupSize)
         {

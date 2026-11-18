@@ -263,6 +263,12 @@ namespace TrFileTransfer
                 : string.Format("UDP one-way receiver started on port {0}. Save directory: {1}", port, dir);
         }
         public static string UdpS_Stopped { get { return IsChinese ? "UDP 单向接收已停止。" : "UDP one-way receiver stopped."; } }
+        public static string UdpV2S_Started(string name, string size, string ip)
+        {
+            return IsChinese
+                ? string.Format("来自 {2} 的 Rust 兼容（UDP v2）会话: {0}（{1}）", name, size, ip)
+                : string.Format("Rust-compatible (UDP v2) session from {2}: {0} ({1})", name, size, ip);
+        }
         public static string UdpS_SessionStart(string name, string size, string ip)
         {
             return IsChinese
@@ -286,6 +292,18 @@ namespace TrFileTransfer
             return IsChinese
                 ? string.Format("并发单向会话过多，已让出最空闲的: {0}（分片保留，重发即续）", name)
                 : string.Format("Too many concurrent one-way sessions, released the idle-most: {0} (chunks kept; a re-send resumes)", name);
+        }
+        public static string UdpS_ForeignSession(string name, string ip)
+        {
+            return IsChinese
+                ? string.Format("单向会话 {0} 属于其他来源（{1}），已忽略该 START/数据。", name, ip)
+                : string.Format("One-way session {0} belongs to another sender ({1}) — START/data ignored.", name, ip);
+        }
+        public static string UdpS_ZeroProgressEvicted(string name)
+        {
+            return IsChinese
+                ? string.Format("并发单向会话过多，已丢弃未收到任何数据的会话: {0}", name)
+                : string.Format("Too many one-way sessions, dropped the never-started one: {0}", name);
         }
         public static string UdpS_FinalizeFailed(string name, string err)
         {
@@ -346,6 +364,37 @@ namespace TrFileTransfer
             return IsChinese
                 ? string.Format("前向纠错已启用：{0} 分片一组 × {1} 份 RS 奇偶（交错发送），每组丢 ≤{1} 片单轮免重传恢复", groupSize, parity)
                 : string.Format("FEC on: groups of {0} chunks × {1} RS parity rows (interleaved) — up to {1} losses per group recover without retransmit", groupSize, parity);
+        }
+        public static string UdpV2C_Sending(string name, string size, string ip, string port)
+        {
+            return IsChinese
+                ? string.Format("Rust 兼容单向发送 {0}（{1}）到 {2}:{3}（协议 v2，无回传确认）", name, size, ip, port)
+                : string.Format("Rust-compatible one-way send {0} ({1}) to {2}:{3} (protocol v2, no ACK channel)", name, size, ip, port);
+        }
+        public static string UdpV2C_FecOn(object groupSize, object parity)
+        {
+            return IsChinese
+                ? string.Format("前向纠错已启用：{0} 分片一组 × {1} 份 RS 奇偶（系统化 Vandermonde，兼容 Rust）", groupSize, parity)
+                : string.Format("FEC on: groups of {0} chunks × {1} RS parity rows (systematic Vandermonde, Rust-compatible)", groupSize, parity);
+        }
+        public static string UdpV2C_BadName(string name)
+        {
+            return IsChinese
+                ? string.Format("文件名不适合 Rust 兼容发送: {0}", name)
+                : string.Format("File name is not valid for Rust-compatible sending: {0}", name);
+        }
+        public static string UdpRustCompat
+        {
+            get { return IsChinese ? "Rust 兼容（UDP v2）" : "Rust-compatible (UDP v2)"; }
+        }
+        public static string UdpRustCompatHint
+        {
+            get
+            {
+                return IsChinese
+                    ? "使用 Rust trft 的 v2 单向 UDP 帧（与 trft --proto udp 互通）。旧版 C# 接收端只认 v1，互发时两端都要开启。"
+                    : "Use the Rust trft v2 one-way UDP frame format (interop with trft --proto udp). Older C# receivers only understand v1.";
+            }
         }
         public static string UdpS_ParityRecovered(object name, object group)
         {
@@ -881,7 +930,7 @@ namespace TrFileTransfer
                 return IsChinese
                     ? "用法:\r\n" +
                       "  TrFileTransfer send --ip <IP> --port <端口> [--tcp|--udt|--udp] --file <路径|--folder <路径>\r\n" +
-                      "        [--code <配对码>] [--limit <KB/s>] [--srcport <端口>] [--nocompress] [--noencrypt] [--passes <N>] [--nofec] [--fec-parity <N>]\r\n" +
+                      "        [--code <配对码>] [--limit <KB/s>] [--srcport <端口>] [--nocompress] [--noencrypt] [--passes <N>] [--nofec] [--fec-parity <N>] [--udp-v2]\r\n" +
                       "  TrFileTransfer recv --port <端口> [--out <目录>] [--tcp|--udt|--udp] [--code <配对码>] [--count <N>]\r\n" +
                       "  TrFileTransfer sync --folder <目录> --ip <IP> --port <端口> [--tcp|--udt]\r\n" +
                       "        [--code <配对码>] [--limit <KB/s>] [--srcport <端口>] [--nocompress] [--noencrypt]\r\n" +
@@ -890,13 +939,14 @@ namespace TrFileTransfer
                       "send: 发送一个文件或文件夹后退出（退出码 0=成功）。--udp 为单向传输：仅单文件，\r\n" +
                       "      无配对码/加密/压缩；--passes <N> 自动连发 N 轮对抗丢包；默认启用前向纠错\r\n" +
                       "      （RS 纠删 + 交错发送，每组 2 份奇偶），--fec-parity <1-8> 调冗余，--nofec 关闭。\r\n" +
+                      "      --udp-v2 改用 Rust trft 的 v2 帧（与 trft --proto udp 互通；对端收端无需开关）。\r\n" +
                       "recv: 接收直到 Ctrl+C，或收到 --count 个文件后退出。\r\n" +
                       "sync: 增量同步一个文件夹（只传差异），适合任务计划程序定时备份。\r\n" +
                       "verify: 用本地校验缓存核对目录中文件是否与接收时一致（发现改动退出码为 1）。\r\n" +
                       "默认协议 TCP；--nocompress/--noencrypt 关闭压缩/加密协商。"
                     : "Usage:\r\n" +
                       "  TrFileTransfer send --ip <IP> --port <port> [--tcp|--udt|--udp] --file <path|--folder <path>\r\n" +
-                      "        [--code <pairing code>] [--limit <KB/s>] [--srcport <port>] [--nocompress] [--noencrypt] [--passes <N>] [--nofec] [--fec-parity <N>]\r\n" +
+                      "        [--code <pairing code>] [--limit <KB/s>] [--srcport <port>] [--nocompress] [--noencrypt] [--passes <N>] [--nofec] [--fec-parity <N>] [--udp-v2]\r\n" +
                       "  TrFileTransfer recv --port <port> [--out <dir>] [--tcp|--udt|--udp] [--code <pairing code>] [--count <N>]\r\n" +
                       "  TrFileTransfer sync --folder <dir> --ip <IP> --port <port> [--tcp|--udt]\r\n" +
                       "        [--code <pairing code>] [--limit <KB/s>] [--srcport <port>] [--nocompress] [--noencrypt]\r\n" +
@@ -907,6 +957,8 @@ namespace TrFileTransfer
                       "      re-sends the whole file N times to ride out loss. Forward error\r\n" +
                       "      correction (RS erasure coding + interleaving, 2 parity rows per group)\r\n" +
                       "      is on by default; --fec-parity <1-8> sets the redundancy, --nofec disables it.\r\n" +
+                      "      --udp-v2 speaks the Rust trft v2 frame format (interop with\r\n" +
+                      "      \"trft --proto udp\"; the receiving side needs no switch).\r\n" +
                       "recv: receives until Ctrl+C, or until --count files have arrived.\r\n" +
                       "sync: incremental folder sync (differences only) — for scheduled backups.\r\n" +
                       "verify: checks the directory's files against the local digest cache\r\n" +
@@ -1041,6 +1093,15 @@ namespace TrFileTransfer
                     : "Peer is an older version without encryption — falling back to plaintext.";
             }
         }
+        public static string C_EncryptLegacyRetry
+        {
+            get
+            {
+                return IsChinese
+                    ? "对端不认识新版握手（2.12–2.15），改用兼容的 0x09 握手重试（仍加密）。"
+                    : "Peer predates the new handshake (2.12–2.15) — retrying with the compatible 0x09 handshake (still encrypted).";
+            }
+        }
         public static string C_EncryptUnsupported
         {
             get
@@ -1074,6 +1135,12 @@ namespace TrFileTransfer
                 ? string.Format("检测到同名文件的上次分块传输未完成且大小不同，已重置重组状态：{0}", name)
                 : string.Format("Stale chunk reassembly for '{0}' (different size) — reset", name);
         }
+        public static string S_FolderSessionForeignPeer(object session)
+        {
+            return IsChinese
+                ? string.Format("文件夹续传会话 {0} 属于其他来源，已拒绝。", session)
+                : string.Format("Folder-resume session {0} belongs to another peer — refusing.", session);
+        }
         public static string S_ChunkGroupForeignPeer(object group)
         {
             return IsChinese
@@ -1089,8 +1156,62 @@ namespace TrFileTransfer
         public static string S_AuthLockedOut(object ip)
         {
             return IsChinese
-                ? string.Format("配对码错误次数过多，已临时锁定该来源: {0}（重启服务可解除）。", ip)
-                : string.Format("Too many wrong pairing codes — temporarily locked out: {0} (restart the server to clear).", ip);
+                ? string.Format("配对码错误次数过多，已临时锁定该来源: {0}（10 分钟后自动解除）。", ip)
+                : string.Format("Too many wrong pairing codes — temporarily locked out: {0} (clears automatically after 10 minutes).", ip);
+        }
+        public static string S_AuthBusy
+        {
+            get
+            {
+                return IsChinese
+                    ? "并发的加密握手过多，暂时拒绝新连接。"
+                    : "Too many concurrent encrypted handshakes — refusing new connections.";
+            }
+        }
+        public static string S_TooManyConnections
+        {
+            get
+            {
+                return IsChinese
+                    ? "并发连接数已达上限，已拒绝新连接。"
+                    : "Connection limit reached — new connection refused.";
+            }
+        }
+        public static string ConnIdleTimeout
+        {
+            get
+            {
+                return IsChinese
+                    ? "连接空闲超时，已断开。"
+                    : "Connection timed out while idle.";
+            }
+        }
+        public static string S_HandshakeTimeout
+        {
+            get
+            {
+                return IsChinese
+                    ? "连接建立后未发送任何数据，已超时关闭。"
+                    : "No request byte arrived in time — connection closed.";
+            }
+        }
+        public static string S_LegacyAuthWarn
+        {
+            get
+            {
+                return IsChinese
+                    ? "对方使用了旧版 0x09 加密握手：配对码哈希在线上传输，可被离线爆破；建议升级双方版本。"
+                    : "Peer used the legacy 0x09 handshake, whose pairing-code hash crosses the wire (offline-crackable) — upgrade both ends.";
+            }
+        }
+        public static string C_StrictPlainRefused
+        {
+            get
+            {
+                return IsChinese
+                    ? "对方声称未启用配对码并要求明文，但已启用严格加密（EncryptStrict）；已中止传输。"
+                    : "Peer asked to continue in plaintext, but strict encryption (EncryptStrict) is enabled — transfer aborted.";
+            }
         }
         public static string S_EncHandshakeFailed
         {

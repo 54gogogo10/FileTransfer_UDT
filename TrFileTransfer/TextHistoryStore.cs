@@ -84,8 +84,16 @@ namespace TrFileTransfer
             return new TextHistoryEntry { When = when, Text = Unescape(line.Substring(bar + 1)) };
         }
 
+        /// <summary>Files above this size are trimmed on a pool thread instead of the
+        /// caller's. Add() is called on the UI thread (received messages are marshalled
+        /// there); re-reading and rewriting a file holding 200 MB of text froze the
+        /// window for seconds on every single message.</summary>
+        private const long SyncTrimLimitBytes = 1024 * 1024;
+        private int _trimScheduled;
+
         public void Add(string text)
         {
+            bool trimInBackground = false;
             lock (_lock)
             {
                 try
@@ -93,13 +101,31 @@ namespace TrFileTransfer
                     Directory.CreateDirectory(Path.GetDirectoryName(_path));
                     File.AppendAllText(_path,
                         Serialize(new TextHistoryEntry { When = DateTime.Now, Text = text ?? "" }) + Environment.NewLine);
-                    TryTrim();
+                    long length = 0;
+                    try { length = new FileInfo(_path).Length; } catch { }
+                    if (length <= SyncTrimLimitBytes) TryTrimLocked();
+                    else trimInBackground = true;
                 }
                 catch { }
             }
+            // Small files keep the deterministic synchronous behaviour (tests rely on
+            // it); a big history is trimmed without blocking the caller.
+            if (trimInBackground) ScheduleTrim();
         }
 
-        private void TryTrim()
+        private void ScheduleTrim()
+        {
+            if (System.Threading.Interlocked.CompareExchange(ref _trimScheduled, 1, 0) != 0) return;
+            System.Threading.Tasks.Task.Run(delegate
+            {
+                try { lock (_lock) { TryTrimLocked(); } }
+                catch { }
+                finally { System.Threading.Interlocked.Exchange(ref _trimScheduled, 0); }
+            });
+        }
+
+        /// <summary>Rewrites the file to the last MaxEntries lines. Caller holds _lock.</summary>
+        private void TryTrimLocked()
         {
             try
             {

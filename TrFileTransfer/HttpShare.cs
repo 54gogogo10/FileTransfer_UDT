@@ -12,15 +12,18 @@ using System.Threading.Tasks;
 namespace TrFileTransfer
 {
     /// <summary>
-    /// Read-only HTTP share over a directory: any LAN browser (phones included) can
-    /// list and download files. Built on TcpListener so it needs no HttpListener URL
-    /// ACLs or admin rights. An optional access token (pairing mode reuses the pairing
-    /// code) is exchanged once via the entry form for an HttpOnly cookie — listing and
-    /// download links stay clean of credentials. The legacy "?t=..." query still
-    /// authenticates (bookmarks, scripted clients). Navigation and download paths are
-    /// sanitized and pinned under the shared root; files are always served as
-    /// attachments except a small safe-inline allowlist (images/video/pdf/text — never
-    /// HTML/SVG, which could script the page).
+    /// Browser-facing HTTP share over a directory: any LAN browser (phones included)
+    /// can list and download files. When an access token is configured (pairing mode
+    /// reuses the pairing code) the share is also WRITABLE — uploads and single-file
+    /// deletes are allowed, both gated on the token and a same-origin check. WITHOUT a
+    /// token the share is read-only: an anonymous, cross-site-forgeable write endpoint
+    /// was a real exposure, not a feature. Built on TcpListener so it needs no
+    /// HttpListener URL ACLs or admin rights. The token is exchanged once via the entry
+    /// form for an HttpOnly cookie — listing and download links stay clean of
+    /// credentials; the legacy "?t=..." query still authenticates (bookmarks, scripted
+    /// clients). Navigation and download paths are sanitized and pinned under the shared
+    /// root; files are always served as attachments except a small safe-inline allowlist
+    /// (images/video/pdf/text — never HTML/SVG, which could script the page).
     /// </summary>
     public class HttpShareServer
     {
@@ -30,6 +33,11 @@ namespace TrFileTransfer
         private string _rootFull;
         private string _token;
         private volatile bool _isRunning;
+        /// <summary>Host header values this share answers to. Without a whitelist the
+        /// same-origin check below compares Origin against a Host header the attacker
+        /// controls, so DNS rebinding (evil.com -> 192.168.x.x) passes it.</summary>
+        private HashSet<string> _allowedHosts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private bool _allowAnyHost;
 
         // Access-code brute-force defence. The code may be short (a pairing code),
         // so a LAN peer must not be able to try unlimited guesses against the cheap
@@ -48,9 +56,13 @@ namespace TrFileTransfer
         private SemaphoreSlim _connLimit;
         /// <summary>Maximum requests being served at once.</summary>
         public const int MaxConcurrentConnections = 32;
-        /// <summary>Per-connection idle deadline while reading the request head — a
-        /// client that never finishes its headers is dropped instead of held open.</summary>
-        public const int HeadReadTimeoutMs = 15000;
+        /// <summary>Per-connection deadline while reading the request head — a client
+        /// that never finishes its headers is dropped instead of held open. Instance
+        /// field (not const) so tests can shorten it and prove the slot is released.</summary>
+        public int HeadReadTimeoutMs = 15000;
+        /// <summary>Idle deadline for one request-body read (uploads): a peer that stops
+        /// sending mid-body must not hold an admission slot indefinitely.</summary>
+        public int BodyIdleTimeoutMs = 30000;
 
         /// <summary>Fired for lifecycle events and downloads (log-ready lines).</summary>
         public event Action<string> OnLog;
@@ -126,6 +138,43 @@ namespace TrFileTransfer
             return "http://" + ip + ":" + port.ToString(CultureInfo.InvariantCulture) + "/";
         }
 
+        /// <summary>True when the share requires an access code, in which case uploads
+        /// and deletes are allowed (authenticated + same-origin checked). Without a code
+        /// the share is read-only for everyone.</summary>
+        private bool WritesEnabled { get { return _token.Length > 0; } }
+
+        /// <summary>Authorities this share legitimately answers under: loopback, the
+        /// machine name and every local IPv4 address, with and without the port. Used to
+        /// defeat DNS rebinding, where Origin and Host both name the attacker's domain.</summary>
+        private HashSet<string> BuildAllowedHosts(int port)
+        {
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string portText = port.ToString(CultureInfo.InvariantCulture);
+            string[] names = new string[] { "localhost", "127.0.0.1", Environment.MachineName };
+            for (int i = 0; i < names.Length; i++) AddHost(set, names[i], portText);
+            List<string> ips = LanAddresses();
+            for (int i = 0; i < ips.Count; i++) AddHost(set, ips[i], portText);
+            return set;
+        }
+
+        private static void AddHost(HashSet<string> set, string host, string port)
+        {
+            if (string.IsNullOrEmpty(host)) return;
+            set.Add(host);
+            set.Add(host + ":" + port);
+            if (port == "80") set.Add(host);
+        }
+
+        private bool HostAllowed(Dictionary<string, string> headers)
+        {
+            if (_allowAnyHost) return true;
+            string host;
+            if (!headers.TryGetValue("Host", out host)) return false;
+            host = (host ?? "").Trim();
+            if (host.Length == 0) return false;
+            return _allowedHosts.Contains(host);
+        }
+
         private static bool IsRfc1918_172(string ip)
         {
             // 172.16.0.0 – 172.31.255.255
@@ -144,6 +193,8 @@ namespace TrFileTransfer
             if (!_rootFull.EndsWith(Path.DirectorySeparatorChar.ToString()))
                 _rootFull += Path.DirectorySeparatorChar;
             _token = token ?? "";
+            _allowAnyHost = Config.GetBool("HttpShareAllowAnyHost", false);
+            _allowedHosts = BuildAllowedHosts(port);
             lock (_authLock)
             {
                 _authFailures.Clear();
@@ -222,19 +273,29 @@ namespace TrFileTransfer
                     // after the try with a flag.)
                     string head;
                     bool headTimedOut = false;
-                    using (var headCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                    // net48's NetworkStream.ReadAsync does NOT observe a token that is
+                    // cancelled after the read has already started (verified on CLR
+                    // 4.0.30319: the pending task stays pending). A cancellation-based
+                    // timeout therefore never fires and 32 silent connections could pin
+                    // every admission slot forever. Race the read against a deadline and
+                    // close the socket instead — that aborts the pending read.
+                    var headRead = reader.ReadHeadAsync(ct);
+                    var headDeadline = Task.Delay(HeadReadTimeoutMs, CancellationToken.None);
+                    var headWinner = await Task.WhenAny(headRead, headDeadline).ConfigureAwait(false);
+                    if (!ReferenceEquals(headWinner, headRead))
                     {
-                        headCts.CancelAfter(HeadReadTimeoutMs);
-                        try
-                        {
-                            head = await reader.ReadHeadAsync(headCts.Token).ConfigureAwait(false);
-                        }
-                        catch (OperationCanceledException)
-                        {
-                            if (ct.IsCancellationRequested) return;
-                            headTimedOut = true;
-                            head = null;
-                        }
+                        headTimedOut = true;
+                        head = null;
+                        try { client.Close(); } catch { }
+                        // Observe a possible later fault so it is not unobserved.
+                        headRead.ContinueWith(t => { var ignored = t.Exception; },
+                            TaskContinuationOptions.OnlyOnFaulted);
+                    }
+                    else
+                    {
+                        try { head = await headRead.ConfigureAwait(false); }
+                        catch (OperationCanceledException) { return; }
+                        catch (IOException) { return; }
                     }
                     if (headTimedOut)
                     {
@@ -247,6 +308,18 @@ namespace TrFileTransfer
                     int nl = requestLine.IndexOf("\r\n", StringComparison.Ordinal);
                     if (nl >= 0) requestLine = requestLine.Substring(0, nl);
                     var headers = ParseHeaders(head);
+
+                    // Reject any Host this machine is not actually serving under. The
+                    // same-origin check for delete/upload compares Origin against Host,
+                    // so a rebinding attacker's domain must never become a valid Host.
+                    if (!HostAllowed(headers))
+                    {
+                        await WriteSimpleAsync(ns, 400, "Bad Host", ct).ConfigureAwait(false);
+                        return;
+                    }
+                    // Body reads get an idle deadline too: a peer that completes its
+                    // headers and then stops sending must not hold an admission slot.
+                    reader.IdleTimeoutMs = BodyIdleTimeoutMs;
 
                     string method = requestLine.Length > 0 ? requestLine.Split(' ')[0] : "";
                     string rawPath = method.Length > 0 ? requestLine.Substring(method.Length).TrimStart(' ') : "";
@@ -310,6 +383,16 @@ namespace TrFileTransfer
                         }
                     }
 
+                    if (method == "POST" && !WritesEnabled)
+                    {
+                        // Writes require an access code. Without one this is a read-only
+                        // share: otherwise any LAN host — or any web page the user visits,
+                        // since uploads carry no CSRF check — could drop files into the
+                        // directory or delete them.
+                        await WriteSimpleAsync(ns, 403, "Read-only share: set an access code to allow uploads/deletes", ct).ConfigureAwait(false);
+                        return;
+                    }
+
                     if (method == "POST")
                     {
                         string delArg;
@@ -368,6 +451,9 @@ namespace TrFileTransfer
             internal readonly byte[] _buf = new byte[65536];
             internal int _start;
             internal int _end;
+            /// <summary>Per-read idle deadline. 0 = wait forever (the request head has
+            /// its own overall deadline; bodies use this).</summary>
+            public int IdleTimeoutMs;
 
             public NetBufReader(NetworkStream ns) { _ns = ns; }
 
@@ -394,7 +480,25 @@ namespace TrFileTransfer
                     _start = 0;
                 }
                 if (_end == _buf.Length) return _end - _start;
-                int n = await _ns.ReadAsync(_buf, _end, _buf.Length - _end, ct).ConfigureAwait(false);
+                int n;
+                if (IdleTimeoutMs <= 0)
+                {
+                    n = await _ns.ReadAsync(_buf, _end, _buf.Length - _end, ct).ConfigureAwait(false);
+                }
+                else
+                {
+                    // Same reason as the head deadline: the token cannot abort an
+                    // already-started read on net48, so race it against a delay.
+                    var read = _ns.ReadAsync(_buf, _end, _buf.Length - _end, ct);
+                    var delay = Task.Delay(IdleTimeoutMs, CancellationToken.None);
+                    if (!ReferenceEquals(await Task.WhenAny(read, delay).ConfigureAwait(false), read))
+                    {
+                        read.ContinueWith(t => { var ignored = t.Exception; },
+                            TaskContinuationOptions.OnlyOnFaulted);
+                        throw new IOException("connection read timeout");
+                    }
+                    n = await read.ConfigureAwait(false);
+                }
                 _end += n;
                 return _end - _start;
             }
@@ -751,6 +855,14 @@ namespace TrFileTransfer
         private async Task HandleUploadAsync(NetworkStream ns, NetBufReader reader,
             Dictionary<string, string> headers, string query, string peer, CancellationToken ct)
         {
+            // Same-origin check, exactly like the delete path: without it any website
+            // the user visits can POST a multipart form into the share (multipart is a
+            // CORS-safelisted content type, so no preflight is involved).
+            if (!SameOriginOrNoOrigin(headers))
+            {
+                await WriteSimpleAsync(ns, 403, "Forbidden", ct).ConfigureAwait(false);
+                return;
+            }
             long contentLength;
             string clen;
             if (!headers.TryGetValue("Content-Length", out clen) ||
@@ -818,7 +930,9 @@ namespace TrFileTransfer
                 // (CON/NUL/…) plus trailing dots/spaces — same rules the transfer
                 // receivers apply; a crafted upload must never open a device.
                 string bareName = Path.GetFileName(filename.Replace('/', '\\'));
+                bareName = Utils.ReplaceInvalidNameChars(Utils.StripControlChars(bareName));
                 bareName = bareName.TrimEnd('.', ' ');
+                if (bareName.Length > 200) bareName = bareName.Substring(0, 200);
                 if (Utils.IsReservedFileName(bareName))
                     bareName = "_" + bareName;
                 if (string.IsNullOrWhiteSpace(bareName) || bareName == "_")
@@ -838,17 +952,42 @@ namespace TrFileTransfer
                     await WriteSimpleAsync(ns, 507, "Insufficient Storage", ct).ConfigureAwait(false);
                     return;
                 }
+                // Write the part to a sibling temp file and only move it into place once
+                // the body is complete: (a) an interrupted upload must not leave what
+                // looks like a finished file, and (b) the final name is chosen by
+                // renaming, so two same-named uploads can never truncate each other
+                // (FileMode.Create on a name picked microseconds earlier could).
                 string savePath = Utils.GetUniqueSavePath(dir, bareName);
-
+                string tmpPath = savePath + ".part-" + Guid.NewGuid().ToString("N");
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                using (var fs = new FileStream(savePath, FileMode.Create, FileAccess.Write,
-                    FileShare.None, 65536, FileOptions.SequentialScan))
+                try
                 {
-                    // Cap THIS file, not just the whole request: one part must not be
-                    // able to stream up to the 4 GB request cap into a single file.
-                    long perFile = Math.Min(MaxUploadFileBytes, contentLength);
-                    if (!await ReadUntilAsync(reader, midDelim, fs, perFile, ct).ConfigureAwait(false))
-                        throw new IOException("upload part truncated");
+                    using (var fs = new FileStream(tmpPath, FileMode.CreateNew, FileAccess.Write,
+                        FileShare.None, 65536, FileOptions.SequentialScan))
+                    {
+                        // Cap THIS file, not just the whole request: one part must not be
+                        // able to stream up to the 4 GB request cap into a single file.
+                        long perFile = Math.Min(MaxUploadFileBytes, contentLength);
+                        if (!await ReadUntilAsync(reader, midDelim, fs, perFile, ct).ConfigureAwait(false))
+                            throw new IOException("upload part truncated");
+                    }
+                    bool committed = false;
+                    for (int attempt = 0; attempt < 5 && !committed; attempt++)
+                    {
+                        try { File.Move(tmpPath, savePath); committed = true; }
+                        catch (IOException)
+                        {
+                            // Another upload took the name between our check and the
+                            // move — pick the next free suffix and retry.
+                            savePath = Utils.GetUniqueSavePath(dir, bareName);
+                        }
+                    }
+                    if (!committed) throw new IOException("could not commit upload");
+                }
+                catch
+                {
+                    try { if (File.Exists(tmpPath)) File.Delete(tmpPath); } catch { }
+                    throw;
                 }
                 sw.Stop();
                 if (filesBytes + new FileInfo(savePath).Length > MaxUploadBytes)
@@ -1001,10 +1140,12 @@ namespace TrFileTransfer
                   .Append(isDir ? "&#128193; " : "&#128196; ").Append(HtmlEscape(e.Name))
                   .Append(isDir ? "/" : "").Append("</a><span style=\"display:flex;gap:10px;align-items:center\">")
                   .Append("<span>").Append(size).Append("</span>");
-                if (!isDir)
+                if (!isDir && WritesEnabled)
                 {
                     // ✕ steps to a no-JS confirm page (CSP allows no inline script);
-                    // the actual delete is the POST behind it
+                    // the actual delete is the POST behind it. Hidden entirely when the
+                    // share has no access code (read-only), so the UI never offers an
+                    // action the server refuses.
                     sb.Append("<a style=\"color:#c62828;font-weight:bold;text-decoration:none\" href=\"?delconfirm=")
                       .Append(Uri.EscapeDataString(rel)).Append("&amp;p=").Append(Uri.EscapeDataString(rawRel))
                       .Append("\">&#10005;</a>");
@@ -1015,15 +1156,19 @@ namespace TrFileTransfer
                 sb.Append("<li><span>").Append(L.HttpShareEmpty).Append("</span></li>");
             sb.Append("</ul>");
 
-            // Upload form — posts into the directory being viewed
+            // Upload form — posts into the directory being viewed (only when the
+            // share is writable; see WritesEnabled)
             string formAction = linkQuery.Length > 0 ? "/?" + linkQuery.Substring(1) : "/";
-            sb.Append("<form method=\"post\" action=\"" + HtmlEscape(formAction) +
-                "\" enctype=\"multipart/form-data\" style=\"margin:10px 8px 24px;background:#fff;padding:12px;border-radius:8px;display:flex;gap:8px;flex-wrap:wrap\">");
-            sb.Append("<input type=\"hidden\" name=\"p\" value=\"").Append(HtmlEscape(rawRel)).Append("\">");
-            sb.Append("<input type=\"file\" name=\"file\" multiple required style=\"flex:1;min-width:200px;font-size:.95rem\">");
-            sb.Append("<input type=\"submit\" value=\"").Append(L.HttpShareUploadBtn)
-              .Append("\" style=\"padding:8px 16px;border:0;border-radius:8px;background:#0078d7;color:#fff;font-size:.95rem\">");
-            sb.Append("</form>");
+            if (WritesEnabled)
+            {
+                sb.Append("<form method=\"post\" action=\"" + HtmlEscape(formAction) +
+                    "\" enctype=\"multipart/form-data\" style=\"margin:10px 8px 24px;background:#fff;padding:12px;border-radius:8px;display:flex;gap:8px;flex-wrap:wrap\">");
+                sb.Append("<input type=\"hidden\" name=\"p\" value=\"").Append(HtmlEscape(rawRel)).Append("\">");
+                sb.Append("<input type=\"file\" name=\"file\" multiple required style=\"flex:1;min-width:200px;font-size:.95rem\">");
+                sb.Append("<input type=\"submit\" value=\"").Append(L.HttpShareUploadBtn)
+                  .Append("\" style=\"padding:8px 16px;border:0;border-radius:8px;background:#0078d7;color:#fff;font-size:.95rem\">");
+                sb.Append("</form>");
+            }
 
             sb.Append("<p style=\"text-align:center;color:#aaa;font-size:.75rem\">TrFileTransfer</p></body></html>");
 
@@ -1125,6 +1270,7 @@ namespace TrFileTransfer
                 head = Encoding.ASCII.GetBytes(
                     "HTTP/1.1 206 Partial Content\r\n" +
                     "Content-Type: " + mime + "\r\n" +
+                    "X-Content-Type-Options: nosniff\r\n" +
                     "Content-Length: " + (rangeEnd - rangeStart + 1) + "\r\n" +
                     "Content-Range: bytes " + rangeStart + "-" + rangeEnd + "/" + total + "\r\n" +
                     "Accept-Ranges: bytes\r\n" +
@@ -1137,6 +1283,7 @@ namespace TrFileTransfer
                 head = Encoding.ASCII.GetBytes(
                     "HTTP/1.1 200 OK\r\n" +
                     "Content-Type: " + mime + "\r\n" +
+                    "X-Content-Type-Options: nosniff\r\n" +
                     "Content-Length: " + total + "\r\n" +
                     "Accept-Ranges: bytes\r\n" +
                     "Content-Disposition: " + (inline ? "inline" : "attachment") +
@@ -1194,6 +1341,7 @@ namespace TrFileTransfer
                 // This share renders attacker-influenced names; do not cache and do not
                 // let another origin frame it (clickjacking on the upload form).
                 "Cache-Control: no-store\r\nX-Frame-Options: DENY\r\n" +
+                "X-Content-Type-Options: nosniff\r\n" +
                 "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\n\r\n");
             await ns.WriteAsync(head, 0, head.Length, ct).ConfigureAwait(false);
             await ns.WriteAsync(body, 0, body.Length, ct).ConfigureAwait(false);

@@ -88,39 +88,60 @@ namespace TrFileTransfer
             return loaded;
         }
 
+        /// <summary>Serializes saves inside this process: two windows (or the UI and a
+        /// test) saving at once must not interleave their temp files.</summary>
+        private static readonly object _saveLock = new object();
+
         public static void Save()
         {
-            try
+            lock (_saveLock)
             {
-                Directory.CreateDirectory(_dir);
-                string[] lines;
-                lock (_lock)
-                {
-                    lines = new string[_values.Count];
-                    int i = 0;
-                    foreach (var kv in _values)
-                        lines[i++] = kv.Key + "=" + kv.Value;
-                }
-                // Write-then-swap so a crash mid-save can never truncate the live
-                // file; the previous good generation stays one step back in .bak.
-                string tmp = _path + ".tmp";
-                File.WriteAllLines(tmp, lines);
                 try
                 {
-                    if (File.Exists(_path)) File.Copy(_path, _path + ".bak", true);
+                    Directory.CreateDirectory(_dir);
+                    string[] lines;
+                    lock (_lock)
+                    {
+                        lines = new string[_values.Count];
+                        int i = 0;
+                        foreach (var kv in _values)
+                            lines[i++] = kv.Key + "=" + kv.Value;
+                    }
+                    // Write-then-swap so a crash mid-save can never truncate the live
+                    // file; the previous good generation stays one step back in .bak.
+                    // The temp name is unique so two instances cannot fight over it.
+                    string tmp = _path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                    try
+                    {
+                        File.WriteAllLines(tmp, lines);
+                        try
+                        {
+                            if (File.Exists(_path)) File.Copy(_path, _path + ".bak", true);
+                        }
+                        catch { }
+                        bool replaced = false;
+                        if (File.Exists(_path))
+                        {
+                            try { File.Replace(tmp, _path, null); replaced = true; }
+                            catch { }
+                        }
+                        if (!replaced)
+                        {
+                            // NEVER delete the live file first (the old fallback did,
+                            // and a failed move then left no config at all — the next
+                            // start reads that as a user reset and silently drops every
+                            // security setting). Copy over it instead: on failure the
+                            // previous generation stays exactly as it was.
+                            File.Copy(tmp, _path, true);
+                        }
+                    }
+                    finally
+                    {
+                        try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+                    }
                 }
                 catch { }
-                if (File.Exists(_path))
-                {
-                    try { File.Replace(tmp, _path, null); }
-                    catch { File.Delete(_path); File.Move(tmp, _path); }
-                }
-                else
-                {
-                    File.Move(tmp, _path);
-                }
             }
-            catch { }
         }
 
         public static string Get(string key, string fallback)

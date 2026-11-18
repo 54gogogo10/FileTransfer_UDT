@@ -16,6 +16,8 @@
     <!-- 仅用 WinForms 的 NotifyIcon/FolderBrowserDialog 与 System.Drawing 的图标（net48 WPF 无零依赖替代） -->
     <Reference Include="System.Windows.Forms" />
     <Reference Include="System.Drawing" />
+    <!-- DPAPI（ProtectedData）用于配对码落盘加密；见 SecretProtector.cs -->
+    <Reference Include="System.Security" />
   </ItemGroup>
 
   <ItemGroup>
