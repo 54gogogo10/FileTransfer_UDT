@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
@@ -335,6 +335,8 @@ namespace TrFileTransfer
         private readonly string _saveDirectory;
         private volatile bool _isRunning;
         private bool _startupOk;
+        /// <summary>The accept loop task, awaited by Stop() before native cleanup.</summary>
+        private Task _acceptTask;
         private int _activeClients;
         private readonly List<int> _clientSockets = new List<int>();
         private readonly ServerWireContext _wire = new ServerWireContext();
@@ -575,7 +577,7 @@ namespace TrFileTransfer
 
             Log(L.UdtS_Started(_port.ToString(), _saveDirectory));
 
-            Task.Factory.StartNew(() => AcceptLoop(_cts.Token), _cts.Token,
+            _acceptTask = Task.Factory.StartNew(() => AcceptLoop(_cts.Token), _cts.Token,
                 TaskCreationOptions.LongRunning, TaskScheduler.Default);
         }
 
@@ -584,12 +586,28 @@ namespace TrFileTransfer
         {
             _isRunning = false;
             var cts = _cts;
-            if (cts != null) cts.Cancel();
-            if (_socket >= 0)
+            _cts = null;
+            if (cts != null) { try { cts.Cancel(); } catch { } }
+            int sock = _socket;
+            _socket = -1;
+            if (sock >= 0)
             {
-                try { UdtNative.udt_close(_socket); } catch { }
-                _socket = -1;
+                try { UdtNative.udt_close(sock); } catch { }
             }
+
+            // The accept thread may still be inside udt_accept(). Tearing the native
+            // library down under it is an AccessViolation (seen on CI: the lambda read
+            // _socket after Stop had set it to -1). Closing the listener makes accept
+            // return; wait for the loop to leave before UdtCleanup.
+            var accept = _acceptTask;
+            _acceptTask = null;
+            bool acceptDone = true;
+            if (accept != null)
+            {
+                try { acceptDone = accept.Wait(3000); }
+                catch { acceptDone = true; }
+            }
+
             // Persist incomplete resume sessions and dispose chunk trackers
             _wire.Shutdown();
             // Close all active client sockets so HandleClient tasks unblock immediately
@@ -599,7 +617,21 @@ namespace TrFileTransfer
                     try { UdtNative.udt_close(cs); } catch { }
                 _clientSockets.Clear();
             }
-            Uninit();
+
+            if (acceptDone)
+            {
+                Uninit();
+            }
+            else if (_startupOk)
+            {
+                // Accept is still unwinding; release this server's refcount from its
+                // continuation instead of cleaning the library underneath it.
+                _startupOk = false;
+                accept.ContinueWith(delegate { try { UdtNative.UdtCleanup(); } catch { } },
+                    TaskScheduler.Default);
+            }
+
+            if (cts != null) { try { cts.Dispose(); } catch { } }
             var handler = OnStopped;
             if (handler != null) handler();
             Log(L.UdtS_Stopped);
@@ -621,12 +653,17 @@ namespace TrFileTransfer
                 int clientSocket = -1;
                 try
                 {
+                    if (!_isRunning) break;
+                    // Capture the descriptor: Stop() sets _socket to -1, and a late
+                    // udt_accept(-1, ...) is undefined behavior in the native library.
+                    int listenSocket = _socket;
+                    if (listenSocket < 0) break;
                     // Family-agnostic buffer: v4 peers fill the first 16 bytes (AF_INET),
                     // v6 peers all 28 (AF_INET6) — see UdtNative.ParsePeer.
                     var raw = new byte[UdtNative.SockAddr6Size];
                     int addrLen = raw.Length;
                     clientSocket = await Task.Run(() =>
-                        UdtNative.udt_accept(_socket, raw, ref addrLen), ct);
+                        UdtNative.udt_accept(listenSocket, raw, ref addrLen), ct);
                     if (clientSocket < 0) break;
 
                     UdtNative.SetTimeout(clientSocket, 30000, 30000);
