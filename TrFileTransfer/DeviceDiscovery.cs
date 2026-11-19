@@ -93,6 +93,14 @@ namespace TrFileTransfer
         private UdpClient _udp;
         private CancellationTokenSource _cts;
         private readonly int _port;
+        // A 1-byte probe produces a response of up to ~260 bytes (name + port + flags),
+        // so the responder is a modest UDP amplifier and, with a spoofed source, a
+        // reflection primitive. A global reply budget makes that useless without
+        // changing behaviour for real peers (normal scans send a handful of probes).
+        private readonly object _rateLock = new object();
+        private long _windowStartTicks;
+        private int _repliesInWindow;
+        private const int MaxRepliesPerSecond = 200;
 
         public DiscoveryServer(int port)
         {
@@ -133,6 +141,7 @@ namespace TrFileTransfer
                     var result = await _udp.ReceiveAsync();
                     if (result.Buffer.Length >= 1 && result.Buffer[0] == DiscoveryProtocol.Probe)
                     {
+                        if (!TakeReplyBudget()) continue;
                         var resp = DiscoveryProtocol.BuildResponse(serverName, serverPort, tcp, udt, pairing);
                         await _udp.SendAsync(resp, resp.Length, result.RemoteEndPoint);
                     }
@@ -147,6 +156,23 @@ namespace TrFileTransfer
                     if (ct.IsCancellationRequested) break;
                 }
                 catch (Exception) { if (ct.IsCancellationRequested) break; }
+            }
+        }
+
+        /// <summary>Token bucket for discovery replies (see MaxRepliesPerSecond).</summary>
+        private bool TakeReplyBudget()
+        {
+            long now = DateTime.UtcNow.Ticks;
+            lock (_rateLock)
+            {
+                if (now - _windowStartTicks >= TimeSpan.TicksPerSecond)
+                {
+                    _windowStartTicks = now;
+                    _repliesInWindow = 0;
+                }
+                if (_repliesInWindow >= MaxRepliesPerSecond) return false;
+                _repliesInWindow++;
+                return true;
             }
         }
 

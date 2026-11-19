@@ -26,6 +26,14 @@ namespace TrFileTransfer
         /// TCP reads have no timeout to interrupt them otherwise.</summary>
         private readonly System.Collections.Concurrent.ConcurrentDictionary<TcpClient, byte> _clients
             = new System.Collections.Concurrent.ConcurrentDictionary<TcpClient, byte>();
+        /// <summary>Upper bound on simultaneously served connections. Each accepted
+        /// connection can allocate multi-megabyte buffers once it sends a header, so an
+        /// unauthenticated peer must not be able to open sockets without limit.</summary>
+        public const int MaxConcurrentConnections = 64;
+        private readonly SemaphoreSlim _connLimit = new SemaphoreSlim(MaxConcurrentConnections, MaxConcurrentConnections);
+        /// <summary>How long an accepted connection may stay silent before the first
+        /// request byte arrives (an idle socket must not hold a slot forever).</summary>
+        public int HandshakeTimeoutMs = 30000;
 
         /// <summary>Fired for every log message.</summary>
         public event Action<string> OnLog;
@@ -295,6 +303,16 @@ namespace TrFileTransfer
                         }
                     }
                     Log(L.S_ClientConnected(clientEp));
+                    if (!_connLimit.Wait(0))
+                    {
+                        // Admission control: the sender learns immediately instead of
+                        // queueing an unbounded number of half-open sockets.
+                        Log(L.S_TooManyConnections);
+                        var fullHandler = OnError;
+                        if (fullHandler != null) fullHandler(L.S_TooManyConnections);
+                        try { client.Close(); } catch { }
+                        continue;
+                    }
                     var _ = HandleClient(client, ct, clientEp);
                 }
                 catch (ObjectDisposedException) { break; }
@@ -315,6 +333,20 @@ namespace TrFileTransfer
 
         private async Task HandleClient(TcpClient client, CancellationToken ct, IPEndPoint clientEp)
         {
+            try
+            {
+                await HandleClientCore(client, ct, clientEp).ConfigureAwait(false);
+            }
+            finally
+            {
+                // The admission slot is released on EVERY path, including a throwing
+                // OnClientConnected handler (which runs before the using block below).
+                try { _connLimit.Release(); } catch { }
+            }
+        }
+
+        private async Task HandleClientCore(TcpClient client, CancellationToken ct, IPEndPoint clientEp)
+        {
             var connectedHandler = OnClientConnected;
             if (connectedHandler != null) connectedHandler(clientEp);
 
@@ -329,6 +361,12 @@ namespace TrFileTransfer
                     WireOutcome outcome;
                     using (var ws = new TcpWireStream(client.GetStream(), L.S_ConnClosedUnexpectedly))
                     {
+                        // Idle deadline for every read: a peer that connects (even one
+                        // that completes the first frame) and then goes silent used to
+                        // hold a handler and an admission slot forever. The receive
+                        // confirmation prompt can take up to 30s before payload starts,
+                        // so 60s leaves comfortable headroom.
+                        ws.SetReadTimeoutMs(60000);
                         // Progress/completion callbacks are scoped to THIS connection via
                         // the session hook: the parent's shared delegate fans every
                         // connection's progress out to every subscribed handler, which
@@ -341,7 +379,7 @@ namespace TrFileTransfer
                                 var ph = OnClientProgress; if (ph != null) ph(clientEp, p);
                                 var h = OnProgress; if (h != null) h(p);
                             };
-                        }).ConfigureAwait(false);
+                        }, HandshakeTimeoutMs).ConfigureAwait(false);
                     }
 
                     RaiseSessionStats(outcome);

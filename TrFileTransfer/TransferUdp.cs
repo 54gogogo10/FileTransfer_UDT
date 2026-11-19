@@ -115,6 +115,178 @@ namespace TrFileTransfer
         }
     }
 
+    /// <summary>Wire format of the Rust trft v2 one-way UDP protocol (v2.16 interop).
+    /// The v1 (TU/1) format above is kept for C#↔C#; this one is byte-compatible
+    /// with `trft --proto udp`:
+    ///   header = [0]=2, [1]=frame, [2..10]=session u64 LE, [10..18]=seq u64 LE, [18..20]=0
+    ///   START  = u16 nameLen + name + u64 size + u32 chunkLen + u8 fec + u8 parity + [32B hash]
+    ///   DATA   = seq = global chunk index, payload = actual chunk bytes (last chunk short)
+    ///   PARITY = u32 group + u8 shard index (>=4) + full chunkLen RS shard
+    ///   END    = 32B SHA-256
+    /// Session id = SHA-256(name || size LE || mtime-nanos LE)[0..8] as LE u64; the
+    /// sender repeats START/END three times (40 ms apart) because a one-way link
+    /// cannot repair a lost control frame. Must stay C# 5.</summary>
+    public static class UdpV2Wire
+    {
+        public const byte Version = 2;
+        public const int HeaderSize = 20;
+        public const byte FrameStart = 0x01;
+        public const byte FrameData = 0x02;
+        public const byte FrameEnd = 0x03;
+        public const byte FrameParity = 0x04;
+
+        public const int ChunkSize = 1200;   // trft UDP_CHUNK
+        public const int FecDataShards = 4;  // trft FEC_DATA_SHARDS
+        public const int MaxNameBytes = 255;
+        public const int StartCopies = 3;
+        public const int FrameSpacingMs = 40;
+        public const int InterPassDelayMs = 400;
+        /// <summary>Bound on a START-declared chunk count (bitmap ≤ 2 MB/session).</summary>
+        public const long MaxChunks = 16 * 1024 * 1024;
+        public const int MaxSessions = 64;
+        private const long UnixEpochTicks = 621355968000000000L;
+
+        public static ulong DeriveSession(string name, long size, long mtimeNanos)
+        {
+            byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(name);
+            var material = new byte[nameBytes.Length + 16];
+            Buffer.BlockCopy(nameBytes, 0, material, 0, nameBytes.Length);
+            WriteU64(material, nameBytes.Length, (ulong)size);
+            WriteU64(material, nameBytes.Length + 8, (ulong)mtimeNanos);
+            byte[] hash;
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+                hash = sha.ComputeHash(material);
+            return ReadU64(hash, 0);
+        }
+
+        /// <summary>mtime as nanoseconds since the Unix epoch (the v2 session key
+        /// input; second granularity would collide same-second edits).</summary>
+        public static long GetMtimeNanos(string path)
+        {
+            long ticks = File.GetLastWriteTimeUtc(path).Ticks;
+            long d = ticks - UnixEpochTicks;
+            if (d < 0) d = 0;
+            return d * 100L;
+        }
+
+        public static byte[] BuildHeader(byte frame, ulong session, ulong seq)
+        {
+            var buf = new byte[HeaderSize];
+            buf[0] = Version;
+            buf[1] = frame;
+            WriteU64(buf, 2, session);
+            WriteU64(buf, 10, seq);
+            return buf;
+        }
+
+        public static byte[] BuildStart(ulong session, string name, long size, int chunkLen,
+            bool fec, int parity, byte[] hash)
+        {
+            byte[] nameBytes = System.Text.Encoding.UTF8.GetBytes(name);
+            int body = 2 + nameBytes.Length + 8 + 4 + 1 + 1 + (hash != null ? 32 : 0);
+            var frame = new byte[HeaderSize + body];
+            byte[] head = BuildHeader(FrameStart, session, 0);
+            Buffer.BlockCopy(head, 0, frame, 0, HeaderSize);
+            int p = HeaderSize;
+            frame[p++] = (byte)(nameBytes.Length & 0xFF);
+            frame[p++] = (byte)((nameBytes.Length >> 8) & 0xFF);
+            Buffer.BlockCopy(nameBytes, 0, frame, p, nameBytes.Length); p += nameBytes.Length;
+            WriteU64(frame, p, (ulong)size); p += 8;
+            frame[p++] = (byte)(chunkLen & 0xFF);
+            frame[p++] = (byte)((chunkLen >> 8) & 0xFF);
+            frame[p++] = (byte)((chunkLen >> 16) & 0xFF);
+            frame[p++] = (byte)((chunkLen >> 24) & 0xFF);
+            frame[p++] = (byte)(fec ? 1 : 0);
+            frame[p++] = (byte)Math.Max(1, Math.Min(8, parity));
+            if (hash != null) Buffer.BlockCopy(hash, 0, frame, p, 32);
+            return frame;
+        }
+
+        public static byte[] BuildData(ulong session, long seq, byte[] chunk, int offset, int len)
+        {
+            var frame = new byte[HeaderSize + len];
+            byte[] head = BuildHeader(FrameData, session, (ulong)seq);
+            Buffer.BlockCopy(head, 0, frame, 0, HeaderSize);
+            Buffer.BlockCopy(chunk, offset, frame, HeaderSize, len);
+            return frame;
+        }
+
+        public static byte[] BuildParity(ulong session, int group, int shardIndex, byte[] shard, int len)
+        {
+            var frame = new byte[HeaderSize + 4 + 1 + len];
+            byte[] head = BuildHeader(FrameParity, session, 0);
+            Buffer.BlockCopy(head, 0, frame, 0, HeaderSize);
+            frame[HeaderSize] = (byte)(group & 0xFF);
+            frame[HeaderSize + 1] = (byte)((group >> 8) & 0xFF);
+            frame[HeaderSize + 2] = (byte)((group >> 16) & 0xFF);
+            frame[HeaderSize + 3] = (byte)((group >> 24) & 0xFF);
+            frame[HeaderSize + 4] = (byte)shardIndex;
+            Buffer.BlockCopy(shard, 0, frame, HeaderSize + 5, len);
+            return frame;
+        }
+
+        public static byte[] BuildEnd(ulong session, byte[] hash)
+        {
+            var frame = new byte[HeaderSize + 32];
+            byte[] head = BuildHeader(FrameEnd, session, 0);
+            Buffer.BlockCopy(head, 0, frame, 0, HeaderSize);
+            Buffer.BlockCopy(hash, 0, frame, HeaderSize, 32);
+            return frame;
+        }
+
+        public static bool TryParseHeader(byte[] buf, int len, out byte frame, out ulong session, out long seq)
+        {
+            frame = 0; session = 0; seq = 0;
+            if (buf == null || len < HeaderSize || buf[0] != Version) return false;
+            frame = buf[1];
+            session = ReadU64(buf, 2);
+            ulong s = ReadU64(buf, 10);
+            if (s > long.MaxValue) return false;
+            seq = (long)s;
+            return true;
+        }
+
+        /// <summary>Mirror of trft sanitize_name for the START name: a bare name only,
+        /// no separators / control characters / trailing dot or space. Invalid names
+        /// are ignored (never written to disk).</summary>
+        public static bool TryNormalizeName(string raw, out string name)
+        {
+            name = null;
+            if (raw == null) return false;
+            string n = raw.Trim();
+            if (n.Length == 0) return false;
+            if (System.Text.Encoding.UTF8.GetByteCount(n) > MaxNameBytes) return false;
+            if (n == "." || n == "..") return false;
+            if (n.IndexOf('/') >= 0 || n.IndexOf('\\') >= 0) return false;
+            if (n[n.Length - 1] == '.' || n[n.Length - 1] == ' ') return false;
+            for (int i = 0; i < n.Length; i++)
+            {
+                char c = n[i];
+                if (char.IsControl(c)) return false;
+                if (c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') return false;
+            }
+            name = n;
+            return true;
+        }
+
+        public static void WriteU64(byte[] buf, int off, ulong value)
+        {
+            for (int i = 0; i < 8; i++) buf[off + i] = (byte)((value >> (8 * i)) & 0xFF);
+        }
+
+        public static ulong ReadU64(byte[] buf, int off)
+        {
+            ulong v = 0;
+            for (int i = 0; i < 8; i++) v |= ((ulong)buf[off + i]) << (8 * i);
+            return v;
+        }
+
+        public static long ReadI64(byte[] buf, int off)
+        {
+            return (long)ReadU64(buf, off);
+        }
+    }
+
     /// <summary>Management of the receiver's on-disk .part files — the "disk is the
     /// state" of one-way UDP. Listing and cleanup are pure file operations shared by
     /// the UI; deleting the part of a LIVE session fails on the open handle (the
@@ -205,6 +377,9 @@ namespace TrFileTransfer
         /// passes from turning into _1 duplicate files. After the window (or a
         /// restart) a repeat send delivers again, exactly as before.</summary>
         private readonly Dictionary<Guid, DateTime> _delivered = new Dictionary<Guid, DateTime>();
+        /// <summary>v2 (Rust trft) sessions, keyed by the protocol's u64 session id.</summary>
+        private readonly Dictionary<ulong, UdpV2RecvSession> _v2Sessions = new Dictionary<ulong, UdpV2RecvSession>();
+        private readonly Dictionary<ulong, DateTime> _v2Delivered = new Dictionary<ulong, DateTime>();
         private static readonly TimeSpan DeliveredWindow = TimeSpan.FromMinutes(10);
         private const int MaxDeliveredMemory = 256;
         /// <summary>Finalizations run on the pool but one at a time: GetUniqueSavePath
@@ -322,10 +497,17 @@ namespace TrFileTransfer
 
         public void Stop()
         {
+            // Stop accepting first, then let the receive loop finish: a datagram that
+            // raced the old order could create a session AFTER the table was cleared,
+            // leaving an open FileStream nobody owned.
             _isRunning = false;
             if (_gc != null) { try { _gc.Dispose(); } catch { } _gc = null; }
             var cts = _cts;
-            if (cts != null) { try { cts.Cancel(); } catch { } }
+            _cts = null;
+            if (cts != null)
+            {
+                try { cts.Cancel(); } catch { }
+            }
             if (_udp != null)
             {
                 try { _udp.Close(); } catch { }
@@ -335,7 +517,10 @@ namespace TrFileTransfer
             {
                 foreach (var s in _sessions.Values) s.CloseStream();
                 _sessions.Clear();
+                foreach (var s in _v2Sessions.Values) s.CloseStream();
+                _v2Sessions.Clear();
             }
+            if (cts != null) { try { cts.Dispose(); } catch { } }
             var handler = OnStopped;
             if (handler != null) handler();
             Log(L.UdpS_Stopped);
@@ -367,7 +552,14 @@ namespace TrFileTransfer
 
         private void HandleDatagram(byte[] buf, IPEndPoint from)
         {
-            if (buf == null || buf.Length < UdpOneWay.HeaderSize) return;
+            if (buf == null) return;
+            // v2 (Rust trft) frames start with version 2; v1 starts with "TU" (0x54).
+            if (buf.Length >= UdpV2Wire.HeaderSize && buf[0] == UdpV2Wire.Version)
+            {
+                HandleV2Datagram(buf, buf.Length, from);
+                return;
+            }
+            if (buf.Length < UdpOneWay.HeaderSize) return;
             if (buf[0] != UdpOneWay.Magic[0] || buf[1] != UdpOneWay.Magic[1]) return;
             if (buf[2] != UdpOneWay.Version) return;
             string peerIp = from != null ? from.Address.ToString() : "";
@@ -381,9 +573,332 @@ namespace TrFileTransfer
             byte type = buf[3];
             Guid session = new Guid(Utils.CopyBytes(buf, 4, 16));
             if (type == UdpOneWay.FrameStart) HandleStart(buf, session, from, peerIp);
-            else if (type == UdpOneWay.FrameData) HandleData(buf, session, from);
-            else if (type == UdpOneWay.FrameParity) HandleParity(buf, session, from);
-            else if (type == UdpOneWay.FrameEnd) TouchSession(session);
+            else if (type == UdpOneWay.FrameData) HandleData(buf, session, from, peerIp);
+            else if (type == UdpOneWay.FrameParity) HandleParity(buf, session, from, peerIp);
+            else if (type == UdpOneWay.FrameEnd) TouchSession(session, peerIp);
+        }
+
+        // ------------------------------------------------------------------
+        // v2 (Rust trft) one-way UDP receive path
+        // ------------------------------------------------------------------
+
+        private void HandleV2Datagram(byte[] buf, int len, IPEndPoint from)
+        {
+            string peerIp = from != null ? from.Address.ToString() : "";
+            if (IpAllowed != null && !IpAllowed(peerIp))
+            {
+                Log(L.UdpS_IpRefused(peerIp));
+                return;
+            }
+            byte frame; ulong session; long seq;
+            if (!UdpV2Wire.TryParseHeader(buf, len, out frame, out session, out seq)) return;
+            lock (_sessionLock)
+            {
+                DateTime deliveredAt;
+                if (_v2Delivered.TryGetValue(session, out deliveredAt)
+                    && DateTime.UtcNow - deliveredAt < DeliveredWindow)
+                    return; // a later pass of a transfer that already landed
+            }
+            if (frame == UdpV2Wire.FrameStart) HandleV2Start(buf, len, session, from, peerIp);
+            else if (frame == UdpV2Wire.FrameData) HandleV2Data(buf, len, session, seq, from, peerIp);
+            else if (frame == UdpV2Wire.FrameParity) HandleV2Parity(buf, len, session, from, peerIp);
+            else if (frame == UdpV2Wire.FrameEnd) HandleV2End(buf, len, session, from, peerIp);
+        }
+
+        private void HandleV2Start(byte[] buf, int len, ulong session, IPEndPoint from, string peerIp)
+        {
+            if (len < UdpV2Wire.HeaderSize + 2) return;
+            int p = UdpV2Wire.HeaderSize;
+            int nameLen = buf[p] | (buf[p + 1] << 8); p += 2;
+            if (nameLen <= 0 || nameLen > UdpV2Wire.MaxNameBytes || len < p + nameLen + 14) return;
+            string rawName;
+            try { rawName = System.Text.Encoding.UTF8.GetString(buf, p, nameLen); }
+            catch { return; }
+            p += nameLen;
+            long size = UdpV2Wire.ReadI64(buf, p); p += 8;
+            int chunkLen = buf[p] | (buf[p + 1] << 8) | (buf[p + 2] << 16) | (buf[p + 3] << 24); p += 4;
+            bool fec = buf[p++] == 1;
+            int parity = Math.Max(1, Math.Min(8, (int)buf[p++]));
+            byte[] startHash = null;
+            if (len >= p + 32)
+            {
+                startHash = new byte[32];
+                Buffer.BlockCopy(buf, p, startHash, 0, 32);
+            }
+
+            string fileName;
+            if (!UdpV2Wire.TryNormalizeName(rawName, out fileName)) return;
+            if (size < 0 || size > Utils.MaxTransferSize) return;
+            if (chunkLen <= 0 || chunkLen > 1500) return;
+            long totalChunks = size == 0 ? 0 : (size + chunkLen - 1) / chunkLen;
+            if (totalChunks > UdpV2Wire.MaxChunks) return;
+            if (!Utils.HasFreeSpaceFor(_saveDirectory, size))
+            {
+                Log(L.UdpS_NoSpace(fileName));
+                return;
+            }
+
+            UdpV2RecvSession created = null;
+            bool empty = false;
+            lock (_sessionLock)
+            {
+                if (!_isRunning) return;
+                UdpV2RecvSession s;
+                if (_v2Sessions.TryGetValue(session, out s))
+                {
+                    if (!string.Equals(s.PeerIp, peerIp, StringComparison.Ordinal))
+                    {
+                        Log(L.UdpS_ForeignSession(fileName, peerIp));
+                        return;
+                    }
+                    if (s.Matches(size, chunkLen, startHash))
+                    {
+                        s.Touch();
+                        if (s.IsComplete && s.StartHash != null) empty = true;
+                        else return;
+                    }
+                    else
+                    {
+                        // Same id, different shape: the source changed. Never reuse
+                        // the old bytes.
+                        s.Discard();
+                        _v2Sessions.Remove(session);
+                        s = null;
+                    }
+                }
+                if (s == null)
+                {
+                    if (_v2Sessions.Count >= UdpV2Wire.MaxSessions)
+                    {
+                        ulong victim = 0; bool have = false; bool zeroProgress = false;
+                        foreach (var kv in _v2Sessions)
+                        {
+                            if (kv.Value.CoveredBytes == 0) { victim = kv.Key; have = true; zeroProgress = true; break; }
+                        }
+                        if (!have)
+                        {
+                            DateTime oldest = DateTime.MaxValue;
+                            foreach (var kv in _v2Sessions)
+                            {
+                                if (kv.Value.LastHeard < oldest) { oldest = kv.Value.LastHeard; victim = kv.Key; have = true; }
+                            }
+                        }
+                        if (have)
+                        {
+                            UdpV2RecvSession ev;
+                            if (_v2Sessions.TryGetValue(victim, out ev))
+                            {
+                                _v2Sessions.Remove(victim);
+                                if (zeroProgress || ev.CoveredBytes == 0) ev.Discard(); else ev.CloseStream();
+                            }
+                        }
+                    }
+                    try
+                    {
+                        s = new UdpV2RecvSession(session, fileName, size, chunkLen, totalChunks,
+                            fec, parity, startHash, peerIp, _partDir);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log(L.UdpS_FinalizeFailed(fileName, ex.Message));
+                        return;
+                    }
+                    _v2Sessions[session] = s;
+                    created = s;
+                    Log(L.UdpV2S_Started(fileName, Utils.FormatSize(size), peerIp));
+                }
+            }
+
+            if (empty || (created != null && created.TotalChunks == 0 && created.StartHash != null))
+            {
+                if (created != null) FinalizeV2(created, created.StartHash, from);
+                return;
+            }
+            if (created != null && created.TotalChunks == 0 && created.StartHash == null)
+            {
+                // Empty file without a START hash: wait for the END frame (old sender).
+                return;
+            }
+        }
+
+        private void HandleV2Data(byte[] buf, int len, ulong session, long seq, IPEndPoint from, string peerIp)
+        {
+            UdpV2RecvSession s;
+            lock (_sessionLock)
+            {
+                if (!_v2Sessions.TryGetValue(session, out s)) return;
+            }
+            if (!s.IsPeer(peerIp)) return;
+            s.Touch();
+            if (seq < 0 || seq >= s.TotalChunks) return;
+            long expected = Math.Min((long)s.ChunkLen, s.TotalSize - seq * s.ChunkLen);
+            if (len - UdpV2Wire.HeaderSize != (int)expected) return;
+            long done = s.WriteChunk(seq, buf, UdpV2Wire.HeaderSize, (int)expected);
+            if (done < 0) return;
+            if (s.Fec) s.TryRecover((int)(seq / UdpV2Wire.FecDataShards));
+            lock (_sessionLock)
+            {
+                var prog = OnClientProgress;
+                if (prog != null && (done & 63) == 0)
+                {
+                    prog(from, new TransferProgress
+                    {
+                        BytesTransferred = s.CoveredBytes,
+                        TotalBytes = s.TotalSize,
+                        FileName = s.FileName
+                    });
+                }
+            }
+            if (s.IsComplete && s.StartHash != null) FinalizeV2(s, s.StartHash, from);
+        }
+
+        private void HandleV2Parity(byte[] buf, int len, ulong session, IPEndPoint from, string peerIp)
+        {
+            UdpV2RecvSession s;
+            lock (_sessionLock)
+            {
+                if (!_v2Sessions.TryGetValue(session, out s)) return;
+            }
+            if (!s.IsPeer(peerIp) || !s.Fec) return;
+            s.Touch();
+            if (len < UdpV2Wire.HeaderSize + 5) return;
+            int p = UdpV2Wire.HeaderSize;
+            int group = buf[p] | (buf[p + 1] << 8) | (buf[p + 2] << 16) | (buf[p + 3] << 24); p += 4;
+            int idx = buf[p]; p += 1;
+            int shardLen = len - p;
+            if (shardLen != s.ChunkLen) return;
+            if (idx < UdpV2Wire.FecDataShards || idx >= UdpV2Wire.FecDataShards + s.ParityShards) return;
+            long groups = (s.TotalChunks + UdpV2Wire.FecDataShards - 1) / UdpV2Wire.FecDataShards;
+            if (group < 0 || group >= groups) return;
+            s.StoreParity(group, idx, buf, p, shardLen);
+            s.TryRecover(group);
+            if (s.IsComplete && s.StartHash != null) FinalizeV2(s, s.StartHash, from);
+        }
+
+        private void HandleV2End(byte[] buf, int len, ulong session, IPEndPoint from, string peerIp)
+        {
+            UdpV2RecvSession s;
+            lock (_sessionLock)
+            {
+                if (!_v2Sessions.TryGetValue(session, out s)) return;
+            }
+            if (!s.IsPeer(peerIp)) return;
+            s.Touch();
+            if (len < UdpV2Wire.HeaderSize + 32) return;
+            if (!s.IsComplete) return; // wait for the remaining data frames
+            var claimed = new byte[32];
+            Buffer.BlockCopy(buf, UdpV2Wire.HeaderSize, claimed, 0, 32);
+            FinalizeV2(s, s.StartHash != null ? s.StartHash : claimed, from);
+        }
+
+        private void FinalizeV2(UdpV2RecvSession s, byte[] claimed, IPEndPoint from)
+        {
+            if (claimed == null || !s.TryBeginFinalize()) return;
+            try
+            {
+                s.PrepareFinalize();
+            }
+            catch
+            {
+                s.Discard();
+                RemoveV2Session(s.Id);
+                return;
+            }
+            byte[] actual = null;
+            try { actual = ClientWire.ComputeFileHash(s.PartPath, CancellationToken.None); }
+            catch (Exception ex)
+            {
+                Log(L.UdpS_FinalizeFailed(s.FileName, ex.Message));
+            }
+            bool ok = actual != null && Utils.ConstantTimeEquals(actual, claimed);
+            if (!ok)
+            {
+                Log(L.UdpS_HashMismatch(s.FileName, actual == null ? "-" : Utils.FormatSize(s.TotalSize)));
+                s.Discard();
+                RemoveV2Session(s.Id);
+                var done = OnClientTransferComplete;
+                if (done != null) done(from);
+                return;
+            }
+
+            string dir = _saveDirectory;
+            if (PerDeviceFolder)
+            {
+                string device = ResolveDeviceName != null ? ResolveDeviceName(s.PeerIp) : s.PeerIp;
+                if (!string.IsNullOrEmpty(device))
+                {
+                    dir = Path.Combine(_saveDirectory, Utils.SanitizeRelativePath(device));
+                    try { Directory.CreateDirectory(dir); } catch { dir = _saveDirectory; }
+                }
+            }
+            string basePath = Path.Combine(dir, s.FileName);
+            string finalPath = Utils.GetUniqueSavePath(dir, s.FileName);
+            if (SkipDuplicateFiles
+                && !string.Equals(finalPath, basePath, StringComparison.OrdinalIgnoreCase)
+                && ExistingFileMatches(basePath, s.TotalSize, claimed))
+            {
+                Log(L.S_DuplicateSkipped(s.FileName));
+                s.Discard();
+                RemoveV2Session(s.Id);
+                var recvDup = OnFileReceived;
+                if (recvDup != null) recvDup(basePath, s.TotalSize);
+                var doneDup = OnClientTransferComplete;
+                if (doneDup != null) doneDup(from);
+                return;
+            }
+            try
+            {
+                lock (_finalizeGate) { s.MoveTo(finalPath); }
+            }
+            catch (Exception ex)
+            {
+                Log(L.UdpS_FinalizeFailed(s.FileName, ex.Message));
+                s.Discard();
+                RemoveV2Session(s.Id);
+                var done2 = OnClientTransferComplete;
+                if (done2 != null) done2(from);
+                return;
+            }
+
+            Log(L.UdpS_Delivered(s.FileName, Utils.FormatSize(s.TotalSize)));
+            lock (_sessionLock)
+            {
+                _v2Sessions.Remove(s.Id);
+                _v2Delivered[s.Id] = DateTime.UtcNow;
+                while (_v2Delivered.Count > MaxDeliveredMemory)
+                {
+                    ulong oldestKey = 0; DateTime oldestAt = DateTime.MaxValue;
+                    foreach (var kv in _v2Delivered)
+                        if (kv.Value < oldestAt) { oldestAt = kv.Value; oldestKey = kv.Key; }
+                    _v2Delivered.Remove(oldestKey);
+                }
+            }
+            try
+            {
+                long fsz, fmt;
+                if (Utils.StatFile(finalPath, out fsz, out fmt))
+                    FileHashCache.ForServer.StoreIfUnchanged(finalPath, claimed, fsz, fmt);
+            }
+            catch { }
+            var recv = OnFileReceived;
+            if (recv != null) recv(finalPath, s.TotalSize);
+            var stats = new WireSessionStats
+            {
+                Peer = s.PeerIp,
+                Bytes = s.TotalSize,
+                Files = 1,
+                Detail = s.FileName,
+                Path = finalPath
+            };
+            var sh = OnSessionStats;
+            if (sh != null) sh(stats);
+            var complete = OnClientTransferComplete;
+            if (complete != null) complete(from);
+        }
+
+        private void RemoveV2Session(ulong id)
+        {
+            lock (_sessionLock) { _v2Sessions.Remove(id); }
         }
 
         private void HandleStart(byte[] buf, Guid session, IPEndPoint from, string peerIp)
@@ -430,9 +945,20 @@ namespace TrFileTransfer
             UdpRecvSession emptyToFinalize = null;
             lock (_sessionLock)
             {
+                // A datagram that raced Stop() must not create a session after the
+                // table was cleared (its FileStream would never be closed).
+                if (!_isRunning) return;
                 UdpRecvSession s;
                 if (_sessions.TryGetValue(session, out s))
                 {
+                    if (!string.Equals(s.PeerIp, peerIp, StringComparison.Ordinal))
+                    {
+                        // Same derived session id from ANOTHER host: it must never be
+                        // able to reset (and delete the part of) a transfer in flight
+                        // for the real sender. The frames are simply dropped.
+                        Log(L.UdpS_ForeignSession(fileName, peerIp));
+                        return;
+                    }
                     if (s.Matches(size, chunkSize, hash) && s.Usable)
                     {
                         s.Touch(); // repeated START of the same file version: keep filling
@@ -446,23 +972,42 @@ namespace TrFileTransfer
                 _sessions[session] = s;
                 if (_sessions.Count > UdpOneWay.MaxSessions)
                 {
-                    // Evict the most-idle session to stay bounded
-                    Guid oldest = Guid.Empty;
-                    DateTime oldestAt = DateTime.MaxValue;
+                    // Prefer dropping a session that never received a byte: its part is
+                    // empty, so deleting it costs nothing. Otherwise an unauthenticated
+                    // host could mint one retained .part file per START (only swept
+                    // after seven days) and grow the directory without bound.
+                    Guid victim = Guid.Empty;
                     foreach (var kv in _sessions)
                     {
-                        if (kv.Value.LastHeard < oldestAt)
+                        if (kv.Value.CoveredBytes == 0) { victim = kv.Key; break; }
+                    }
+                    bool zeroProgress = victim != Guid.Empty;
+                    if (!zeroProgress)
+                    {
+                        DateTime oldestAt = DateTime.MaxValue;
+                        foreach (var kv in _sessions)
                         {
-                            oldestAt = kv.Value.LastHeard;
-                            oldest = kv.Key;
+                            if (kv.Value.LastHeard < oldestAt)
+                            {
+                                oldestAt = kv.Value.LastHeard;
+                                victim = kv.Key;
+                            }
                         }
                     }
                     UdpRecvSession evicted;
-                    if (_sessions.TryGetValue(oldest, out evicted))
+                    if (_sessions.TryGetValue(victim, out evicted))
                     {
-                        evicted.CloseStream(); // keep its part: the sender may come back
-                        _sessions.Remove(oldest);
-                        Log(L.UdpS_SessionEvicted(evicted.FileName));
+                        _sessions.Remove(victim);
+                        if (zeroProgress)
+                        {
+                            evicted.Discard(); // nothing to resume — drop the empty part
+                            Log(L.UdpS_ZeroProgressEvicted(evicted.FileName));
+                        }
+                        else
+                        {
+                            evicted.CloseStream(); // keep its part: the sender may come back
+                            Log(L.UdpS_SessionEvicted(evicted.FileName));
+                        }
                     }
                 }
                 Log(L.UdpS_SessionStart(fileName, Utils.FormatSize(size), peerIp));
@@ -481,13 +1026,14 @@ namespace TrFileTransfer
                 Task.Run(delegate { lock (_finalizeGate) FinalizeSession(emptyToFinalize, from); });
         }
 
-        private void HandleData(byte[] buf, Guid session, IPEndPoint from)
+        private void HandleData(byte[] buf, Guid session, IPEndPoint from, string peerIp)
         {
             if (buf.Length < UdpOneWay.HeaderSize + 4) return;
             UdpRecvSession s;
             lock (_sessionLock)
             {
                 if (!_sessions.TryGetValue(session, out s)) return; // unknown/finished: sender re-runs will re-START
+                if (!s.IsPeer(peerIp)) return; // another host must not write into this part
                 s.Touch();
             }
             int chunkIndex = BitConverter.ToInt32(buf, UdpOneWay.HeaderSize);
@@ -544,13 +1090,14 @@ namespace TrFileTransfer
         /// attempted — if the surviving parity rows cover the group's missing members,
         /// they reconstruct in place; otherwise the cache lets a LATER data chunk
         /// trigger the recovery once the erasure count drops to the parity count.</summary>
-        private void HandleParity(byte[] buf, Guid session, IPEndPoint from)
+        private void HandleParity(byte[] buf, Guid session, IPEndPoint from, string peerIp)
         {
             if (buf.Length < UdpOneWay.HeaderSize + UdpOneWay.MinParityBody) return;
             UdpRecvSession s;
             lock (_sessionLock)
             {
                 if (!_sessions.TryGetValue(session, out s)) return; // unknown/finished
+                if (!s.IsPeer(peerIp)) return;
                 s.Touch();
             }
             int p = UdpOneWay.HeaderSize;
@@ -588,12 +1135,12 @@ namespace TrFileTransfer
             }
         }
 
-        private void TouchSession(Guid session)
+        private void TouchSession(Guid session, string peerIp)
         {
             lock (_sessionLock)
             {
                 UdpRecvSession s;
-                if (_sessions.TryGetValue(session, out s)) s.Touch();
+                if (_sessions.TryGetValue(session, out s) && s.IsPeer(peerIp)) s.Touch();
             }
         }
 
@@ -782,12 +1329,49 @@ namespace TrFileTransfer
                 foreach (var s in stale)
                 {
                     Log(L.UdpS_SessionIdle(s.FileName));
-                    s.CloseStream();
+                    if (s.CoveredBytes == 0) s.Discard(); // never started: drop the part
+                    else s.CloseStream();
+                }
+
+            // v2 sessions: same idle policy (Rust uses 600 s; the v1 sweep above
+            // uses 2 minutes for its own table, so keep the v2 rule explicit).
+            List<UdpV2RecvSession> staleV2 = null;
+            lock (_sessionLock)
+            {
+                List<ulong> removeV2 = null;
+                foreach (var kv in _v2Sessions)
+                {
+                    if ((DateTime.UtcNow - kv.Value.LastHeard).TotalMinutes >= 10)
+                    {
+                        if (removeV2 == null) removeV2 = new List<ulong>();
+                        removeV2.Add(kv.Key);
+                        if (staleV2 == null) staleV2 = new List<UdpV2RecvSession>();
+                        staleV2.Add(kv.Value);
+                    }
+                }
+                if (removeV2 != null)
+                    foreach (ulong id in removeV2) _v2Sessions.Remove(id);
+            }
+            if (staleV2 != null)
+                foreach (var s in staleV2)
+                {
+                    Log(L.UdpS_SessionIdle(s.FileName));
+                    if (s.CoveredBytes == 0) s.Discard();
+                    else s.CloseStream();
                 }
             try
             {
                 if (Directory.Exists(_partDir))
                 {
+                    foreach (string part in Directory.GetFiles(_partDir, "*.trft-udppart"))
+                    {
+                        try
+                        {
+                            if (File.GetLastWriteTimeUtc(part) < DateTime.UtcNow.AddDays(-7))
+                                File.Delete(part);
+                        }
+                        catch { }
+                    }
                     foreach (string part in Directory.GetFiles(_partDir, "*.part"))
                     {
                         try
@@ -808,6 +1392,284 @@ namespace TrFileTransfer
         }
 
         /// <summary>In-flight receive state: sparse .part file plus per-chunk coverage.</summary>
+        /// <summary>Receiver state for one v2 (Rust trft) one-way session. Writes
+        /// chunks at their index offsets, tracks coverage/FEC, and finalizes by
+        /// hashing the whole part file before an atomic publish.</summary>
+        private sealed class UdpV2RecvSession
+        {
+            public readonly ulong Id;
+            public readonly string FileName;
+            public readonly long TotalSize;
+            public readonly int ChunkLen;
+            public readonly long TotalChunks;
+            public readonly bool Fec;
+            public readonly int ParityShards;
+            public readonly byte[] StartHash;
+            public readonly string PeerIp;
+            public readonly string PartPath;
+            public DateTime LastHeard = DateTime.UtcNow;
+            public long CoveredBytes;
+            public long Done;
+            private readonly object _io = new object();
+            private FileStream _fs;
+            private byte[] _coveredBits;
+            private readonly Dictionary<int, Dictionary<int, byte[]>> _parity
+                = new Dictionary<int, Dictionary<int, byte[]>>();
+            private readonly Queue<int> _parityOrder = new Queue<int>();
+            private long _parityBytes;
+            private bool _finalizing;
+
+            public UdpV2RecvSession(ulong id, string fileName, long size, int chunkLen,
+                long totalChunks, bool fec, int parity, byte[] startHash, string peerIp, string partDir)
+            {
+                Id = id;
+                FileName = fileName;
+                TotalSize = size;
+                ChunkLen = chunkLen;
+                TotalChunks = totalChunks;
+                Fec = fec;
+                ParityShards = parity;
+                StartHash = startHash;
+                PeerIp = peerIp;
+                try { Directory.CreateDirectory(partDir); } catch { }
+                PartPath = Path.Combine(partDir, id.ToString("x16") + "_" + fileName + ".trft-udppart");
+                _fs = new FileStream(PartPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+                _fs.SetLength(totalChunks * (long)chunkLen);
+            }
+
+            public bool IsComplete { get { return Done >= TotalChunks; } }
+
+            public bool Matches(long size, int chunkLen, byte[] startHash)
+            {
+                if (TotalSize != size || ChunkLen != chunkLen) return false;
+                if (StartHash == null && startHash == null) return true;
+                if (StartHash == null || startHash == null) return false;
+                return Utils.ConstantTimeEquals(StartHash, startHash);
+            }
+
+            public bool IsPeer(string ip)
+            {
+                return string.Equals(PeerIp, ip, StringComparison.Ordinal);
+            }
+
+            public void Touch() { LastHeard = DateTime.UtcNow; }
+
+            public long WriteChunk(long seq, byte[] buf, int offset, int len)
+            {
+                lock (_io)
+                {
+                    if (_fs == null) return -1;
+                    if (_coveredBits == null) _coveredBits = new byte[(TotalChunks + 7) / 8];
+                    long byteIdx = seq >> 3;
+                    int bit = 1 << (int)(seq & 7);
+                    if ((_coveredBits[byteIdx] & bit) != 0) return Done; // duplicate
+                    try
+                    {
+                        _fs.Seek(seq * (long)ChunkLen, SeekOrigin.Begin);
+                        _fs.Write(buf, offset, len);
+                    }
+                    catch
+                    {
+                        return -1;
+                    }
+                    _coveredBits[byteIdx] |= (byte)bit;
+                    Done++;
+                    CoveredBytes += len;
+                    return Done;
+                }
+            }
+
+            private bool IsCovered(long idx)
+            {
+                if (_coveredBits == null) return false;
+                return (_coveredBits[idx >> 3] & (1 << (int)(idx & 7))) != 0;
+            }
+
+            private bool ReadChunk(long idx, byte[] dst)
+            {
+                if (_fs == null) return false;
+                try
+                {
+                    _fs.Seek(idx * (long)ChunkLen, SeekOrigin.Begin);
+                    int read = 0;
+                    while (read < dst.Length)
+                    {
+                        int r = _fs.Read(dst, read, dst.Length - read);
+                        if (r <= 0) return false;
+                        read += r;
+                    }
+                    return true;
+                }
+                catch { return false; }
+            }
+
+            public void StoreParity(int group, int idx, byte[] buf, int offset, int len)
+            {
+                lock (_io)
+                {
+                    if (_fs == null) return;
+                    Dictionary<int, byte[]> g;
+                    if (!_parity.TryGetValue(group, out g))
+                    {
+                        g = new Dictionary<int, byte[]>();
+                        _parity[group] = g;
+                        _parityOrder.Enqueue(group);
+                    }
+                    if (g.ContainsKey(idx)) return;
+                    var shard = new byte[len];
+                    Buffer.BlockCopy(buf, offset, shard, 0, len);
+                    g[idx] = shard;
+                    _parityBytes += len;
+                    while ((_parityOrder.Count > 4 || _parityBytes > 256 * 1024) && _parityOrder.Count > 1)
+                    {
+                        int old = _parityOrder.Dequeue();
+                        if (old == group) { _parityOrder.Enqueue(old); continue; }
+                        Dictionary<int, byte[]> m;
+                        if (_parity.TryGetValue(old, out m))
+                        {
+                            foreach (var v in m.Values) _parityBytes -= v.Length;
+                            _parity.Remove(old);
+                        }
+                    }
+                }
+            }
+
+            private void RemoveParityGroup(int group)
+            {
+                Dictionary<int, byte[]> m;
+                if (_parity.TryGetValue(group, out m))
+                {
+                    foreach (var v in m.Values) _parityBytes -= v.Length;
+                    _parity.Remove(group);
+                }
+                if (_parityOrder.Count == 0) return;
+                var keep = new Queue<int>();
+                while (_parityOrder.Count > 0)
+                {
+                    int g = _parityOrder.Dequeue();
+                    if (g != group) keep.Enqueue(g);
+                }
+                while (keep.Count > 0) _parityOrder.Enqueue(keep.Dequeue());
+            }
+
+            /// <summary>Recovers missing chunks of one FEC group from cached parity +
+            /// surviving data (same systematic Vandermonde code as the Rust sender).</summary>
+            public void TryRecover(int group)
+            {
+                lock (_io)
+                {
+                    if (_fs == null || !Fec) return;
+                    int k = UdpV2Wire.FecDataShards;
+                    long g0 = group * (long)k;
+                    var missing = new List<int>();
+                    for (int i = 0; i < k; i++)
+                    {
+                        long idx = g0 + i;
+                        if (idx < TotalChunks && !IsCovered(idx)) missing.Add(i);
+                    }
+                    if (missing.Count == 0) { RemoveParityGroup(group); return; }
+
+                    Dictionary<int, byte[]> cached;
+                    _parity.TryGetValue(group, out cached);
+                    int availableParity = cached != null ? cached.Count : 0;
+                    if (availableParity < missing.Count) return;
+
+                    var indices = new List<int>();
+                    var blocks = new List<byte[]>();
+                    for (int i = 0; i < k; i++)
+                    {
+                        long idx = g0 + i;
+                        if (idx >= TotalChunks)
+                        {
+                            indices.Add(i);
+                            blocks.Add(new byte[ChunkLen]); // sender pads missing tail shards with zeros
+                            continue;
+                        }
+                        if (IsCovered(idx))
+                        {
+                            var b = new byte[ChunkLen];
+                            if (!ReadChunk(idx, b)) return;
+                            indices.Add(i);
+                            blocks.Add(b);
+                        }
+                    }
+                    if (cached != null)
+                    {
+                        foreach (var kv in cached)
+                        {
+                            indices.Add(kv.Key);
+                            blocks.Add(kv.Value);
+                        }
+                    }
+                    if (indices.Count < k) return;
+
+                    var solved = UdpFec.VandermondeReconstruct(indices.ToArray(), blocks.ToArray(),
+                        missing.ToArray(), ChunkLen, k, ParityShards);
+                    if (solved == null) return;
+                    for (int i = 0; i < missing.Count; i++)
+                    {
+                        long idx = g0 + missing[i];
+                        if (idx >= TotalChunks) continue;
+                        if (_coveredBits == null) _coveredBits = new byte[(TotalChunks + 7) / 8];
+                        long byteIdx = idx >> 3;
+                        int bit = 1 << (int)(idx & 7);
+                        if ((_coveredBits[byteIdx] & bit) != 0) continue;
+                        try
+                        {
+                            _fs.Seek(idx * (long)ChunkLen, SeekOrigin.Begin);
+                            _fs.Write(solved[i], 0, ChunkLen);
+                        }
+                        catch { return; }
+                        _coveredBits[byteIdx] |= (byte)bit;
+                        Done++;
+                        CoveredBytes += Math.Min((long)ChunkLen, TotalSize - idx * (long)ChunkLen);
+                    }
+                    RemoveParityGroup(group);
+                }
+            }
+
+            public bool TryBeginFinalize()
+            {
+                lock (_io)
+                {
+                    if (_finalizing) return false;
+                    _finalizing = true;
+                    return true;
+                }
+            }
+
+            public void PrepareFinalize()
+            {
+                lock (_io)
+                {
+                    if (_fs == null) return;
+                    _fs.SetLength(TotalSize);
+                    _fs.Flush(true);
+                }
+                CloseStream();
+            }
+
+            public void CloseStream()
+            {
+                lock (_io)
+                {
+                    if (_fs != null) { try { _fs.Dispose(); } catch { } _fs = null; }
+                }
+            }
+
+            public void Discard()
+            {
+                CloseStream();
+                try { File.Delete(PartPath); } catch { }
+            }
+
+            public void MoveTo(string finalPath)
+            {
+                CloseStream();
+                File.Move(PartPath, finalPath);
+            }
+        }
+
         private sealed class UdpRecvSession
         {
             public readonly Guid Id;
@@ -827,7 +1689,11 @@ namespace TrFileTransfer
             // 16M chunks (19 GiB @ 1200B) without ever sending a byte, and the part
             // file itself is sparse — bool[] would commit 16 MB per session (64 such
             // sessions ≈ 1 GB of RAM); bits cut that eightfold.
-            private readonly byte[] _coveredBits;
+            // Allocated on the first payload/parity write, not in the constructor: a
+            // START-only session costs a 74-byte datagram, and eagerly allocating a
+            // 2 MB bitmap for each of MaxSessions declared-large sessions let an
+            // unauthenticated host pin ~128 MB with almost no traffic.
+            private byte[] _coveredBits;
             private long _coveredBytes;
             private readonly object _io = new object();
             // FEC parity cache: recent group → (payload, member count). Bounded hard —
@@ -859,7 +1725,6 @@ namespace TrFileTransfer
                 ExpectedHash = hash;
                 PeerIp = peerIp;
                 PartPath = Path.Combine(partDir, id.ToString("N") + ".part");
-                _coveredBits = new byte[(totalChunks + 7) / 8];
                 try { Directory.CreateDirectory(partDir); } catch { }
                 try
                 {
@@ -912,6 +1777,27 @@ namespace TrFileTransfer
                 return false;
             }
 
+            /// <summary>Allocates the coverage bitmap on first use (caller holds _io).</summary>
+            private void EnsureCoverageBits()
+            {
+                if (_coveredBits == null)
+                    _coveredBits = new byte[(TotalChunks + 7) / 8];
+            }
+
+            /// <summary>True when this datagram really comes from the host that started
+            /// the session. A different peer must never write into (or reset) a part
+            /// another sender is filling.</summary>
+            public bool IsPeer(string ip)
+            {
+                return string.Equals(PeerIp, ip, StringComparison.Ordinal);
+            }
+
+            /// <summary>Bytes actually written for this session (0 = never started).</summary>
+            public long CoveredBytes
+            {
+                get { lock (_io) { return _coveredBytes; } }
+            }
+
             /// <summary>Whether chunks can still land (the part file is writable).
             /// A session whose part file could not be opened is dead weight — a fresh
             /// START must get a fresh chance instead of filling a black hole.</summary>
@@ -938,6 +1824,7 @@ namespace TrFileTransfer
                 lock (_io)
                 {
                     if (_fs == null) return -1; // part file unusable — finalize will say why
+                    EnsureCoverageBits();
                     int bitByte = chunkIndex >> 3;
                     int bitMask = 1 << (chunkIndex & 7);
                     if ((_coveredBits[bitByte] & bitMask) != 0) return _coveredBytes; // re-send: already have it
@@ -1011,6 +1898,7 @@ namespace TrFileTransfer
                 {
                     ParityGroup pg;
                     if (_fs == null || !_parity.TryGetValue(groupStart, out pg)) return false;
+                    EnsureCoverageBits();
                     int groupCount = pg.Count;
                     if (groupCount < 1 || groupStart + groupCount > TotalChunks) return false;
 
@@ -1143,6 +2031,12 @@ namespace TrFileTransfer
         /// 25% wire overhead — on a no-return link a re-send pass costs the whole file,
         /// so overhead is the cheap currency here.</summary>
         public int FecParity = 2;
+        /// <summary>Speak the Rust trft v2 one-way UDP wire format instead of TU/1.
+        /// Interop-only: old C# receivers cannot decode v2 frames, so this is opt-in
+        /// (CLI --udp-v2 / the GUI's "Rust compatible" switch). Receiving needs no
+        /// flag — the C# server demultiplexes both formats by the first byte.</summary>
+        public bool RustCompat;
+        private const int InterPassDelayMsV2 = UdpV2Wire.InterPassDelayMs;
 
         public event Action<string> OnLog;
         public event Action<TransferProgress> OnProgress;
@@ -1177,6 +2071,11 @@ namespace TrFileTransfer
 
         public async Task SendAsync()
         {
+            if (RustCompat)
+            {
+                await SendV2Async().ConfigureAwait(false);
+                return;
+            }
             _cts = new CancellationTokenSource();
             var ct = _cts.Token;
             UdpClient udp = null;
@@ -1319,6 +2218,230 @@ namespace TrFileTransfer
                 if (udp != null) { try { udp.Close(); } catch { } }
                 var stopped = OnStopped;
                 if (stopped != null) stopped();
+            }
+        }
+
+        /// <summary>Rust trft v2 wire format (see UdpV2Wire). Mirrors the v1 flow —
+        /// hash first, START×3 per pass, optional 4-shard RS parity, END×3, 400 ms
+        /// between passes — but with the v2 fields/ordering so `trft --proto udp`
+        /// accepts it. The receiver repeats START each pass; the sender here does the
+        /// same for parity with the Rust implementation (a lost START voids a pass).</summary>
+        private async Task SendV2Async()
+        {
+            _cts = new CancellationTokenSource();
+            var ct = _cts.Token;
+            UdpClient udp = null;
+            try
+            {
+                ct.ThrowIfCancellationRequested();
+                IPAddress target;
+                if (!IPAddress.TryParse(_ip, out target))
+                    throw new IOException(L.UdpC_BadTarget(_ip));
+                var socket = new Socket(
+                    target.AddressFamily == AddressFamily.InterNetworkV6
+                        ? AddressFamily.InterNetworkV6 : AddressFamily.InterNetwork,
+                    SocketType.Dgram, ProtocolType.Udp);
+                if (_srcPort > 0)
+                    socket.Bind(new IPEndPoint(
+                        target.AddressFamily == AddressFamily.InterNetworkV6
+                            ? IPAddress.IPv6Any : IPAddress.Any, _srcPort));
+                try { socket.IOControl(unchecked((int)0x98000004), new byte[] { 0 }, null); }
+                catch { }
+                try { socket.SendBufferSize = 4 * 1024 * 1024; } catch { }
+                socket.Connect(new IPEndPoint(target, _port));
+                udp = new UdpClient(target.AddressFamily);
+                try { udp.Client.Close(); } catch { }
+                udp.Client = socket;
+
+                string safeName;
+                if (!UdpV2Wire.TryNormalizeName(Path.GetFileName(_path), out safeName))
+                    throw new IOException(L.UdpV2C_BadName(Path.GetFileName(_path)));
+                long mtimeNanos = UdpV2Wire.GetMtimeNanos(_path);
+                long totalChunks = _fileSize == 0 ? 0
+                    : (_fileSize + UdpV2Wire.ChunkSize - 1) / UdpV2Wire.ChunkSize;
+                int passes = Math.Max(1, Math.Min(5, Passes));
+
+                Log(L.UdpC_Hashing(safeName));
+                byte[] hash = await Task.Run(delegate { return ClientWire.ComputeFileHash(_path, ct); }, ct)
+                    .ConfigureAwait(false);
+                ulong session = UdpV2Wire.DeriveSession(safeName, _fileSize, mtimeNanos);
+                int parity = Math.Max(1, Math.Min(8, FecParity));
+                bool fec = FecEnabled && totalChunks > 1;
+
+                Log(L.UdpV2C_Sending(safeName, Utils.FormatSize(_fileSize), _ip, _port.ToString()));
+                if (fec) Log(L.UdpV2C_FecOn(UdpV2Wire.FecDataShards.ToString(), parity.ToString()));
+                byte[] start = UdpV2Wire.BuildStart(session, safeName, _fileSize,
+                    UdpV2Wire.ChunkSize, fec, parity, hash);
+                byte[] end = UdpV2Wire.BuildEnd(session, hash);
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                long overall = 0;
+                long grandTotal = _fileSize * passes;
+                var progressWatch = System.Diagnostics.Stopwatch.StartNew();
+                DateTime lastProgress = DateTime.UtcNow.AddSeconds(-1);
+                Action<long> report = delegate(long passSent)
+                {
+                    DateTime now = DateTime.UtcNow;
+                    if ((now - lastProgress).TotalMilliseconds < 100 && passSent != _fileSize) return;
+                    lastProgress = now;
+                    long shown = overall + passSent;
+                    var h = OnProgress;
+                    if (h == null) return;
+                    h(new TransferProgress
+                    {
+                        BytesTransferred = shown,
+                        TotalBytes = grandTotal,
+                        SpeedBytesPerSecond = shown / Math.Max(0.001, progressWatch.Elapsed.TotalSeconds),
+                        Elapsed = progressWatch.Elapsed,
+                        FileName = safeName
+                    });
+                };
+
+                for (int pass = 1; pass <= passes; pass++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    if (pass > 1)
+                    {
+                        Log(L.UdpC_Pass(pass.ToString(), passes.ToString()));
+                        await Task.Delay(InterPassDelayMsV2, ct).ConfigureAwait(false);
+                    }
+                    for (int copy = 0; copy < UdpV2Wire.StartCopies; copy++)
+                    {
+                        if (copy > 0) await Task.Delay(UdpV2Wire.FrameSpacingMs, ct).ConfigureAwait(false);
+                        await udp.SendAsync(start, start.Length).ConfigureAwait(false);
+                        if (_limiter != null) await _limiter.ThrottleAsync(start.Length, ct).ConfigureAwait(false);
+                    }
+
+                    long sent;
+                    using (var fs = File.OpenRead(_path))
+                    {
+                        if (fec) sent = await SendV2FecAsync(udp, fs, totalChunks, session, parity, report, ct).ConfigureAwait(false);
+                        else sent = await SendV2SequentialAsync(udp, fs, totalChunks, session, report, ct).ConfigureAwait(false);
+                    }
+
+                    for (int copy = 0; copy < UdpV2Wire.StartCopies; copy++)
+                    {
+                        if (copy > 0) await Task.Delay(UdpV2Wire.FrameSpacingMs, ct).ConfigureAwait(false);
+                        await udp.SendAsync(end, end.Length).ConfigureAwait(false);
+                        if (_limiter != null) await _limiter.ThrottleAsync(end.Length, ct).ConfigureAwait(false);
+                    }
+                    overall += sent;
+                }
+
+                var complete = OnTransferComplete;
+                if (complete != null) complete();
+                Log(L.UdpC_Done(safeName, Utils.FormatSize(overall),
+                    sw.Elapsed.TotalSeconds.ToString("0.0")));
+            }
+            catch (OperationCanceledException)
+            {
+                _wasCancelled = true;
+                var h = OnError;
+                if (h != null) h(L.UdpC_Cancelled(_fileName));
+            }
+            catch (Exception ex)
+            {
+                var h = OnError;
+                if (h != null) h(ex.Message);
+            }
+            finally
+            {
+                if (udp != null) { try { udp.Close(); } catch { } }
+                var stopped = OnStopped;
+                if (stopped != null) stopped();
+            }
+        }
+
+        private async Task<long> SendV2SequentialAsync(UdpClient udp, FileStream fs, long totalChunks,
+            ulong session, Action<long> report, CancellationToken ct)
+        {
+            long sent = 0;
+            var buf = new byte[UdpV2Wire.ChunkSize];
+            for (long seq = 0; seq < totalChunks; seq++)
+            {
+                ct.ThrowIfCancellationRequested();
+                int want = (int)Math.Min((long)UdpV2Wire.ChunkSize, _fileSize - seq * UdpV2Wire.ChunkSize);
+                ReadExact(fs, buf, want);
+                byte[] frame = UdpV2Wire.BuildData(session, seq, buf, 0, want);
+                await udp.SendAsync(frame, frame.Length).ConfigureAwait(false);
+                if (_limiter != null) await _limiter.ThrottleAsync(frame.Length, ct).ConfigureAwait(false);
+                sent += want;
+                report(sent);
+            }
+            return sent;
+        }
+
+        /// <summary>FEC path: 4 data shards per group (zero-padded), systematic
+        /// Vandermonde parity, data frames in column-major order across a super-block
+        /// of 4 groups (same on-wire order as Rust, though order is not semantic).</summary>
+        private async Task<long> SendV2FecAsync(UdpClient udp, FileStream fs, long totalChunks,
+            ulong session, int parity, Action<long> report, CancellationToken ct)
+        {
+            long sent = 0;
+            const int k = UdpV2Wire.FecDataShards;
+            const int chunk = UdpV2Wire.ChunkSize;
+            long groups = (totalChunks + k - 1) / k;
+            const int groupsPerSuper = 4;
+            for (long g0 = 0; g0 < groups; g0 += groupsPerSuper)
+            {
+                ct.ThrowIfCancellationRequested();
+                int nGroups = (int)Math.Min((long)groupsPerSuper, groups - g0);
+                var data = new byte[nGroups * k][];
+                var par = new byte[nGroups * parity][];
+                for (int gi = 0; gi < nGroups; gi++)
+                {
+                    var groupData = new byte[k][];
+                    for (int s = 0; s < k; s++)
+                    {
+                        long seq = (g0 + gi) * k + s;
+                        var shard = new byte[chunk];
+                        if (seq < totalChunks)
+                        {
+                            int want = (int)Math.Min((long)chunk, _fileSize - seq * chunk);
+                            ReadExact(fs, shard, want);
+                            sent += want;
+                        }
+                        report(sent);
+                        groupData[s] = shard;
+                        data[gi * k + s] = shard;
+                    }
+                    var groupParity = UdpFec.VandermondeEncode(groupData, parity, chunk);
+                    for (int p = 0; p < parity; p++) par[gi * parity + p] = groupParity[p];
+                }
+                for (int col = 0; col < k; col++)
+                {
+                    for (int gi = 0; gi < nGroups; gi++)
+                    {
+                        long seq = (g0 + gi) * k + col;
+                        if (seq >= totalChunks) continue;
+                        int real = (int)Math.Min((long)chunk, _fileSize - seq * chunk);
+                        byte[] frame = UdpV2Wire.BuildData(session, seq, data[gi * k + col], 0, real);
+                        await udp.SendAsync(frame, frame.Length).ConfigureAwait(false);
+                        if (_limiter != null) await _limiter.ThrottleAsync(frame.Length, ct).ConfigureAwait(false);
+                    }
+                }
+                for (int p = 0; p < parity; p++)
+                {
+                    for (int gi = 0; gi < nGroups; gi++)
+                    {
+                        int group = (int)(g0 + gi);
+                        byte[] frame = UdpV2Wire.BuildParity(session, group, k + p, par[gi * parity + p], chunk);
+                        await udp.SendAsync(frame, frame.Length).ConfigureAwait(false);
+                        if (_limiter != null) await _limiter.ThrottleAsync(frame.Length, ct).ConfigureAwait(false);
+                    }
+                }
+            }
+            return sent;
+        }
+
+        private static void ReadExact(FileStream fs, byte[] buf, int len)
+        {
+            int read = 0;
+            while (read < len)
+            {
+                int r = fs.Read(buf, read, len - read);
+                if (r <= 0) throw new IOException("unexpected end of file");
+                read += r;
             }
         }
 

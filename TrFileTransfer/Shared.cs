@@ -52,11 +52,18 @@ namespace TrFileTransfer
         public string FileName;
         public long TotalSize;
         public string SavePath;
+        /// <summary>Directory the unique final name is allocated in. Kept so a lost
+        /// race between "pick a unique name" and "create the file" can be retried
+        /// instead of truncating a file another peer just finished writing.</summary>
+        public string SaveDirectory;
         public FileStream WriteStream;
         public long BytesReceived;
         public int ChunksCompleted;
         public readonly object Lock = new object();
         public bool Complete;
+        /// <summary>Last chunk write (or creation) — an abandoned tracker is swept so
+        /// its FileShare.None handle and preallocated file do not leak forever.</summary>
+        public DateTime LastActivityUtc = DateTime.UtcNow;
         // Received byte ranges, kept merged and sorted. Completion is decided by real
         // COVERAGE, not by summing chunk sizes: overlapping or duplicate chunks used to
         // inflate BytesReceived past TotalSize and report a file with holes as complete.
@@ -81,11 +88,16 @@ namespace TrFileTransfer
             ChunkTracker tracker;
             if (!dict.TryGetValue(key, out tracker))
             {
+                // A peer that abandons a chunk transfer leaves an open FileShare.None
+                // handle and a preallocated file behind; sweep the idle ones whenever a
+                // new group appears (cheap: real groups are few).
+                SweepIdle(dict, TimeSpan.FromMinutes(10));
                 var newTracker = new ChunkTracker
                 {
                     FileName = fileName,
                     TotalSize = totalSize,
-                    SavePath = Utils.GetUniqueSavePath(saveDirectory, fileName)
+                    SavePath = Utils.GetUniqueSavePath(saveDirectory, fileName),
+                    SaveDirectory = saveDirectory
                 };
                 tracker = dict.GetOrAdd(key, newTracker);
             }
@@ -104,10 +116,14 @@ namespace TrFileTransfer
                 if (Complete) return false;
                 if (WriteStream == null)
                 {
-                    WriteStream = new FileStream(SavePath, FileMode.Create,
-                        FileAccess.Write, FileShare.None, bufferSize, FileOptions.RandomAccess);
+                    // Allocate the name and create the file in ONE step: the previous
+                    // Exists-check-then-Create split let two peers pick the same name
+                    // and truncate each other's completed file. CreateNew makes the
+                    // loser of that race retry with the next _N suffix instead.
+                    WriteStream = OpenUniqueStream(bufferSize);
                     WriteStream.SetLength(TotalSize);
                 }
+                LastActivityUtc = DateTime.UtcNow;
                 WriteStream.Seek(chunkOffset, SeekOrigin.Begin);
                 WriteStream.Write(data, 0, bufferSize);
                 BytesReceived += bufferSize;
@@ -121,6 +137,56 @@ namespace TrFileTransfer
                 }
             }
             return isComplete;
+        }
+
+        private FileStream OpenUniqueStream(int bufferSize)
+        {
+            string dir = SaveDirectory;
+            if (string.IsNullOrEmpty(dir)) dir = Path.GetDirectoryName(SavePath);
+            Exception last = null;
+            for (int attempt = 0; attempt < 20; attempt++)
+            {
+                string candidate = string.IsNullOrEmpty(dir)
+                    ? SavePath
+                    : Utils.GetUniqueSavePath(dir, FileName);
+                try
+                {
+                    var fs = new FileStream(candidate, FileMode.CreateNew,
+                        FileAccess.Write, FileShare.None, bufferSize, FileOptions.RandomAccess);
+                    SavePath = candidate;
+                    return fs;
+                }
+                catch (IOException ex)
+                {
+                    // Another peer created the same name first — try the next suffix.
+                    last = ex;
+                }
+            }
+            throw new IOException("Could not allocate a unique receive file for '" + FileName + "'", last);
+        }
+
+        /// <summary>Drops trackers that have seen no chunk for the given idle time,
+        /// closing their FileStream (the partial file itself is left on disk).</summary>
+        public static int SweepIdle(
+            System.Collections.Concurrent.ConcurrentDictionary<string, ChunkTracker> dict, TimeSpan idle)
+        {
+            int removed = 0;
+            DateTime cutoff = DateTime.UtcNow - idle;
+            foreach (var kv in dict)
+            {
+                ChunkTracker t = kv.Value;
+                if (t == null) continue;
+                bool stale;
+                lock (t.Lock) { stale = t.LastActivityUtc < cutoff; }
+                if (!stale) continue;
+                ChunkTracker gone;
+                if (dict.TryRemove(kv.Key, out gone))
+                {
+                    try { gone.Dispose(); } catch { }
+                    removed++;
+                }
+            }
+            return removed;
         }
 
         /// <summary>True when the merged ranges cover exactly [0, TotalSize).</summary>
@@ -339,6 +405,18 @@ namespace TrFileTransfer
                 handler(string.Format("[{0:HH:mm:ss}] {1}", DateTime.Now, msg));
         }
 
+        /// <summary>Replaces control characters (CR/LF/TAB/NUL…) with '_'. A peer-supplied
+        /// name reaches the UI and the log before it reaches the filesystem, so CR/LF there
+        /// could forge whole log lines; Windows also cannot create such a name anyway.</summary>
+        public static string StripControlChars(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return text;
+            var sb = new System.Text.StringBuilder(text.Length);
+            for (int i = 0; i < text.Length; i++)
+                sb.Append(char.IsControl(text[i]) ? '_' : text[i]);
+            return sb.ToString();
+        }
+
         /// <summary>Sanitizes a relative file path by replacing ".." and "." segments to prevent directory traversal.</summary>
         public static string SanitizeRelativePath(string path)
         {
@@ -354,6 +432,11 @@ namespace TrFileTransfer
                 // rooted second argument verbatim) or address an NTFS alternate
                 // data stream ("file.txt:hidden") — neither may come from the wire.
                 parts[i] = parts[i].Replace(':', '_');
+                // Control characters would break the log/UI line format and cannot be
+                // created on disk; other invalid file-name characters would make the
+                // whole transfer throw instead of landing under a safe name.
+                parts[i] = StripControlChars(parts[i]);
+                parts[i] = ReplaceInvalidNameChars(parts[i]);
                 // Windows strips trailing dots/spaces on create, which desyncs the
                 // collision check from the file that actually lands on disk
                 parts[i] = parts[i].TrimEnd('.', ' ');
@@ -363,6 +446,21 @@ namespace TrFileTransfer
                     parts[i] = "_" + parts[i];
             }
             return string.Join(Path.DirectorySeparatorChar.ToString(), parts);
+        }
+
+        /// <summary>Replaces the characters Windows forbids in a file name (other than
+        /// the path separators, which are handled by the segment split).</summary>
+        public static string ReplaceInvalidNameChars(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return name;
+            var sb = new System.Text.StringBuilder(name.Length);
+            for (int i = 0; i < name.Length; i++)
+            {
+                char c = name[i];
+                bool bad = c == '<' || c == '>' || c == '"' || c == '|' || c == '?' || c == '*';
+                sb.Append(bad ? '_' : c);
+            }
+            return sb.ToString();
         }
 
         /// <summary>Whether the file name (any extension) collides with a Windows

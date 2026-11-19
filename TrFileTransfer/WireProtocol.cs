@@ -28,28 +28,50 @@ namespace TrFileTransfer
         /// <summary>Reads whatever is available (at most count). Returns 0 on EOF.</summary>
         Task<int> ReadSomeAsync(byte[] buffer, int offset, int count, CancellationToken ct);
 
-        /// <summary>Sets the read timeout, for waits where the peer is legitimately busy
-        /// rather than stalled (see ClientWire.LongReadWindowMs). Streams that have no read
-        /// timeout — TCP, and decorators wrapping it — make this a no-op.</summary>
+        /// <summary>Sets the read idle deadline (0 = none). TCP implements it by closing
+        /// the socket when a read does not complete in time (net48's ReadAsync cannot be
+        /// cancelled after it starts); decorators forward it to the inner stream. UDT
+        /// ignores it — its native socket carries its own timeouts.</summary>
         void SetReadTimeoutMs(int milliseconds);
     }
 
     /// <summary>IWireStream over a TCP NetworkStream.</summary>
     public class TcpWireStream : IWireStream
     {
-        // TCP reads block until the socket is closed by the remote end or by our own
-        // Cancel(), so there is no timeout to adjust; a stalled peer is only ever
-        // surfaced by the OS or by the caller cancelling.
-        public void SetReadTimeoutMs(int milliseconds) { }
-
         private readonly NetworkStream _stream;
         private readonly string _eofMessage;
+        private int _readTimeoutMs;
         private bool _disposed;
+
+        /// <summary>Read idle deadline (0 = none). net48's ReadAsync does NOT observe a
+        /// token cancelled after the read has started, so a stalled peer can only be
+        /// unblocked by closing the socket — which is exactly what this timeout does.
+        /// Without it a peer that connects and then says nothing (or stops mid-handshake)
+        /// pinned a server thread/admission slot forever.</summary>
+        public void SetReadTimeoutMs(int milliseconds) { _readTimeoutMs = milliseconds; }
 
         public TcpWireStream(NetworkStream stream, string eofMessage)
         {
             _stream = stream;
             _eofMessage = eofMessage;
+        }
+
+        private async Task<int> ReadWithTimeoutAsync(byte[] buffer, int offset, int count, CancellationToken ct)
+        {
+            int timeout = _readTimeoutMs;
+            if (timeout <= 0)
+                return await _stream.ReadAsync(buffer, offset, count, ct).ConfigureAwait(false);
+            Task<int> read = _stream.ReadAsync(buffer, offset, count, ct);
+            Task deadline = Task.Delay(timeout, CancellationToken.None);
+            if (!ReferenceEquals(await Task.WhenAny(read, deadline).ConfigureAwait(false), read))
+            {
+                // Observe a later fault, then abort the pending read by closing the socket.
+                read.ContinueWith(t => { var ignored = t.Exception; },
+                    TaskContinuationOptions.OnlyOnFaulted);
+                try { _stream.Close(); } catch { }
+                throw new IOException(L.ConnIdleTimeout);
+            }
+            return await read.ConfigureAwait(false);
         }
 
         public async Task WriteExactAsync(byte[] buffer, int offset, int count, CancellationToken ct)
@@ -62,7 +84,7 @@ namespace TrFileTransfer
             int totalRead = 0;
             while (totalRead < count)
             {
-                int read = await _stream.ReadAsync(buffer, offset + totalRead, count - totalRead, ct).ConfigureAwait(false);
+                int read = await ReadWithTimeoutAsync(buffer, offset + totalRead, count - totalRead, ct).ConfigureAwait(false);
                 if (read == 0)
                     throw new IOException(_eofMessage);
                 totalRead += read;
@@ -71,7 +93,7 @@ namespace TrFileTransfer
 
         public async Task<int> ReadSomeAsync(byte[] buffer, int offset, int count, CancellationToken ct)
         {
-            return await _stream.ReadAsync(buffer, offset, count, ct).ConfigureAwait(false);
+            return await ReadWithTimeoutAsync(buffer, offset, count, ct).ConfigureAwait(false);
         }
 
         public void Dispose()
@@ -235,6 +257,14 @@ namespace TrFileTransfer
         public string Path;
     }
 
+    /// <summary>Wrong-code counter for one peer IP. LastUtc ages the record out so a
+    /// lockout is temporary and the table stays bounded under address rotation.</summary>
+    public sealed class AuthFailure
+    {
+        public int Count;
+        public DateTime LastUtc;
+    }
+
     /// <summary>State a server keeps across client connections: save location plus chunk/resume tracking.</summary>
     public class ServerWireContext
     {
@@ -271,12 +301,24 @@ namespace TrFileTransfer
         /// offsets and corrupts both the file and the persisted checkpoint.</summary>
         public ConcurrentDictionary<Guid, System.Threading.SemaphoreSlim> ResumeLocks
             = new ConcurrentDictionary<Guid, System.Threading.SemaphoreSlim>();
-        /// <summary>Consecutive pairing failures per peer IP. The pairing code is only
-        /// 6 digits, so without a cap a LAN peer can brute-force it with cheap 0x05/0x07
-        /// frames; after MaxAuthFailures the peer is locked out until it authenticates
-        /// successfully (or the server restarts).</summary>
-        public ConcurrentDictionary<string, int> AuthFailures
-            = new ConcurrentDictionary<string, int>();
+        /// <summary>Pairing failures per peer IP. The pairing code may be short, so a
+        /// LAN peer must not be able to pass unlimited guesses. The record carries the
+        /// time of the last failure so a lockout EXPIRES: a permanent lock (the old
+        /// behaviour) let one attacker wedge a legitimate peer until the server was
+        /// restarted, and address rotation (IPv6 /64) made the table grow forever.</summary>
+        public ConcurrentDictionary<string, AuthFailure> AuthFailures
+            = new ConcurrentDictionary<string, AuthFailure>(StringComparer.OrdinalIgnoreCase);
+        /// <summary>How long a peer stays locked out once MaxAuthFailures is reached.</summary>
+        public TimeSpan AuthLockoutDuration = TimeSpan.FromMinutes(10);
+        /// <summary>Upper bound on tracked peer records, so rotating source addresses
+        /// cannot grow the table without bound (expired rows are dropped first).</summary>
+        public int MaxAuthTrackedPeers = 4096;
+        /// <summary>Caps concurrent authenticated ECDH handshakes: the server-side
+        /// PBKDF2 stretch now runs before the code can be verified (the code hash is no
+        /// longer on the wire), so an unauthenticated peer must not be able to turn
+        /// connections into a CPU burn. Legitimate peers only hold a slot for the
+        /// handshake itself (tens of milliseconds).</summary>
+        public SemaphoreSlim AuthHandshakeGate = new SemaphoreSlim(16, 16);
         /// <summary>Digests of files already on disk, so re-verifying them (every 0x04
         /// sync re-checks its whole corpus) costs no disk reads — see FileHashCache.
         /// The process-wide instance, so every server and connection shares one cache.</summary>
@@ -295,6 +337,14 @@ namespace TrFileTransfer
         /// to the same peer, or it would be writing into someone else's file.</summary>
         public ConcurrentDictionary<string, string> ChunkSessionPeers
             = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        /// <summary>Folder-resume session id ("N" format) → owning peer. The session
+        /// directory is derived from the id alone, so without this a foreign peer that
+        /// learns/replays an id can write into another device's sync tree. Bounded like
+        /// the auth table; an id is bound for the lifetime of the process.</summary>
+        public ConcurrentDictionary<string, string> FolderSessionPeers
+            = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        /// <summary>Upper bound on tracked folder sessions before the table is cleared.</summary>
+        public int MaxFolderSessions = 4096;
         /// <summary>Pairing failures allowed per peer IP before lockout. 0 disables.</summary>
         public int MaxAuthFailures = 10;
         /// <summary>Statistics for the CURRENT connection (set by BeginSession).</summary>
@@ -418,9 +468,14 @@ namespace TrFileTransfer
             // Pairing-failure counters are process-wide (per peer IP, across connections)
             clone.AuthFailures = ctx.AuthFailures;
             clone.MaxAuthFailures = ctx.MaxAuthFailures;
+            clone.AuthLockoutDuration = ctx.AuthLockoutDuration;
+            clone.MaxAuthTrackedPeers = ctx.MaxAuthTrackedPeers;
+            clone.AuthHandshakeGate = ctx.AuthHandshakeGate;
             // Chunk group ownership is process-wide: the tracker a paused concurrent send
             // resumes must be findable by a new connection and refuse foreign peers.
             clone.ChunkSessionPeers = ctx.ChunkSessionPeers;
+            clone.FolderSessionPeers = ctx.FolderSessionPeers;
+            clone.MaxFolderSessions = ctx.MaxFolderSessions;
             // File digests are process-wide too: the point is that the NEXT connection
             // (a repeat sync) finds what this one already hashed or received.
             clone.FileHashes = ctx.FileHashes;
@@ -469,8 +524,11 @@ namespace TrFileTransfer
         /// clone is built, so a transport can scope callbacks (progress/completion) to
         /// THIS connection — the parent context's delegates are process-shared and
         /// fanning them out per connection cross-talks concurrent clients.</summary>
+        /// <param name="firstFrameTimeoutMs">How long a freshly accepted connection may
+        /// stay silent before its first request byte. An idle socket otherwise held an
+        /// admission slot forever (TCP reads cannot be cancelled on net48).</param>
         public static async Task<WireOutcome> HandleClientAsync(IWireStream s, ServerWireContext ctx, CancellationToken ct,
-            string clientIp = null, Action<ServerWireContext> onSessionCreated = null)
+            string clientIp = null, Action<ServerWireContext> onSessionCreated = null, int firstFrameTimeoutMs = 0)
         {
             var outcome = new WireOutcome();
 
@@ -487,7 +545,26 @@ namespace TrFileTransfer
             outcome.Session = ctx.Session;
 
             var typeBuf = new byte[1];
-            await s.ReadExactAsync(typeBuf, 0, 1, ct).ConfigureAwait(false);
+            if (firstFrameTimeoutMs > 0)
+            {
+                // Race the first byte against a deadline and let the CALLER close the
+                // socket on timeout: the cancellation token cannot abort a pending
+                // NetworkStream read on .NET Framework, so the only reliable way to
+                // unstick it is to dispose the socket underneath it.
+                Task typeRead = s.ReadExactAsync(typeBuf, 0, 1, ct);
+                Task typeDeadline = Task.Delay(firstFrameTimeoutMs, CancellationToken.None);
+                if (!ReferenceEquals(await Task.WhenAny(typeRead, typeDeadline).ConfigureAwait(false), typeRead))
+                {
+                    typeRead.ContinueWith(t => { var ignored = t.Exception; },
+                        TaskContinuationOptions.OnlyOnFaulted);
+                    throw new IOException(L.S_HandshakeTimeout);
+                }
+                await typeRead.ConfigureAwait(false);
+            }
+            else
+            {
+                await s.ReadExactAsync(typeBuf, 0, 1, ct).ConfigureAwait(false);
+            }
             byte transferType = typeBuf[0];
 
             IWireStream active = s;
@@ -537,10 +614,28 @@ namespace TrFileTransfer
                             ctx.Cb.RaiseLog(L.S_InvalidHeader(transferType, preludeFrames));
                             return outcome;
                         }
+                        // Legacy handshake kept for 2.12–2.14 peers. It carries
+                        // SHA256(pairing code), which a passive eavesdropper can brute
+                        // force offline — the new 0x0C frame (no hash on the wire) is
+                        // what current clients use.
+                        ctx.Cb.RaiseLog(L.S_LegacyAuthWarn);
                         IWireStream enc2 = await HandleEcdhAuthAsync(active, ctx, ct).ConfigureAwait(false);
                         if (enc2 == null)
                             return outcome; // rejected — Session.Rejected flagged
                         active = enc2;
+                        authSeen = true;
+                    }
+                    else if (transferType == 0x0C)
+                    {
+                        if (++preludeFrames > MaxPreludeFrames)
+                        {
+                            ctx.Cb.RaiseLog(L.S_InvalidHeader(transferType, preludeFrames));
+                            return outcome;
+                        }
+                        IWireStream enc3 = await HandleEcdhAuthV2Async(active, ctx, ct).ConfigureAwait(false);
+                        if (enc3 == null)
+                            return outcome; // rejected — Session.Rejected flagged
+                        active = enc3;
                         authSeen = true;
                     }
                     else if (transferType == 0x08)
@@ -588,7 +683,10 @@ namespace TrFileTransfer
                         // for the extended formats.
                         var respA = new byte[2];
                         respA[0] = 0x1A;
-                        respA[1] = 0x03;
+                        // bit0/bit1: this build always supports per-file skip and
+                        // chunk-group sessions. bit2 (completion verdict byte) is a
+                        // transport property: TCP writes it, UDT answers out of band.
+                        respA[1] = (byte)(0x03 | (ctx.CompletionAck ? 0x04 : 0));
                         await active.WriteExactAsync(respA, 0, respA.Length, ct).ConfigureAwait(false);
                         ctx.PerFileSkip = true;
                         ctx.ChunkSessions = true;
@@ -836,24 +934,51 @@ namespace TrFileTransfer
             return new EncryptedWireStream(s, s2cEnc, s2cMac, c2sEnc, c2sMac, false);
         }
 
-        /// <summary>True when the peer has failed pairing too many times and is locked out.</summary>
+        /// <summary>True when the peer has failed pairing too many times and its
+        /// lockout has not expired yet. An expired record is forgotten here, so the
+        /// peer gets a fresh allowance instead of staying locked forever.</summary>
         private static bool AuthLockedOut(ServerWireContext ctx, string peer)
         {
             if (ctx.MaxAuthFailures <= 0 || string.IsNullOrEmpty(peer)) return false;
-            int n;
-            return ctx.AuthFailures.TryGetValue(peer, out n) && n >= ctx.MaxAuthFailures;
+            AuthFailure f;
+            if (!ctx.AuthFailures.TryGetValue(peer, out f)) return false;
+            if (f.Count < ctx.MaxAuthFailures) return false;
+            if (DateTime.UtcNow - f.LastUtc < ctx.AuthLockoutDuration) return true;
+            AuthFailure ignored;
+            ctx.AuthFailures.TryRemove(peer, out ignored);
+            return false;
         }
 
         private static void NoteAuthFailure(ServerWireContext ctx, string peer)
         {
             if (ctx.MaxAuthFailures <= 0 || string.IsNullOrEmpty(peer)) return;
-            ctx.AuthFailures.AddOrUpdate(peer, 1, delegate (string k, int v) { return v + 1; });
+            if (ctx.AuthFailures.Count >= ctx.MaxAuthTrackedPeers)
+            {
+                // Address rotation (a hostile host cycling through its IPv6 /64) must
+                // not grow this table without bound. Expired rows go first; if that is
+                // not enough the table is reset (worst case: one extra free attempt).
+                foreach (var kv in ctx.AuthFailures)
+                {
+                    if (DateTime.UtcNow - kv.Value.LastUtc >= ctx.AuthLockoutDuration)
+                    {
+                        AuthFailure gone;
+                        ctx.AuthFailures.TryRemove(kv.Key, out gone);
+                    }
+                }
+                if (ctx.AuthFailures.Count >= ctx.MaxAuthTrackedPeers) ctx.AuthFailures.Clear();
+            }
+            ctx.AuthFailures.AddOrUpdate(peer,
+                delegate (string k) { return new AuthFailure { Count = 1, LastUtc = DateTime.UtcNow }; },
+                delegate (string k, AuthFailure v)
+                {
+                    return new AuthFailure { Count = v.Count + 1, LastUtc = DateTime.UtcNow };
+                });
         }
 
         private static void NoteAuthSuccess(ServerWireContext ctx, string peer)
         {
             if (string.IsNullOrEmpty(peer)) return;
-            int ignored;
+            AuthFailure ignored;
             ctx.AuthFailures.TryRemove(peer, out ignored);
         }
 
@@ -964,6 +1089,135 @@ namespace TrFileTransfer
                 if (ctx.Session != null) ctx.Session.Rejected = true;
                 return null;
             }
+        }
+
+        /// <summary>
+        /// Server side of the authenticated ECDH handshake v2 (0x0C). Wire:
+        ///   client → server: [0x0C][clientPub 72]
+        ///   server → client: [0x1C][status 1][serverPub 72][confirmS 32]
+        ///   client → server: [confirmC 32]
+        /// Unlike the legacy 0x09 frame, NO code hash is sent: the pairing code only
+        /// feeds PBKDF2, so a passive eavesdropper learns nothing that can be brute
+        /// forced offline. A peer that does not know the code simply fails the
+        /// client-confirmation check, which is counted like any other wrong code.
+        /// status: 0 accepted, 1 code wrong/locked out, 2 pairing disabled (continue
+        /// plaintext on this connection). Returns the raw stream for 1/2, a wrapped
+        /// EncryptedWireStream on success.
+        /// </summary>
+        private static async Task<IWireStream> HandleEcdhAuthV2Async(IWireStream s, ServerWireContext ctx, CancellationToken ct)
+        {
+            var clientPub = new byte[SessionCrypto.EcdhPublicBytes];
+            await s.ReadExactAsync(clientPub, 0, clientPub.Length, ct).ConfigureAwait(false);
+
+            string peer = ctx.Session != null ? ctx.Session.Peer : null;
+            if (string.IsNullOrEmpty(ctx.PairingCode))
+            {
+                await SendEcdhAuthV2Response(s, 2, new byte[SessionCrypto.EcdhPublicBytes], new byte[32], ct).ConfigureAwait(false);
+                ctx.Cb.RaiseLog(L.S_EncryptUnsupported);
+                return s;
+            }
+            if (AuthLockedOut(ctx, peer))
+            {
+                await SendEcdhAuthV2Response(s, 1, new byte[SessionCrypto.EcdhPublicBytes], new byte[32], ct).ConfigureAwait(false);
+                ctx.Cb.RaiseLog(L.S_AuthLockedOut(peer));
+                if (ctx.Session != null) ctx.Session.Rejected = true;
+                return null;
+            }
+
+            bool gateHeld = false;
+            try
+            {
+                try { gateHeld = await ctx.AuthHandshakeGate.WaitAsync(2000, ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return null; }
+                if (!gateHeld)
+                {
+                    // The code can no longer be checked before PBKDF2 runs, so a peer
+                    // must not be able to turn connections into a CPU burn.
+                    ctx.Cb.RaiseLog(L.S_AuthBusy);
+                    if (ctx.Session != null) ctx.Session.Rejected = true;
+                    return null;
+                }
+
+                using (var serverKey = SessionCrypto.CreateEcdhKey())
+                {
+                    byte[] serverPub = SessionCrypto.EcdhPublicBlob(serverKey);
+                    byte[] shared = null;
+                    try { shared = SessionCrypto.EcdhDeriveShared(serverKey, clientPub); }
+                    catch { shared = null; }
+                    if (shared == null)
+                    {
+                        // Malformed public key — answer with a random confirmation so
+                        // the rejection is indistinguishable from a wrong code.
+                        await SendEcdhAuthV2Response(s, 1, serverPub, RandomBytes(32), ct).ConfigureAwait(false);
+                        NoteAuthFailure(ctx, peer);
+                        ctx.Cb.RaiseLog(L.S_EncHandshakeFailed);
+                        if (ctx.Session != null) ctx.Session.Rejected = true;
+                        return null;
+                    }
+
+                    byte[] authKey = SessionCrypto.DeriveAuthKey(ctx.PairingCode, clientPub, serverPub, shared);
+                    byte[] confirmS = SessionCrypto.Confirm(authKey, "s2c-confirm", clientPub, serverPub);
+                    await SendEcdhAuthV2Response(s, 0, serverPub, confirmS, ct).ConfigureAwait(false);
+
+                    var confirmC = new byte[32];
+                    await s.ReadExactAsync(confirmC, 0, 32, ct).ConfigureAwait(false);
+                    byte[] expected = SessionCrypto.Confirm(authKey, "c2s-confirm", clientPub, serverPub);
+                    if (!Utils.ConstantTimeEquals(confirmC, expected))
+                    {
+                        // No code on the wire — this IS the code check.
+                        NoteAuthFailure(ctx, peer);
+                        ctx.Cb.RaiseLog(L.S_EncHandshakeFailed);
+                        ctx.Cb.RaiseError(L.S_AuthFailed);
+                        if (ctx.Session != null) ctx.Session.Rejected = true;
+                        return null;
+                    }
+
+                    NoteAuthSuccess(ctx, peer);
+                    byte[] c2sEnc, c2sMac, s2cEnc, s2cMac;
+                    SessionCrypto.DeriveSessionKeys(authKey, new byte[SessionCrypto.SaltBytes], out c2sEnc, out c2sMac, out s2cEnc, out s2cMac);
+                    if (ctx.Session != null) ctx.Session.Encrypted = true;
+                    ctx.Cb.RaiseLog(L.S_EncryptedOn);
+                    // ownsInner:false — the transport sends its own ACK/NACK afterwards.
+                    // bindSequence:true — same sequence-bound segment format as 0x09.
+                    return new EncryptedWireStream(s, s2cEnc, s2cMac, c2sEnc, c2sMac, false, true);
+                }
+            }
+            catch (IOException)
+            {
+                // The peer vanished before sending confirmC: the code was never proven
+                // correct. Count it as a failed attempt — otherwise an attacker could
+                // brute-force by opening a connection, reading confirmS, and dropping it
+                // (our own client does exactly that when its code is wrong, because it
+                // rejects the mismatched confirmS locally).
+                NoteAuthFailure(ctx, peer);
+                ctx.Cb.RaiseLog(L.S_EncHandshakeFailed);
+                if (ctx.Session != null) ctx.Session.Rejected = true;
+                return null;
+            }
+            finally
+            {
+                if (gateHeld) ctx.AuthHandshakeGate.Release();
+            }
+        }
+
+        private static byte[] RandomBytes(int count)
+        {
+            var buf = new byte[count];
+            using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create())
+                rng.GetBytes(buf);
+            return buf;
+        }
+
+        private static async Task SendEcdhAuthV2Response(IWireStream s, byte status, byte[] serverPub, byte[] confirmS, CancellationToken ct)
+        {
+            var resp = new byte[1 + 1 + SessionCrypto.EcdhPublicBytes + 32];
+            resp[0] = 0x1C;
+            resp[1] = status;
+            if (serverPub != null && serverPub.Length > 0)
+                Buffer.BlockCopy(serverPub, 0, resp, 2, Math.Min(serverPub.Length, SessionCrypto.EcdhPublicBytes));
+            if (confirmS != null && confirmS.Length > 0)
+                Buffer.BlockCopy(confirmS, 0, resp, 2 + SessionCrypto.EcdhPublicBytes, Math.Min(confirmS.Length, 32));
+            await s.WriteExactAsync(resp, 0, resp.Length, ct).ConfigureAwait(false);
         }
 
         private static async Task SendEcdhAuthResponse(IWireStream s, byte status, byte[] serverPub, byte[] confirmS, CancellationToken ct)
@@ -1083,9 +1337,15 @@ namespace TrFileTransfer
             string name = Path.GetFileName(rawName);
             if (string.IsNullOrWhiteSpace(name))
                 name = fallback;
+            // Control characters cannot exist in a Windows file name, but they would
+            // still reach the log/UI (this name is logged before the file is created),
+            // where CR/LF let a peer forge whole log lines. Neutralize them and bound
+            // the length before the name is used for anything.
+            name = Utils.StripControlChars(name);
             name = name.TrimEnd('.', ' ');
             if (name.Length == 0)
                 return fallback;
+            if (name.Length > 200) name = name.Substring(0, 200);
             if (Utils.IsReservedFileName(name))
                 name = "_" + name;
             return name;
@@ -1147,9 +1407,40 @@ namespace TrFileTransfer
                 fullHashes[i] = hashBuf;
 
                 sizes[i] = size;
+                // Checked-style accumulation: 10^6 entries × 2^50 would wrap a signed
+                // 64-bit counter and could be made to equal a forged totalBytes.
+                if (size > Utils.MaxTransferSize - manifestTotal) return false;
                 manifestTotal += size;
             }
             if (manifestTotal != totalBytes) return false;
+
+            // The session directory is derived from the id alone; bind the id to the
+            // first peer that used it so another host cannot write into (or continue)
+            // someone else's sync tree by replaying a guessed id.
+            string folderPeer = ctx.Session != null ? ctx.Session.Peer : "";
+            if (!string.IsNullOrEmpty(folderPeer))
+            {
+                string sessionKey = sessionId.ToString("N");
+                if (!ctx.FolderSessionPeers.TryAdd(sessionKey, folderPeer))
+                {
+                    string owner;
+                    if (ctx.FolderSessionPeers.TryGetValue(sessionKey, out owner)
+                        && !string.Equals(owner, folderPeer, StringComparison.OrdinalIgnoreCase))
+                    {
+                        ctx.Cb.RaiseLog(L.S_FolderSessionForeignPeer(sessionKey));
+                        ctx.Cb.RaiseError(L.S_FolderSessionForeignPeer(sessionKey));
+                        ctx.Session.Rejected = true;
+                        return false;
+                    }
+                }
+                else if (ctx.FolderSessionPeers.Count > ctx.MaxFolderSessions)
+                {
+                    // Bound memory under session-id flooding; the current binding is
+                    // re-added immediately afterwards.
+                    ctx.FolderSessionPeers.Clear();
+                    ctx.FolderSessionPeers.TryAdd(sessionKey, folderPeer);
+                }
+            }
 
             if (!await GateAsync(ctx, folderName, totalBytes, fileCount, true).ConfigureAwait(false))
                 return false;
@@ -1560,6 +1851,18 @@ namespace TrFileTransfer
             {
                 ctx.Cb.RaiseLog(L.S_ChunkRangeOverflow(fileName, tracker.RangeCount));
                 ctx.Cb.RaiseError(L.S_ChunkRangeOverflow(fileName, tracker.RangeCount));
+                // The group is garbage: drop it (and its ownership record) so its open
+                // FileShare.None handle and preallocated file do not leak until Stop().
+                ChunkTracker overflow;
+                if (ctx.ChunkTrackers.TryRemove(trackerKey, out overflow))
+                {
+                    try { overflow.Dispose(); } catch { }
+                }
+                if (groupKey != null)
+                {
+                    string staleOwner;
+                    ctx.ChunkSessionPeers.TryRemove(groupKey, out staleOwner);
+                }
                 return false;
             }
 
@@ -1899,13 +2202,28 @@ namespace TrFileTransfer
                 if (state.ReceivedBytes >= totalSize)
                 {
                     // Payload fully on disk from an earlier connection that died before
-                    // the final handshake — finalize like the success path so the file
-                    // is not left locked by the abandoned write stream.
+                    // the final handshake. Close the abandoned write stream first so the
+                    // file can be re-read, then HONOUR the full hash the client declared:
+                    // reporting status=2 without verifying it would accept bytes that
+                    // never passed an end-to-end check (a cut connection right after the
+                    // last payload byte used to skip verification entirely).
                     try { state.WriteStream.Dispose(); } catch { }
                     state.WriteStream = null;
                     ResumeState removedDone;
                     ctx.ResumeStates.TryRemove(sessionId, out removedDone);
                     ServerResumeStore.Delete(sessionId);
+                    if (expectedFullHash != null
+                        && !await VerifyFullHashFile(ctx, state.SavePath, expectedFullHash, ct).ConfigureAwait(false))
+                    {
+                        ctx.FileHashes.Remove(state.SavePath);
+                        Utils.DeleteWithRetry(state.SavePath);
+                        ctx.Cb.RaiseLog(L.S_FullHashFailed(fileName));
+                        ctx.Cb.RaiseError(L.S_FullHashFailed(fileName));
+                        await SendResumeResponse(s, totalSize, 3, ct).ConfigureAwait(false);
+                        return false;
+                    }
+                    if (expectedFullHash != null)
+                        ctx.FileHashes.Store(state.SavePath, expectedFullHash);
                     status = 2;
                     resumeFrom = totalSize;
                     await SendResumeResponse(s, resumeFrom, status, ct).ConfigureAwait(false);
@@ -2352,6 +2670,16 @@ namespace TrFileTransfer
             /// <summary>True when the peer dropped the 0x0A capability frame (an older
             /// version) — the caller must reconnect without the offer.</summary>
             public bool NeedNoPerFileSkipFallback;
+            /// <summary>True when the peer ignored the new 0x0C authenticated handshake
+            /// (a 2.12–2.14 build): the caller may reconnect and try the legacy 0x09
+            /// frame instead, but only when downgrades are allowed — 0x09 puts the
+            /// pairing-code hash on the wire.</summary>
+            public bool NeedLegacyAuth;
+            /// <summary>True when the peer acknowledged the completion-verdict capability
+            /// (0x0A bit 2): this transport will send one status byte after 0x00/0x01/
+            /// 0x04/0x06, so the client must read it even when the session is neither
+            /// encrypted nor compressed.</summary>
+            public bool CompletionAck;
         }
 
     public static class ClientWire
@@ -2821,12 +3149,24 @@ namespace TrFileTransfer
         }
 
         /// <summary>Optional capability negotiation (0x0A, v2.13+).
-        /// capabilities bit0 = 0x04 per-file skip, bit1 = 0x02 chunk-group sessions plus the
-        /// 0x0B coverage query. Callers request exactly what their body will use; a peer
-        /// that drops the frame (an older build) reports NeedNoPerFileSkipFallback so the
+        /// capabilities bit0 = 0x01 per-file skip, bit1 = 0x02 chunk-group sessions plus
+        /// the 0x0B coverage query, bit2 = 0x04 the peer will send the TCP completion
+        /// verdict byte. Callers request exactly what their body will use; a peer that
+        /// drops the frame (an older build) reports NeedNoPerFileSkipFallback so the
         /// caller can reconnect without the offer.</summary>
         public static async Task<AuthResult> AuthenticateAsync(IWireStream s, string pairingCode, bool tryEncryption,
             bool tryCompression, WireCallbacks cb, CancellationToken ct, bool allowDowngrade, byte capabilities)
+        {
+            return await AuthenticateAsync(s, pairingCode, tryEncryption, tryCompression, cb, ct,
+                allowDowngrade, capabilities, false).ConfigureAwait(false);
+        }
+
+        /// <param name="legacyAuth">Only true on the reconnect that retries a peer which
+        /// ignored the 0x0C frame: send the legacy 0x09 handshake (exposes the code
+        /// hash) instead of failing. Never used when allowDowngrade is false.</param>
+        public static async Task<AuthResult> AuthenticateAsync(IWireStream s, string pairingCode, bool tryEncryption,
+            bool tryCompression, WireCallbacks cb, CancellationToken ct, bool allowDowngrade, byte capabilities,
+            bool legacyAuth)
         {
             IWireStream current = s;
             bool encrypted = false;
@@ -2840,23 +3180,30 @@ namespace TrFileTransfer
                 else
                 {
                     cb.RaiseLog(L.C_Authing);
-                    // Preferred: authenticated ECDH (0x09).
-                    var ecdh = await TryEcdhHandshakeAsync(current, pairingCode, cb, ct).ConfigureAwait(false);
+                    // Preferred: authenticated ECDH v2 (0x0C, no code hash on the wire).
+                    var ecdh = await TryEcdhHandshakeAsync(current, pairingCode, cb, ct, allowDowngrade, legacyAuth).ConfigureAwait(false);
                     if (ecdh.Handled)
                     {
                         if (ecdh.Rejected) throw new IOException(L.C_AuthFailed);
                         if (ecdh.Encrypted) { current = ecdh.Stream; encrypted = true; }
-                        // else: peer has no pairing code — continue plaintext on this connection
+                        // else: peer has no pairing code and downgrades are allowed —
+                        // continue plaintext on this connection.
                     }
                     else
                     {
-                        // The peer did not answer 0x09: either an older build, or an
-                        // on-path attacker forcing a weaker path. Fail closed unless
-                        // the caller explicitly allowed a downgrade; otherwise the
-                        // caller reconnects with encryption disabled (plain 0x05),
-                        // never with the legacy 0x07 whose key rides the wire.
+                        // The peer did not answer the handshake frame: either an older
+                        // build, or an on-path attacker forcing a weaker path. Fail
+                        // closed unless the caller explicitly allowed a downgrade.
                         if (!allowDowngrade)
                             throw new IOException(L.C_EncryptPeerTooOld);
+                        if (!legacyAuth)
+                        {
+                            // A 2.12–2.14 peer cannot answer 0x0C. Ask the transport to
+                            // reconnect and retry with the legacy 0x09 frame (which is
+                            // interoperable but exposes the code hash) rather than
+                            // dropping straight to plaintext.
+                            return new AuthResult { Stream = current, NeedLegacyAuth = true };
+                        }
                         return new AuthResult { Stream = current, NeedPlainFallback = true };
                     }
                 }
@@ -2900,6 +3247,7 @@ namespace TrFileTransfer
 
             bool perFileSkip = false;
             bool chunkSessions = false;
+            bool completionAck = false;
             if (capabilities != 0)
             {
                 // Same drop-is-the-signal pattern: an older server sees 0x0A as an unknown
@@ -2920,8 +3268,11 @@ namespace TrFileTransfer
                 }
                 if (respA[0] != 0x1A || (respA[1] & capabilities) != capabilities)
                     return new AuthResult { Stream = current, Encrypted = encrypted, Compressed = compressed, NeedNoPerFileSkipFallback = true };
-                perFileSkip = (capabilities & 0x01) != 0;
-                chunkSessions = (capabilities & 0x02) != 0;
+                perFileSkip = (respA[1] & 0x01) != 0;
+                chunkSessions = (respA[1] & 0x02) != 0;
+                // The peer only sets this when it will actually write the verdict
+                // byte (TCP); UDT answers with its own out-of-band ACK instead.
+                completionAck = (respA[1] & 0x04) != 0;
             }
 
             return new AuthResult
@@ -2930,31 +3281,44 @@ namespace TrFileTransfer
                 Encrypted = encrypted,
                 Compressed = compressed,
                 PerFileSkip = perFileSkip,
-                ChunkSessions = chunkSessions
+                ChunkSessions = chunkSessions,
+                CompletionAck = completionAck
             };
         }
 
         /// <summary>
-        /// Attempts the authenticated ECDH handshake (0x09). Handled=false means the
-        /// peer did not answer with a 0x19 frame (older build, or an attacker cutting
-        /// the handshake) — the caller decides whether to downgrade or refuse. On the
-        /// wire: [0x09][codeHash 32][clientPub 72], then the server's 0x19 reply, then
-        /// the client's confirmation. The session keys come from the DH secret, never
-        /// from anything an eavesdropper can see.
+        /// Attempts the authenticated ECDH handshake. The default frame is 0x0C, which
+        /// carries ONLY the client's ephemeral public key — the pairing code never
+        /// crosses the wire, so a passive eavesdropper cannot brute-force it offline.
+        /// legacyAuth=true sends the old 0x09 frame (code hash included) for 2.12–2.14
+        /// peers; the caller only reaches that path when downgrades are allowed.
+        /// Handled=false means the peer did not answer the expected reply frame (older
+        /// build, or an attacker cutting the handshake) — the caller decides whether to
+        /// downgrade or refuse.
         /// </summary>
         private static async Task<EcdhHandshakeResult> TryEcdhHandshakeAsync(IWireStream s, string pairingCode,
-            WireCallbacks cb, CancellationToken ct)
+            WireCallbacks cb, CancellationToken ct, bool allowDowngrade, bool legacyAuth)
         {
             using (var clientKey = SessionCrypto.CreateEcdhKey())
             {
                 byte[] clientPub = SessionCrypto.EcdhPublicBlob(clientKey);
-                byte[] codeHash = WireAuth.HashCode(pairingCode);
-
-                var frame = new byte[1 + 32 + SessionCrypto.EcdhPublicBytes];
-                frame[0] = 0x09;
-                Buffer.BlockCopy(codeHash, 0, frame, 1, 32);
-                Buffer.BlockCopy(clientPub, 0, frame, 33, clientPub.Length);
-                await s.WriteExactAsync(frame, 0, frame.Length, ct).ConfigureAwait(false);
+                byte replyType = legacyAuth ? (byte)0x19 : (byte)0x1C;
+                if (legacyAuth)
+                {
+                    byte[] codeHash = WireAuth.HashCode(pairingCode);
+                    var legacyFrame = new byte[1 + 32 + SessionCrypto.EcdhPublicBytes];
+                    legacyFrame[0] = 0x09;
+                    Buffer.BlockCopy(codeHash, 0, legacyFrame, 1, 32);
+                    Buffer.BlockCopy(clientPub, 0, legacyFrame, 33, clientPub.Length);
+                    await s.WriteExactAsync(legacyFrame, 0, legacyFrame.Length, ct).ConfigureAwait(false);
+                }
+                else
+                {
+                    var frame = new byte[1 + SessionCrypto.EcdhPublicBytes];
+                    frame[0] = 0x0C;
+                    Buffer.BlockCopy(clientPub, 0, frame, 1, clientPub.Length);
+                    await s.WriteExactAsync(frame, 0, frame.Length, ct).ConfigureAwait(false);
+                }
 
                 var resp = new byte[2 + SessionCrypto.EcdhPublicBytes + 32];
                 try
@@ -2965,26 +3329,33 @@ namespace TrFileTransfer
                 {
                     return new EcdhHandshakeResult { Handled = false };
                 }
-                if (resp[0] != 0x19)
+                if (resp[0] != replyType)
                     return new EcdhHandshakeResult { Handled = false };
 
                 byte status = resp[1];
-                var serverPub = new byte[SessionCrypto.EcdhPublicBytes];
-                Buffer.BlockCopy(resp, 2, serverPub, 0, serverPub.Length);
-                var confirmS = new byte[32];
-                Buffer.BlockCopy(resp, 2 + serverPub.Length, confirmS, 0, 32);
-
                 if (status == 1)
                     return new EcdhHandshakeResult { Handled = true, Rejected = true };
                 if (status == 2)
                 {
-                    // Server has pairing disabled and will not encrypt. Continuing
-                    // plaintext on this connection is the documented lenient path.
+                    // Server has pairing disabled and will not encrypt. Continuing in
+                    // plaintext is only acceptable when the caller allowed a downgrade;
+                    // strict mode (EncryptStrict) must fail closed here, otherwise an
+                    // on-path attacker can force plaintext with a single packet.
+                    if (!allowDowngrade)
+                    {
+                        cb.RaiseLog(L.C_StrictPlainRefused);
+                        return new EcdhHandshakeResult { Handled = true, Rejected = true };
+                    }
                     cb.RaiseLog(L.C_EncryptUnsupported);
                     return new EcdhHandshakeResult { Handled = true };
                 }
                 if (status != 0)
                     return new EcdhHandshakeResult { Handled = false };
+
+                var serverPub = new byte[SessionCrypto.EcdhPublicBytes];
+                Buffer.BlockCopy(resp, 2, serverPub, 0, serverPub.Length);
+                var confirmS = new byte[32];
+                Buffer.BlockCopy(resp, 2 + serverPub.Length, confirmS, 0, 32);
 
                 byte[] shared;
                 try { shared = SessionCrypto.EcdhDeriveShared(clientKey, serverPub); }
@@ -2994,8 +3365,8 @@ namespace TrFileTransfer
                 byte[] expectedS = SessionCrypto.Confirm(authKey, "s2c-confirm", clientPub, serverPub);
                 if (!Utils.ConstantTimeEquals(confirmS, expectedS))
                 {
-                    // The 0x19 reply was not produced by someone holding the code and
-                    // the matching private key — refuse (possible MITM).
+                    // The reply was not produced by someone holding the code and the
+                    // matching private key — refuse (possible MITM).
                     return new EcdhHandshakeResult { Handled = true, Rejected = true };
                 }
 
@@ -3010,7 +3381,7 @@ namespace TrFileTransfer
                 {
                     Handled = true,
                     Encrypted = true,
-                    // bindSequence:true — matches the server's 0x09 segment format
+                    // bindSequence:true — matches the server's sequence-bound format.
                     Stream = new EncryptedWireStream(s, c2sEnc, c2sMac, s2cEnc, s2cMac, true, true)
                 };
             }

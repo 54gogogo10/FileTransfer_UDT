@@ -114,6 +114,10 @@ namespace TrFileTransfer.Tests
             runner.Run("Integration_HTTP_UploadTokenAndTraversalName", HttpShareUploadTokenAndTraversalName);
             runner.Run("Integration_HTTP_Delete", HttpShareDelete, 1);
             runner.Run("Integration_HTTP_AuthLockout", HttpShareAuthLockout);
+            runner.Run("Integration_HTTP_ReadOnlyWithoutCode", HttpShareReadOnlyWithoutCode);
+            runner.Run("Integration_HTTP_UploadRejectsCrossSite", HttpShareUploadRejectsCrossSite);
+            runner.Run("Integration_HTTP_SlowlorisReleasesSlots", HttpShareSlowlorisReleasesSlots);
+            runner.Run("Integration_HTTP_RejectsForeignHost", HttpShareRejectsForeignHost);
             runner.Run("Integration_ResumeFullHash_BeforeConnect", () => ResumeFullHashBeforeConnect(false));
             runner.Run("Integration_UDT_ResumeFullHash_BeforeConnect", () => ResumeFullHashBeforeConnect(true), 1);
             runner.Run("Integration_FolderSync_HashCacheSkipsReread", FolderSyncHashCache);
@@ -149,6 +153,9 @@ namespace TrFileTransfer.Tests
             runner.Run("Unit_AddressPortProbeUnavailableAddr", AddressPortProbeUnavailableAddr);
             runner.Run("Integration_UDP_OneWay_SingleFile", UdpOneWaySingleFile, 1);
             runner.Run("Integration_UDP_OneWay_EmptyFile", UdpOneWayEmptyFile, 1);
+            runner.Run("Integration_UDP_V2_Interop", UdpV2Interop, 1);
+            runner.Run("Integration_UDP_V2_EmptyFile", UdpV2EmptyFile, 1);
+            runner.Run("Integration_UDP_V2_FecRecovery", UdpV2FecRecovery, 1);
             runner.Run("Integration_UDP_OneWay_LossyResume", UdpOneWayLossyResume, 1);
             runner.Run("Integration_UDP_OneWay_ProgressThrottled", UdpOneWayProgressThrottled, 1);
             runner.Run("Integration_UDP_OneWay_DuplicateSkip", UdpOneWayDuplicateSkip, 1);
@@ -483,6 +490,145 @@ namespace TrFileTransfer.Tests
             {
                 if (server != null) { try { server.Stop(); } catch { } }
                 try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>v2 (Rust trft) self-interop: the C# sender in Rust-compat mode must
+        /// be accepted by the C# receiver's v2 path (same wire bytes the VM test feeds
+        /// to the real trft receiver).</summary>
+        private static void UdpV2Interop()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_v2_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_v2_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdpServer server = null;
+            try
+            {
+                var content = new byte[1024 * 1024 + 137];
+                new Random(701).NextBytes(content);
+                string file = Path.Combine(sendDir, "rust_v2.bin");
+                File.WriteAllBytes(file, content);
+
+                server = StartUdpReceiver("127.0.0.1", port, recvDir);
+                var waiter = WatchUdpDelivery(server);
+                var client = new TransferUdpClient("127.0.0.1", port, file);
+                client.RustCompat = true;
+                client.SendAsync().Wait(30000);
+
+                string got = WaitUdp(waiter, 15000);
+                Assert.NotNull(got, "v2 one-way file delivered");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(got)),
+                    "v2 delivered bytes match");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        private static void UdpV2EmptyFile()
+        {
+            int port = FindFreePort();
+            string sendDir = Path.Combine(TempBase(), "tr_v2e_s_" + Guid.NewGuid().ToString("N"));
+            string recvDir = Path.Combine(TempBase(), "tr_v2e_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(sendDir);
+            Directory.CreateDirectory(recvDir);
+            TransferUdpServer server = null;
+            try
+            {
+                string file = Path.Combine(sendDir, "empty_v2.bin");
+                File.WriteAllBytes(file, new byte[0]);
+                server = StartUdpReceiver("127.0.0.1", port, recvDir);
+                var waiter = WatchUdpDelivery(server);
+                var client = new TransferUdpClient("127.0.0.1", port, file);
+                client.RustCompat = true;
+                client.SendAsync().Wait(30000);
+                string got = WaitUdp(waiter, 15000);
+                Assert.NotNull(got, "v2 empty file delivered");
+                Assert.Equal(0L, new FileInfo(got).Length, "empty file is empty");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
+                try { Directory.Delete(sendDir, true); } catch { }
+                try { Directory.Delete(recvDir, true); } catch { }
+            }
+        }
+
+        /// <summary>v2 FEC receive path: a 6-chunk file (one full 4-shard group + one
+        /// tail group) with one data chunk lost in EACH group must be reconstructed from
+        /// the parity shards alone (no re-send). Exercises the systematic Vandermonde
+        /// decoder and the start-hash completion rule.</summary>
+        private static void UdpV2FecRecovery()
+        {
+            int port = FindFreePort();
+            string recvDir = Path.Combine(TempBase(), "tr_v2f_r_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(recvDir);
+            TransferUdpServer server = null;
+            try
+            {
+                const int chunk = UdpV2Wire.ChunkSize;
+                const int totalChunks = 6;
+                long size = (long)chunk * totalChunks - 100; // tail chunk is short
+                var content = new byte[size];
+                new Random(702).NextBytes(content);
+                string name = "v2fec.bin";
+                ulong session = UdpV2Wire.DeriveSession(name, size, 1700000000000000000L);
+                byte[] hash;
+                using (var sha = System.Security.Cryptography.SHA256.Create())
+                    hash = sha.ComputeHash(content);
+
+                server = StartUdpReceiver("127.0.0.1", port, recvDir);
+                var waiter = WatchUdpDelivery(server);
+
+                Func<int, byte[]> shardOf = delegate(int seq)
+                {
+                    var s = new byte[chunk];
+                    long off = (long)seq * chunk;
+                    if (off < size)
+                        Buffer.BlockCopy(content, (int)off, s, 0,
+                            (int)Math.Min((long)chunk, size - off));
+                    return s;
+                };
+
+                using (var udp = new UdpClient())
+                {
+                    udp.Connect(IPAddress.Loopback, port);
+                    Action<byte[]> send = delegate(byte[] b) { udp.Send(b, b.Length); };
+                    byte[] start = UdpV2Wire.BuildStart(session, name, size, chunk, true, 2, hash);
+                    for (int i = 0; i < 3; i++) send(start);
+
+                    // group 0: drop chunk 1; group 1: drop chunk 4 (chunk 5 is the tail)
+                    for (int seq = 0; seq < totalChunks; seq++)
+                    {
+                        if (seq == 1 || seq == 4) continue;
+                        int real = (int)Math.Min((long)chunk, size - (long)seq * chunk);
+                        send(UdpV2Wire.BuildData(session, seq, content, seq * chunk, real));
+                    }
+                    for (int g = 0; g < 2; g++)
+                    {
+                        var groupData = new byte[4][];
+                        for (int s = 0; s < 4; s++) groupData[s] = shardOf(g * 4 + s);
+                        byte[][] parity = UdpFec.VandermondeEncode(groupData, 2, chunk);
+                        for (int p = 0; p < 2; p++)
+                            send(UdpV2Wire.BuildParity(session, g, 4 + p, parity[p], chunk));
+                    }
+                    send(UdpV2Wire.BuildEnd(session, hash));
+                }
+
+                string got = WaitUdp(waiter, 15000);
+                Assert.NotNull(got, "v2 FEC-recovered file delivered");
+                Assert.True(Utils.ConstantTimeEquals(content, File.ReadAllBytes(got)),
+                    "v2 FEC reconstruction byte-identical");
+            }
+            finally
+            {
+                if (server != null) { try { server.Stop(); } catch { } }
                 try { Directory.Delete(recvDir, true); } catch { }
             }
         }
@@ -4559,6 +4705,163 @@ namespace TrFileTransfer.Tests
             }
         }
 
+        /// <summary>Silent connections must not pin the admission slots: the 15s head
+        /// deadline is enforced by closing the socket (net48's ReadAsync ignores the
+        /// token), so after the deadline a normal request is served again. The timeout
+        /// is shortened here to keep the test fast.</summary>
+        private static void HttpShareSlowlorisReleasesSlots()
+        {
+            int port = FindFreePort();
+            string root = Path.Combine(TempBase(), "tr_http_slow_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            var server = new HttpShareServer();
+            server.HeadReadTimeoutMs = 400;
+            var idle = new System.Collections.Generic.List<TcpClient>();
+            try
+            {
+                File.WriteAllBytes(Path.Combine(root, "ok.bin"), new byte[] { 7 });
+                server.Start(root, port, null);
+
+                // Fill every admission slot with connections that never send a byte.
+                for (int i = 0; i < HttpShareServer.MaxConcurrentConnections + 2; i++)
+                {
+                    var c = new TcpClient();
+                    c.Connect("127.0.0.1", port);
+                    idle.Add(c);
+                }
+                Thread.Sleep(1500); // let the head deadline fire and close them
+
+                var list = HttpGet("http://127.0.0.1:" + port + "/");
+                Assert.Equal(200, list.Item1, "share serves again after idle connections time out");
+                Assert.True(System.Text.Encoding.UTF8.GetString(list.Item2).Contains("ok.bin"),
+                    "listing after recovery");
+            }
+            finally
+            {
+                foreach (var c in idle) { try { c.Close(); } catch { } }
+                server.Stop();
+                try { Directory.Delete(root, true); } catch { }
+            }
+        }
+
+        /// <summary>The same-origin check compares Origin against Host; without a Host
+        /// whitelist a rebinding domain would satisfy both. Foreign Host values are
+        /// rejected outright.</summary>
+        private static void HttpShareRejectsForeignHost()
+        {
+            int port = FindFreePort();
+            string root = Path.Combine(TempBase(), "tr_http_host_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            var server = new HttpShareServer();
+            try
+            {
+                server.Start(root, port, null);
+                using (var raw = new TcpClient())
+                {
+                    raw.Connect("127.0.0.1", port);
+                    var ns = raw.GetStream();
+                    byte[] req = System.Text.Encoding.ASCII.GetBytes(
+                        "GET / HTTP/1.1\r\nHost: evil.example:8090\r\nConnection: close\r\n\r\n");
+                    ns.Write(req, 0, req.Length);
+                    ns.Flush();
+                    var buf = new byte[512];
+                    int n = ns.Read(buf, 0, buf.Length);
+                    string resp = System.Text.Encoding.ASCII.GetString(buf, 0, n);
+                    Assert.True(resp.StartsWith("HTTP/1.1 400"), "foreign Host rejected: " + resp);
+                }
+
+                // The addressable Host still works.
+                var ok = HttpGet("http://127.0.0.1:" + port + "/");
+                Assert.Equal(200, ok.Item1, "loopback Host accepted");
+            }
+            finally
+            {
+                server.Stop();
+                try { Directory.Delete(root, true); } catch { }
+            }
+        }
+
+        /// <summary>A share started without an access code is READ-ONLY: listing and
+        /// downloads work, but uploads (and deletes) are refused and the page does not
+        /// offer them. Previously the same button opened an anonymous, writable share
+        /// whose only protection was the browser's CORS policy.</summary>
+        private static void HttpShareReadOnlyWithoutCode()
+        {
+            int port = FindFreePort();
+            string root = Path.Combine(TempBase(), "tr_http_ro_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            var server = new HttpShareServer();
+            try
+            {
+                File.WriteAllBytes(Path.Combine(root, "a.bin"), new byte[] { 1, 2, 3 });
+                server.Start(root, port, null);
+                string baseUrl = "http://127.0.0.1:" + port + "/";
+
+                var list = HttpGet(baseUrl);
+                string html = System.Text.Encoding.UTF8.GetString(list.Item2);
+                Assert.Equal(200, list.Item1, "listing works");
+                Assert.True(html.Contains("a.bin"), "file listed");
+                Assert.False(html.Contains("multipart/form-data"), "no upload form on a read-only share");
+                Assert.False(html.Contains("delconfirm"), "no delete links on a read-only share");
+
+                var files = new System.Collections.Generic.Dictionary<string, byte[]>
+                {
+                    { "x.txt", System.Text.Encoding.UTF8.GetBytes("x") }
+                };
+                var resp = HttpPost(baseUrl, "multipart/form-data; boundary=B",
+                    BuildMultipart("B", new System.Collections.Generic.Dictionary<string, string>(), files));
+                Assert.Equal(403, resp.Item1, "upload refused without an access code");
+                Assert.False(File.Exists(Path.Combine(root, "x.txt")), "nothing written");
+
+                var del = HttpPostStatus(baseUrl + "?del=" + Uri.EscapeDataString("a.bin"), null);
+                Assert.Equal(403, del.Item1, "delete refused without an access code");
+                Assert.True(File.Exists(Path.Combine(root, "a.bin")), "file survived");
+            }
+            finally
+            {
+                server.Stop();
+                try { Directory.Delete(root, true); } catch { }
+            }
+        }
+
+        /// <summary>Even an authenticated share refuses a multipart POST that a foreign
+        /// origin forged: uploads are state-changing and need the same same-origin check
+        /// the delete path always had (multipart is CORS-safelisted, so a plain web page
+        /// can submit one without a preflight).</summary>
+        private static void HttpShareUploadRejectsCrossSite()
+        {
+            int port = FindFreePort();
+            string root = Path.Combine(TempBase(), "tr_http_csrfup_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            var server = new HttpShareServer();
+            try
+            {
+                server.Start(root, port, "246810");
+                string baseUrl = "http://127.0.0.1:" + port + "/";
+                var files = new System.Collections.Generic.Dictionary<string, byte[]>
+                {
+                    { "forged.txt", System.Text.Encoding.UTF8.GetBytes("forged") }
+                };
+                byte[] body = BuildMultipart("B", new System.Collections.Generic.Dictionary<string, string>(), files);
+
+                // No Origin (a scripted client) is allowed; a foreign Origin is not.
+                var forged = HttpPost(baseUrl + "?t=246810", "multipart/form-data; boundary=B", body,
+                    "http://evil.example");
+                Assert.Equal(403, forged.Item1, "cross-origin upload refused");
+                Assert.False(File.Exists(Path.Combine(root, "forged.txt")), "nothing written");
+
+                var sameOrigin = HttpPost(baseUrl + "?t=246810", "multipart/form-data; boundary=B", body,
+                    "http://127.0.0.1:" + port);
+                Assert.Equal(303, sameOrigin.Item1, "same-origin upload accepted");
+                Assert.True(File.Exists(Path.Combine(root, "forged.txt")), "same-origin file written");
+            }
+            finally
+            {
+                server.Stop();
+                try { Directory.Delete(root, true); } catch { }
+            }
+        }
+
         /// <summary>Fan-out pattern end-to-end: two independent servers receive the
         /// same file concurrently from parallel clients (distinct random source ports).</summary>
         private static void FanOutTwoTargets()
@@ -4650,6 +4953,12 @@ namespace TrFileTransfer.Tests
 
         private static System.Tuple<int, byte[], string> HttpPost(string url, string contentType, byte[] body)
         {
+            return HttpPost(url, contentType, body, null);
+        }
+
+        /// <param name="origin">Optional Origin header (models a cross-site forged POST).</param>
+        private static System.Tuple<int, byte[], string> HttpPost(string url, string contentType, byte[] body, string origin)
+        {
             var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
             req.Method = "POST";
             req.Timeout = 30000;
@@ -4658,6 +4967,7 @@ namespace TrFileTransfer.Tests
             req.ContentType = contentType;
             req.ContentLength = body.Length;
             req.AllowAutoRedirect = false;
+            if (origin != null) req.Headers.Add("Origin", origin);
             using (var rs = req.GetRequestStream())
                 rs.Write(body, 0, body.Length);
             try
@@ -4784,7 +5094,9 @@ namespace TrFileTransfer.Tests
                 var content2 = new byte[64 * 1024 + 17];
                 new Random(78).NextBytes(content2);
 
-                server.Start(root, port, null);
+                // Writes require an access code (a code-less share is read-only), so
+                // this upload test authenticates like a browser would.
+                server.Start(root, port, "987654");
                 string baseUrl = "http://127.0.0.1:" + port + "/";
 
                 var files = new System.Collections.Generic.Dictionary<string, byte[]>
@@ -4798,7 +5110,7 @@ namespace TrFileTransfer.Tests
                     { "p", "" }
                 };
                 byte[] body = BuildMultipart("BOUND", fields, files);
-                var resp = HttpPost(baseUrl, "multipart/form-data; boundary=BOUND", body);
+                var resp = HttpPost(baseUrl + "?t=987654", "multipart/form-data; boundary=BOUND", body);
 
                 Assert.Equal(303, resp.Item1, "upload responds 303");
                 Assert.True(resp.Item3 != null && resp.Item3.StartsWith("/?p="), "redirect back to listing");
@@ -4808,15 +5120,17 @@ namespace TrFileTransfer.Tests
                 Assert.True(Utils.ConstantTimeEquals(content2, File.ReadAllBytes(Path.Combine(root, "second.bin"))), "file 2 bytes");
                 Assert.True(Utils.ConstantTimeEquals(small, File.ReadAllBytes(Path.Combine(root, "small.txt"))), "file 3 bytes");
 
-                // Listing now shows the uploaded names
-                var list = HttpGet(baseUrl);
+                // Listing now shows the uploaded names (cookie session, like a browser)
+                var jar = new System.Net.CookieContainer();
+                HttpGet(baseUrl + "?t=987654", jar);   // 303 plants the HttpOnly cookie
+                var list = HttpGet(baseUrl, jar);
                 Assert.True(System.Text.Encoding.UTF8.GetString(list.Item2).Contains("second.bin"), "listing shows uploaded file");
 
                 // Upload into a subdirectory via the p field
                 Directory.CreateDirectory(Path.Combine(root, "sub"));
                 var fieldsSub = new System.Collections.Generic.Dictionary<string, string> { { "p", "sub" } };
                 var filesSub = new System.Collections.Generic.Dictionary<string, byte[]> { { "inner.txt", small } };
-                var resp2 = HttpPost(baseUrl, "multipart/form-data; boundary=BOUND", BuildMultipart("BOUND", fieldsSub, filesSub));
+                var resp2 = HttpPost(baseUrl + "?t=987654", "multipart/form-data; boundary=BOUND", BuildMultipart("BOUND", fieldsSub, filesSub));
                 Assert.Equal(303, resp2.Item1, "subdir upload 303");
                 Assert.True(Utils.ConstantTimeEquals(small, File.ReadAllBytes(Path.Combine(root, "sub", "inner.txt"))), "subdir upload bytes");
             }

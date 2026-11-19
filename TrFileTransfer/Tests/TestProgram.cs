@@ -1037,6 +1037,64 @@ namespace TrFileTransfer.Tests
                 Assert.True(UpdateManifest.FromGitHubJson("") == null, "null"));
 
             // ---- IsNewerThan ----
+            // ---- Redirect handling: only the first URL was scheme-checked, and the
+            // default HttpWebRequest behaviour happily followed a 302 to plain http
+            // (where an on-path attacker controls both the binary and its sidecar hash).
+            runner.Run("Update_Check_RejectsInsecureRedirect", () =>
+            {
+                var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+                listener.Start();
+                int port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
+                try
+                {
+                    var accept = listener.AcceptTcpClientAsync();
+                    string url = "http://127.0.0.1:" + port + "/manifest.txt";
+                    var check = Updater.CheckAsync(url, 5000);
+
+                    using (var peer = accept.Result)
+                    {
+                        var ns = peer.GetStream();
+                        var req = new byte[4096];
+                        int got = 0;
+                        var deadline = DateTime.UtcNow.AddSeconds(5);
+                        while (DateTime.UtcNow < deadline && got < req.Length)
+                        {
+                            int n = ns.Read(req, got, req.Length - got);
+                            if (n <= 0) break;
+                            got += n;
+                            string text = System.Text.Encoding.ASCII.GetString(req, 0, got);
+                            if (text.Contains("\r\n\r\n")) break;
+                        }
+                        byte[] resp = System.Text.Encoding.ASCII.GetBytes(
+                            "HTTP/1.1 302 Found\r\nLocation: http://example.com/evil.exe\r\n" +
+                            "Content-Length: 0\r\nConnection: close\r\n\r\n");
+                        ns.Write(resp, 0, resp.Length);
+                        ns.Flush();
+                    }
+
+                    bool threw = false;
+                    try { check.Wait(10000); }
+                    catch { threw = true; }
+                    Assert.True(threw, "insecure redirect target is refused");
+                }
+                finally
+                {
+                    try { listener.Stop(); } catch { }
+                }
+            });
+
+            runner.Run("Update_GitHubPrefersCanonicalAsset", () =>
+            {
+                // Two .exe assets: an installer listed first, the real binary second.
+                string json = "{\"tag_name\":\"v9.9.9.9\",\"body\":\"notes\",\"assets\":[" +
+                    "{\"browser_download_url\":\"https://example.com/TrFileTransfer-Setup.exe\"}," +
+                    "{\"browser_download_url\":\"https://example.com/TrFileTransfer.exe\"}]}";
+                var m = UpdateManifest.FromGitHubJson(json);
+                Assert.True(m != null, "manifest parsed");
+                Assert.True(m.Url.EndsWith("/TrFileTransfer.exe", StringComparison.Ordinal),
+                    "prefers the canonical asset over the first .exe: " + m.Url);
+            });
+
             runner.Run("Update_IsNewer_True", () =>
             {
                 var m = new UpdateManifest { Version = new Version(2, 1, 0, 0) };

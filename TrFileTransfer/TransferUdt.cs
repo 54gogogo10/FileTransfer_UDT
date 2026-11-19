@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
@@ -231,14 +231,26 @@ namespace TrFileTransfer
 
         private static void ExtractResource(string resourceName, string primaryPath)
         {
-            if (File.Exists(primaryPath)) return;
             using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(resourceName))
             {
-                // Resource not embedded (e.g., DLL placed manually in exe directory)
+                // Resource not embedded (the test build, or a manual DLL layout): trust
+                // whatever is next to the exe, exactly as before.
                 if (stream == null) return;
-                // Try primary path first; fall back to %TEMP% if read-only
+                string expected = Sha256Hex(stream);
+                stream.Seek(0, SeekOrigin.Begin);
+
+                // An existing DLL is only used when it is byte-identical to the embedded
+                // copy. Otherwise a planted udt.dll (writable install directory, or the
+                // app's own receive directory pointed next to the exe) would be loaded as
+                // native code on the next start.
+                if (File.Exists(primaryPath) && FileMatches(primaryPath, expected)) return;
+
+                // Try the primary path first; fall back to %TEMP% if the exe directory is
+                // read-only — but ONLY when no file is occupying the primary path, since
+                // P/Invoke resolves "udt.dll" from the application directory first.
                 string targetPath = primaryPath;
                 bool tryPrimary = true;
+                bool sawPrimaryMismatch = File.Exists(primaryPath);
                 for (int attempt = 0; attempt < 3; attempt++)
                 {
                     try
@@ -246,10 +258,15 @@ namespace TrFileTransfer
                         if (tryPrimary)
                         {
                             using (var fs = new FileStream(targetPath, FileMode.Create, FileAccess.Write))
+                            {
+                                stream.Seek(0, SeekOrigin.Begin);
                                 stream.CopyTo(fs);
+                            }
                         }
                         else
                         {
+                            if (sawPrimaryMismatch)
+                                throw new IOException("refusing to load a mismatched native library: " + primaryPath);
                             targetPath = Path.Combine(Path.GetTempPath(), Path.GetFileName(primaryPath));
                             using (var fs = new FileStream(targetPath, FileMode.Create, FileAccess.Write))
                             {
@@ -258,6 +275,8 @@ namespace TrFileTransfer
                             }
                             SetDllDirectory(Path.GetTempPath());
                         }
+                        if (!FileMatches(targetPath, expected))
+                            throw new IOException("extracted native library failed its integrity check: " + targetPath);
                         return;
                     }
                     catch (UnauthorizedAccessException)
@@ -266,10 +285,35 @@ namespace TrFileTransfer
                     }
                     catch (IOException)
                     {
+                        if (!tryPrimary) throw;
                         System.Threading.Thread.Sleep(200);
                     }
                 }
                 throw new IOException("Failed to extract " + Path.GetFileName(primaryPath) + " after 3 attempts");
+            }
+        }
+
+        private static bool FileMatches(string path, string expectedSha256)
+        {
+            try
+            {
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+                    return string.Equals(Sha256Hex(fs), expectedSha256, StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static string Sha256Hex(Stream stream)
+        {
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            {
+                byte[] hash = sha.ComputeHash(stream);
+                var sb = new System.Text.StringBuilder(hash.Length * 2);
+                for (int i = 0; i < hash.Length; i++) sb.Append(hash[i].ToString("x2"));
+                return sb.ToString();
             }
         }
 
@@ -291,6 +335,8 @@ namespace TrFileTransfer
         private readonly string _saveDirectory;
         private volatile bool _isRunning;
         private bool _startupOk;
+        /// <summary>The accept loop task, awaited by Stop() before native cleanup.</summary>
+        private Task _acceptTask;
         private int _activeClients;
         private readonly List<int> _clientSockets = new List<int>();
         private readonly ServerWireContext _wire = new ServerWireContext();
@@ -531,7 +577,7 @@ namespace TrFileTransfer
 
             Log(L.UdtS_Started(_port.ToString(), _saveDirectory));
 
-            Task.Factory.StartNew(() => AcceptLoop(_cts.Token), _cts.Token,
+            _acceptTask = Task.Factory.StartNew(() => AcceptLoop(_cts.Token), _cts.Token,
                 TaskCreationOptions.LongRunning, TaskScheduler.Default);
         }
 
@@ -540,12 +586,28 @@ namespace TrFileTransfer
         {
             _isRunning = false;
             var cts = _cts;
-            if (cts != null) cts.Cancel();
-            if (_socket >= 0)
+            _cts = null;
+            if (cts != null) { try { cts.Cancel(); } catch { } }
+            int sock = _socket;
+            _socket = -1;
+            if (sock >= 0)
             {
-                try { UdtNative.udt_close(_socket); } catch { }
-                _socket = -1;
+                try { UdtNative.udt_close(sock); } catch { }
             }
+
+            // The accept thread may still be inside udt_accept(). Tearing the native
+            // library down under it is an AccessViolation (seen on CI: the lambda read
+            // _socket after Stop had set it to -1). Closing the listener makes accept
+            // return; wait for the loop to leave before UdtCleanup.
+            var accept = _acceptTask;
+            _acceptTask = null;
+            bool acceptDone = true;
+            if (accept != null)
+            {
+                try { acceptDone = accept.Wait(3000); }
+                catch { acceptDone = true; }
+            }
+
             // Persist incomplete resume sessions and dispose chunk trackers
             _wire.Shutdown();
             // Close all active client sockets so HandleClient tasks unblock immediately
@@ -555,7 +617,21 @@ namespace TrFileTransfer
                     try { UdtNative.udt_close(cs); } catch { }
                 _clientSockets.Clear();
             }
-            Uninit();
+
+            if (acceptDone)
+            {
+                Uninit();
+            }
+            else if (_startupOk)
+            {
+                // Accept is still unwinding; release this server's refcount from its
+                // continuation instead of cleaning the library underneath it.
+                _startupOk = false;
+                accept.ContinueWith(delegate { try { UdtNative.UdtCleanup(); } catch { } },
+                    TaskScheduler.Default);
+            }
+
+            if (cts != null) { try { cts.Dispose(); } catch { } }
             var handler = OnStopped;
             if (handler != null) handler();
             Log(L.UdtS_Stopped);
@@ -577,12 +653,17 @@ namespace TrFileTransfer
                 int clientSocket = -1;
                 try
                 {
+                    if (!_isRunning) break;
+                    // Capture the descriptor: Stop() sets _socket to -1, and a late
+                    // udt_accept(-1, ...) is undefined behavior in the native library.
+                    int listenSocket = _socket;
+                    if (listenSocket < 0) break;
                     // Family-agnostic buffer: v4 peers fill the first 16 bytes (AF_INET),
                     // v6 peers all 28 (AF_INET6) — see UdtNative.ParsePeer.
                     var raw = new byte[UdtNative.SockAddr6Size];
                     int addrLen = raw.Length;
                     clientSocket = await Task.Run(() =>
-                        UdtNative.udt_accept(_socket, raw, ref addrLen), ct);
+                        UdtNative.udt_accept(listenSocket, raw, ref addrLen), ct);
                     if (clientSocket < 0) break;
 
                     UdtNative.SetTimeout(clientSocket, 30000, 30000);
@@ -885,6 +966,12 @@ namespace TrFileTransfer
             _cts = new CancellationTokenSource();
             _isRunning = true;
             _wasCancelled = false;
+            // Only a flow that actually incremented the process-wide UDT reference
+            // count may decrement it. The old unconditional Cleanup in the finally let
+            // an exception BEFORE Startup (a throwing OnStarted handler, a failed DLL
+            // extraction) steal a reference another transfer/server was still holding —
+            // the last real holder then tore the runtime down under live sockets.
+            bool libStarted = false;
 
             try
             {
@@ -896,6 +983,7 @@ namespace TrFileTransfer
                 UdtDll.EnsureExtracted();
                 if (!UdtNative.UdtStartup())
                     throw new Exception("UDT library init failed");
+                libStarted = true;
                 await transferAction(_cts.Token).ConfigureAwait(false);
                 // Wait for server ACK before closing — confirms data was received
                 // (0x01 = success, 0x00 = refused by receiver policy). Anything else
@@ -963,7 +1051,7 @@ namespace TrFileTransfer
                     try { UdtNative.udt_close(_socket); } catch { }
                     _socket = -1;
                 }
-                UdtNative.UdtCleanup();
+                if (libStarted) UdtNative.UdtCleanup();
                 var stoppedHandler = OnStopped;
                 if (stoppedHandler != null) stoppedHandler();
             }
@@ -1017,20 +1105,33 @@ namespace TrFileTransfer
 
             Log(L.UdtC_Connecting(_serverIp, _port));
             int connectResult;
+            // The native error string lives in thread-local storage, and udt_connect
+            // runs on a pool thread: reading it after the await can land on a different
+            // thread and report "Unknown error"/the wrong description. Capture it inside
+            // the call (same rule as UdtIo).
+            string connectError = null;
             if (v6)
             {
                 var addr6 = UdtNative.BuildSockaddr6(_serverIp, _port);
-                connectResult = await Task.Run(
-                    () => UdtNative.udt_connect(_socket, ref addr6, UdtNative.SockAddr6Size), ct).ConfigureAwait(false);
+                connectResult = await Task.Run(delegate
+                {
+                    int r = UdtNative.udt_connect(_socket, ref addr6, UdtNative.SockAddr6Size);
+                    if (r == UdtNative.ERROR) connectError = UdtNative.GetErrorDesc();
+                    return r;
+                }, ct).ConfigureAwait(false);
             }
             else
             {
                 var addr = UdtNative.BuildSockaddr(_serverIp, _port);
-                connectResult = await Task.Run(
-                    () => UdtNative.udt_connect(_socket, ref addr, UdtNative.SockAddrSize), ct).ConfigureAwait(false);
+                connectResult = await Task.Run(delegate
+                {
+                    int r = UdtNative.udt_connect(_socket, ref addr, UdtNative.SockAddrSize);
+                    if (r == UdtNative.ERROR) connectError = UdtNative.GetErrorDesc();
+                    return r;
+                }, ct).ConfigureAwait(false);
             }
             if (connectResult == UdtNative.ERROR)
-                throw new Exception("UDT connect failed: " + UdtNative.GetErrorDesc());
+                throw new Exception("UDT connect failed: " + (connectError ?? UdtNative.GetErrorDesc()));
             Log(L.C_Connected(_serverIp, _port));
             UdtNative.SetTimeout(_socket, 30000, 30000);
             // No UDT_SNDBUF/UDT_RCVBUF here: UDT4 refuses buffer options on an open
@@ -1059,7 +1160,10 @@ namespace TrFileTransfer
         {
             bool allowEncrypt = EncryptionEnabled;
             bool allowCompress = CompressionEnabled;
-            int maxAttempts = capabilities != 0 ? 3 : 2;
+            bool legacyAuth = false;
+            // Legacy handshake, compression and 0x0A can each be refused once; leave
+            // headroom so a 2.12 peer still ends up with a working connection.
+            const int maxAttempts = 5;
             for (int attempt = 0; ; attempt++)
             {
                 await UdtConnect(ct).ConfigureAwait(false);
@@ -1067,11 +1171,11 @@ namespace TrFileTransfer
                 AuthResult auth;
                 try
                 {
-                    // Short receive window: an older peer that does not know 0x07/0x08/0x0A
+                    // Short receive window: an older peer that does not know 0x0C/0x08/0x0A
                     // never answers, and waiting out the full 30s timeout would feel broken
                     UdtNative.SetTimeout(_socket, 8000, 30000);
                     auth = await ClientWire.AuthenticateAsync(raw, PairingCode, allowEncrypt, allowCompress, _cb, ct,
-                        EncryptionDowngradeAllowed, capabilities).ConfigureAwait(false);
+                        EncryptionDowngradeAllowed, capabilities, legacyAuth).ConfigureAwait(false);
                     UdtNative.SetTimeout(_socket, 30000, 30000);
                 }
                 catch
@@ -1088,14 +1192,26 @@ namespace TrFileTransfer
                     _cb.RaiseLog(L.C_CompressFallback);
                     continue;
                 }
+                if (auth.NeedLegacyAuth && allowEncrypt && attempt < maxAttempts)
+                {
+                    raw.Dispose();
+                    try { UdtNative.udt_close(_socket); } catch { }
+                    _socket = -1;
+                    // 2.12–2.14 peer: retry with the legacy 0x09 handshake (kept for
+                    // interoperability; current builds use the 0x0C frame).
+                    legacyAuth = true;
+                    _cb.RaiseLog(L.C_EncryptFallback);
+                    continue;
+                }
                 if (auth.NeedPlainFallback && allowEncrypt && attempt < maxAttempts)
                 {
                     raw.Dispose();
                     try { UdtNative.udt_close(_socket); } catch { }
                     _socket = -1;
-                    // A peer too old for 0x17 is too old for 0x08 as well
+                    // A peer too old for the handshake is too old for 0x08 as well
                     allowEncrypt = false;
                     allowCompress = false;
+                    legacyAuth = false;
                     _cb.RaiseLog(L.C_EncryptFallback);
                     continue;
                 }
@@ -1151,6 +1267,7 @@ namespace TrFileTransfer
             _cts = new CancellationTokenSource();
             _isRunning = true;
             _wasCancelled = false;
+            bool libStarted = false;
             try
             {
                 var startedHandler = OnStarted;
@@ -1158,6 +1275,7 @@ namespace TrFileTransfer
                 UdtDll.EnsureExtracted();
                 if (!UdtNative.UdtStartup())
                     throw new Exception("UDT library init failed");
+                libStarted = true;
                 var auth = await OpenAndAuthenticateResultAsync(_cts.Token, 0x02).ConfigureAwait(false);
                 if (!auth.ChunkSessions)
                     return null;
@@ -1191,7 +1309,7 @@ namespace TrFileTransfer
                     try { UdtNative.udt_close(_socket); } catch { }
                     _socket = -1;
                 }
-                UdtNative.UdtCleanup();
+                if (libStarted) UdtNative.UdtCleanup();
                 var stoppedHandler = OnStopped;
                 if (stoppedHandler != null) stoppedHandler();
             }

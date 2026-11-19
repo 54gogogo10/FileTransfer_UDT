@@ -202,10 +202,20 @@ namespace TrFileTransfer
             }
         }
 
-        /// <summary>Quotes a CSV field only when it contains a separator, quote or newline.</summary>
+        /// <summary>Quotes a CSV field only when it contains a separator, quote or newline,
+        /// and neutralizes spreadsheet formulas: a peer can name a file "=WEBSERVICE(...)"
+        /// (those characters are legal in a Windows file name), and Excel would execute
+        /// it when the user opens the exported history.</summary>
         private static string CsV(string field)
         {
             string f = field ?? "";
+            if (f.Length > 0)
+            {
+                char first = f[0];
+                if (first == '=' || first == '+' || first == '-' || first == '@'
+                    || first == '\t' || first == '\r')
+                    f = "'" + f;
+            }
             if (f.IndexOf(',') >= 0 || f.IndexOf('"') >= 0 || f.IndexOf('\n') >= 0)
                 return "\"" + f.Replace("\"", "\"\"") + "\"";
             return f;

@@ -283,7 +283,11 @@ namespace TrFileTransfer
                 }
                 Log(L.C_Connected(_serverIp, _port));
 
-                return new TcpWireStream(client.GetStream(), L.C_ResumeConnClosed);
+                var stream = new TcpWireStream(client.GetStream(), L.C_ResumeConnClosed);
+                // A silent server must not hang the client forever; waits where the peer
+                // is legitimately busy widen this via ClientWire.LongReadWindow.
+                stream.SetReadTimeoutMs(30000);
+                return stream;
             }
             catch
             {
@@ -311,15 +315,27 @@ namespace TrFileTransfer
         {
             bool allowEncrypt = EncryptionEnabled;
             bool allowCompress = CompressionEnabled;
-            int maxAttempts = capabilities != 0 ? 3 : 2;
+            bool legacyAuth = false;
+            // Every fallback below drops exactly one capability and reconnects; the
+            // worst realistic chain (legacy handshake -> no compression -> no 0x0A)
+            // needs three retries, so leave headroom.
+            const int maxAttempts = 5;
+            bool tryCompletionCaps = true;
             for (int attempt = 0; ; attempt++)
             {
+                // When compression is off there is no prelude left that proves the peer
+                // is a current build, so ask for the completion-verdict capability
+                // (bit2) instead: without that proof a refused transfer used to read as
+                // a success (disk full / confirmation denied reported as "done").
+                byte attemptCaps = capabilities;
+                if (!allowCompress && tryCompletionCaps) attemptCaps |= 0x04;
+
                 TcpWireStream raw = await ConnectAsync(ct).ConfigureAwait(false);
                 AuthResult auth;
                 try
                 {
                     auth = await ClientWire.AuthenticateAsync(raw, PairingCode, allowEncrypt, allowCompress, _cb, ct,
-                        EncryptionDowngradeAllowed, capabilities).ConfigureAwait(false);
+                        EncryptionDowngradeAllowed, attemptCaps, legacyAuth).ConfigureAwait(false);
                 }
                 catch
                 {
@@ -333,26 +349,37 @@ namespace TrFileTransfer
                     _cb.RaiseLog(L.C_CompressFallback);
                     continue;
                 }
+                if (auth.NeedLegacyAuth && allowEncrypt && attempt < maxAttempts)
+                {
+                    raw.Dispose();
+                    // 2.12–2.15 peer: retry with the legacy 0x09 handshake (kept for
+                    // interoperability; the new 0x0C frame is what current builds use).
+                    legacyAuth = true;
+                    _cb.RaiseLog(L.C_EncryptLegacyRetry);
+                    continue;
+                }
                 if (auth.NeedPlainFallback && allowEncrypt && attempt < maxAttempts)
                 {
                     raw.Dispose();
-                    // A peer too old for 0x17 is too old for 0x08 as well
+                    // A peer too old for the handshake is too old for 0x08 as well
                     allowEncrypt = false;
                     allowCompress = false;
+                    legacyAuth = false;
                     _cb.RaiseLog(L.C_EncryptFallback);
                     continue;
                 }
-                if (auth.NeedNoPerFileSkipFallback && capabilities != 0 && attempt < maxAttempts)
+                if (auth.NeedNoPerFileSkipFallback && attemptCaps != 0 && attempt < maxAttempts)
                 {
                     raw.Dispose();
-                    capabilities = 0;
+                    if (capabilities != 0) capabilities = 0;
+                    else tryCompletionCaps = false; // stop asking for the same frame
                     continue;
                 }
-                // A successful prelude (encryption or compression accepted) proves the
-                // peer is a current build, which means it sends the TCP completion
-                // verdict byte. Without that proof (no pairing and compression off, or
-                // an older peer) do not wait for a byte that may never come.
-                _cb.CompletionAckOnStream = auth.Encrypted || auth.Compressed;
+                // A successful prelude (encryption, compression or the 0x0A completion
+                // capability) proves the peer is a current build, which means it sends
+                // the TCP completion verdict byte. Without that proof (an older peer) do
+                // not wait for a byte that will never come.
+                _cb.CompletionAckOnStream = auth.Encrypted || auth.Compressed || auth.CompletionAck;
                 return auth;
             }
         }
